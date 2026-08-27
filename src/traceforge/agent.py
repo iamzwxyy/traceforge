@@ -347,16 +347,7 @@ class AgentManager:
             approved = await self._await_plan_decision(run)
             if approved:
                 run.plan_approved = True
-                run.messages = [
-                    {"role": "system", "content": BUILDER_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Original task:\n{run.task}\n\nApproved plan:\n"
-                            f"{run.plan.model_dump_json()}"
-                        ),
-                    },
-                ]
+                run.messages = self._builder_messages(run, run.plan)
                 await self._transition(run, RunState.EXECUTING)
         elif run.plan_approved:
             run.pending_approval = None
@@ -449,16 +440,7 @@ class AgentManager:
                     approved = await self._await_plan_decision(run, tool_call_id=call.id)
                     if approved:
                         run.plan_approved = True
-                        run.messages = [
-                            {"role": "system", "content": BUILDER_SYSTEM_PROMPT},
-                            {
-                                "role": "user",
-                                "content": (
-                                    f"Original task:\n{run.task}\n\nApproved plan:\n"
-                                    f"{plan.model_dump_json()}"
-                                ),
-                            },
-                        ]
+                        run.messages = self._builder_messages(run, plan)
                         await self._transition(run, RunState.EXECUTING)
                         return
             self.storage.save_run(run)
@@ -577,6 +559,66 @@ class AgentManager:
                         raise RuntimeError("The same tool call failed three times")
                 self.storage.save_run(run)
         raise RuntimeError(f"Builder exceeded the {self.settings.max_steps}-step limit")
+
+    def _builder_messages(
+        self, run: RunRecord, plan: TaskPlan
+    ) -> list[dict[str, Any]]:
+        evidence = self._planning_evidence(run.messages)
+        task_context = (
+            f"Original task:\n{run.task}\n\nApproved plan:\n{plan.model_dump_json()}"
+        )
+        if evidence:
+            task_context += (
+                "\n\nPlanning inspection evidence (reuse this before reading the same files "
+                "again):\n" + evidence
+            )
+        return [
+            {"role": "system", "content": BUILDER_SYSTEM_PROMPT},
+            {"role": "user", "content": task_context},
+        ]
+
+    def _planning_evidence(self, messages: list[dict[str, Any]]) -> str:
+        calls: dict[str, tuple[str, dict[str, Any]]] = {}
+        for message in messages:
+            for raw_call in message.get("tool_calls", []):
+                function = raw_call.get("function", {})
+                name = str(function.get("name", ""))
+                if name not in {"list_files", "read_file", "search_text"}:
+                    continue
+                try:
+                    arguments = json.loads(function.get("arguments", "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    arguments = {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                calls[str(raw_call.get("id", ""))] = (name, arguments)
+
+        sections: list[str] = []
+        for message in messages:
+            if message.get("role") != "tool":
+                continue
+            call = calls.get(str(message.get("tool_call_id", "")))
+            if call is None:
+                continue
+            try:
+                result = ToolResult.model_validate_json(str(message.get("content", "{}")))
+            except (ValidationError, ValueError):
+                continue
+            if not result.ok:
+                continue
+            name, arguments = call
+            sections.append(
+                f"### {name}({json.dumps(arguments, ensure_ascii=False, sort_keys=True)})\n"
+                f"{result.output}"
+            )
+
+        if not sections:
+            return ""
+        limit = min(self.settings.context_limit * 2, self.settings.model_output_limit * 8)
+        rendered = "\n\n".join(sections)
+        if len(rendered) <= limit:
+            return rendered
+        return rendered[:limit] + "\n... planning evidence truncated"
 
     async def _verifier_phase(self, run: RunRecord) -> VerificationReport:
         if not run.verifier_enabled:

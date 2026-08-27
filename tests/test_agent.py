@@ -227,6 +227,52 @@ def _verification(verdict: str, summary: str) -> ModelResponse:
 
 
 @pytest.mark.asyncio
+async def test_builder_reuses_successful_planning_inspection(
+    settings: Settings, storage: Storage
+) -> None:
+    (settings.workspace / "context.txt").write_text("important evidence\n")
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="inspect",
+                        name="read_file",
+                        arguments={"path": "context.txt"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Reviewed", "evidence": ["planner read"]},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Review context.txt", verifier_enabled=False)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    await manager.decide_plan(run.id, PlanDecision(decision="approve"))
+
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    builder_messages = provider.requests[2][0]
+    builder_context = str(builder_messages[1]["content"])
+    assert 'read_file({"path": "context.txt"})' in builder_context
+    assert "important evidence" in builder_context
+
+
+@pytest.mark.asyncio
 async def test_plan_revision_then_completion(settings: Settings, storage: Storage) -> None:
     provider = ScriptedProvider(
         [

@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import signal
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -71,7 +72,10 @@ class ToolRegistry:
             ),
             _tool_schema(
                 "apply_patch",
-                "Apply a standard unified diff transactionally inside the workspace.",
+                (
+                    "Apply a unified diff or Begin/Update File patch transactionally inside "
+                    "the workspace. Hunk counts are repaired, but context must match uniquely."
+                ),
                 {"patch": {"type": "string"}},
                 required=["patch"],
             ),
@@ -135,6 +139,13 @@ class ToolRegistry:
             return PermissionAssessment(
                 PermissionDecision.DENY,
                 "Destructive version-control or recursive deletion command",
+                "dangerous",
+            )
+        outside_path = _outside_workspace_argument(argv, self.workspace.root)
+        if outside_path is not None:
+            return PermissionAssessment(
+                PermissionDecision.DENY,
+                f"Command path is outside the workspace: {outside_path}",
                 "dangerous",
             )
         if _matches_accepted_check(argv, plan):
@@ -327,7 +338,15 @@ class ToolRegistry:
     ) -> ToolResult:
         if not argv or not all(isinstance(item, str) and item for item in argv):
             raise ValueError("argv must contain non-empty strings")
-        executable = shutil.which(argv[0]) if not Path(argv[0]).is_absolute() else argv[0]
+        outside_path = _outside_workspace_argument(argv, self.workspace.root)
+        if outside_path is not None:
+            raise ValueError(f"Command path is outside the workspace: {outside_path}")
+        environment = _command_environment(self.workspace.root)
+        executable = (
+            shutil.which(argv[0], path=environment["PATH"])
+            if not Path(argv[0]).is_absolute()
+            else argv[0]
+        )
         if executable is None:
             raise ValueError(f"Executable not found: {argv[0]}")
         command_cwd = self.workspace.resolve_read(cwd)
@@ -343,6 +362,7 @@ class ToolRegistry:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
+            env=environment,
         )
         self._processes[run_id] = process
         chunks: list[bytes] = []
@@ -438,6 +458,34 @@ def _is_read_only(argv: list[str]) -> bool:
         "grep",
         "ls-files",
     }
+
+
+def _outside_workspace_argument(argv: list[str], workspace: Path) -> str | None:
+    for raw in argv[1:]:
+        candidate = raw.split("=", 1)[1] if raw.startswith("-") and "=" in raw else raw
+        if not candidate or candidate.startswith("-"):
+            continue
+        path = Path(candidate).expanduser()
+        if not path.is_absolute() and ".." not in path.parts:
+            continue
+        resolved = path.resolve() if path.is_absolute() else (workspace / path).resolve()
+        if not resolved.is_relative_to(workspace):
+            return candidate
+    return None
+
+
+def _command_environment(workspace: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    runtime_dirs = [
+        workspace / ".venv" / "bin",
+        workspace / "venv" / "bin",
+        Path(sys.executable).parent,
+    ]
+    existing = environment.get("PATH", "").split(os.pathsep)
+    ordered = [str(path) for path in runtime_dirs if path.is_dir()]
+    ordered.extend(path for path in existing if path and path not in ordered)
+    environment["PATH"] = os.pathsep.join(ordered)
+    return environment
 
 
 def _is_dangerous_git(argv: list[str]) -> bool:

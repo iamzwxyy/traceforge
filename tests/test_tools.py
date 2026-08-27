@@ -44,12 +44,51 @@ def test_permission_policy_denies_malformed_and_destructive_commands(
     for arguments in ({"argv": []}, {"argv": "git status"}, {"argv": ["git", 1]}):
         call = ToolCall(id="bad", name="run_command", arguments=arguments)
         assert registry.assess(call, None).decision is PermissionDecision.DENY
-    for argv in (["git", "reset", "--hard"], ["rm", "-rf", "target"]):
+    for argv in (
+        ["git", "reset", "--hard"],
+        ["rm", "-rf", "target"],
+        ["find", "/", "-name", "python"],
+        ["cat", "../../outside.txt"],
+        ["tool", "--config=/tmp/outside.toml"],
+    ):
         call = ToolCall(id="danger", name="run_command", arguments={"argv": argv})
         assert registry.assess(call, None).decision is PermissionDecision.DENY
     assert registry.assess(
         ToolCall(id="read", name="run_command", arguments={"argv": ["ls"]}), None
     ).decision is PermissionDecision.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_command_prefers_traceforge_runtime_and_rejects_external_paths(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage.create_run(RunRecord(id="run-1", task="Run", workspace=str(workspace.root)))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    registry = ToolRegistry(workspace, settings)
+
+    runtime = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="runtime",
+            name="run_command",
+            arguments={"argv": ["python", "-c", "import sys; print(sys.executable)"]},
+        ),
+    )
+    external = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="external",
+            name="run_command",
+            arguments={"argv": ["find", "/", "-name", "python"]},
+        ),
+    )
+
+    assert runtime.ok
+    assert runtime.output.strip() == tools_module.sys.executable
+    assert not external.ok and "outside the workspace" in (external.error or "")
 
 
 @pytest.mark.asyncio
