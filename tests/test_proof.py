@@ -9,6 +9,8 @@ from traceforge.models import (
     RunRecord,
     RunState,
     TaskPlan,
+    ToolCall,
+    ToolResult,
     Verdict,
     VerificationReport,
 )
@@ -58,6 +60,33 @@ def test_proof_pack_aggregates_stable_completion_evidence(
     path.write_text("proven\n")
     workspace.record_agent_version(run.id, path)
     storage.append_event(run.id, EventType.PLAN_GATED, run.plan_gate.model_dump(mode="json"))
+    command = ToolCall(
+        id="check-command",
+        name="run_command",
+        arguments={"argv": ["pytest", "-q"]},
+    )
+    result = ToolResult(
+        tool_call_id=command.id,
+        name=command.name,
+        ok=True,
+        output="1 passed",
+        metadata={
+            "exit_code": 0,
+            "sandbox": {
+                "status": "enforced",
+                "backend": "seatbelt",
+                "enforced": True,
+            },
+        },
+    )
+    storage.append_event(
+        run.id,
+        EventType.TOOL_COMPLETED,
+        {
+            "call": command.model_dump(mode="json"),
+            "result": result.model_dump(mode="json"),
+        },
+    )
     completion_diff = workspace.diff(run.id)
     storage.append_event(
         run.id,
@@ -79,9 +108,54 @@ def test_proof_pack_aggregates_stable_completion_evidence(
     assert first.evidence_sha256 == second.evidence_sha256
     assert first.event_chain_sha256 == second.event_chain_sha256
     assert first.rollback.status == "available"
+    assert first.command_sandbox.status == "enforced"
+    assert first.command_sandbox.backends == ["seatbelt"]
+    assert first.command_sandbox.sandboxed_commands == 1
     assert "TraceForge Proof Pack" in markdown
     assert first.evidence_sha256 in markdown
     assert "Independent verification" in markdown
+    assert "## Command sandbox" in markdown
+
+
+def test_proof_pack_marks_mixed_sandbox_execution(storage: Storage, workspace: Workspace) -> None:
+    run = RunRecord(
+        id="mixed-sandbox-proof",
+        task="Run two commands",
+        workspace=str(workspace.root),
+        state=RunState.SUCCEEDED,
+    )
+    storage.create_run(run)
+    for command_id, status in (("safe", "enforced"), ("approved", "bypassed")):
+        storage.append_event(
+            run.id,
+            EventType.TOOL_COMPLETED,
+            {
+                "call": {
+                    "id": command_id,
+                    "name": "run_command",
+                    "arguments": {"argv": ["python3", "-V"]},
+                },
+                "result": {
+                    "tool_call_id": command_id,
+                    "name": "run_command",
+                    "ok": True,
+                    "output": "Python",
+                    "metadata": {
+                        "sandbox": {
+                            "status": status,
+                            "backend": "seatbelt",
+                            "enforced": status == "enforced",
+                        }
+                    },
+                },
+            },
+        )
+
+    pack = build_proof_pack(storage.get_run(run.id), storage)
+
+    assert pack.command_sandbox.status == "mixed"
+    assert pack.command_sandbox.sandboxed_commands == 1
+    assert pack.command_sandbox.bypassed_commands == 1
 
 
 def test_proof_pack_records_conflict_aware_rollback(

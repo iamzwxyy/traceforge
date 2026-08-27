@@ -709,13 +709,14 @@ async def test_approved_unknown_command_runs_once(
 
     completed = await manager.wait(run.id)
     assert completed.state is RunState.SUCCEEDED
-    outputs = [
-        event.payload["result"]["output"]
+    results = [
+        event.payload["result"]
         for event in storage.get_events(run.id)
         if event.type is EventType.TOOL_COMPLETED
         and event.payload["call"]["name"] == "run_command"
     ]
-    assert outputs == ["approved\n"]
+    assert [result["output"] for result in results] == ["approved\n"]
+    assert results[0]["metadata"]["sandbox"]["status"] == "bypassed"
 
 
 @pytest.mark.asyncio

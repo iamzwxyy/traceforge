@@ -133,6 +133,7 @@ async def test_command_prefers_traceforge_runtime_and_rejects_external_paths(
 
     assert runtime.ok
     assert runtime.output.strip() == tools_module.sys.executable
+    assert runtime.metadata["sandbox"]["status"] in {"enforced", "policy_only"}
     assert not external.ok and "outside the workspace" in (external.error or "")
 
 

@@ -1,8 +1,10 @@
 # Security model
 
-TraceForge reduces accidental damage from model-proposed actions. It is not an OS sandbox and does
-not claim to safely execute a malicious repository. The user account running TraceForge remains the
-ultimate operating-system authority.
+TraceForge reduces accidental damage from model-proposed actions with three separate layers:
+application policy, explicit approval, and an optional OS-enforced command sandbox. It does not
+claim that those layers make arbitrary hostile code harmless. The user account running TraceForge
+remains the ultimate operating-system authority, and the UI reports when OS enforcement is absent
+or deliberately bypassed.
 
 ## Trust boundaries
 
@@ -33,8 +35,8 @@ human plan approval.
 
 After planning, each `create_file` and every file in an `apply_patch` is compared with the declared
 scope. An unexpected path pauses for a one-time action decision before any bytes are written. This
-is a policy boundary, not an OS sandbox: a separately approved project command can still write
-outside the plan or workspace using the current user's authority.
+scope check remains an application policy even when an OS sandbox is active; it answers “was this
+planned?” while the sandbox answers “what can this process technically reach?”
 
 ## Command policy
 
@@ -43,15 +45,38 @@ not occur.
 
 | Class | Decision | Examples |
 | --- | --- | --- |
-| Approved acceptance check | allow | exact argv recorded in the approved plan |
-| Known read-only | allow | `git status`, `git diff`, `rg`, `ls`, `cat` |
-| Unknown / code execution | ask once | Python scripts, installers, network clients |
+| Approved acceptance check | allow + sandbox | exact argv recorded in the approved plan |
+| Known read-only | allow + sandbox | `git status`, `git diff`, `rg`, `ls`, `cat` |
+| Unknown / code execution | ask once; approval is a one-shot sandbox bypass | Python scripts, installers, network clients |
 | Destructive / privileged | deny | `sudo`, `git reset --hard`, recursive forced `rm` |
 
 An unknown command approval card shows the exact arguments, reason, and risk. Rejection returns a
-normal failed tool result so the builder can choose a safer path. Commands default to 120 seconds,
-are capped at 600 seconds, and run in a separate process group so Stop/timeout can terminate
-descendants.
+normal failed tool result so the builder can choose a safer path. Approval bypasses the OS sandbox
+for that invocation only; the resulting tool event, timeline badge, and Proof Pack record
+`bypassed`. Commands default to 120 seconds, are capped at 600 seconds, and run in a separate
+process group so Stop/timeout can terminate descendants.
+
+## OS command sandbox
+
+Every command gets a private temporary home, temporary directory, and cache directory. TraceForge
+then probes and selects one backend:
+
+| Platform | Enforced backend | Main boundary |
+| --- | --- | --- |
+| macOS | built-in Seatbelt (`sandbox-exec`) | writes limited to workspace and command temp; external network denied; loopback retained |
+| Linux | working non-setuid Bubblewrap | read-only host root, writable workspace/command temp, read-only `.git`, separate user/PID/network namespaces |
+| Unsupported or failed probe | none (`policy_only`) | application path/argv policy and approval only |
+
+Both enforced profiles block configured credential files, common credential locations, and real
+`.env*` files other than `.env.example`. Seatbelt additionally denies ordinary file-content reads
+under the user's home except the selected workspace and runtime paths. Bubblewrap keeps the host
+root readable for tool compatibility but masks the enumerated sensitive paths. These are accurate,
+different claims; the UI does not collapse them into a generic “secure” label.
+
+The sandbox is constructed by TraceForge, not inferred from an approval. Backend, enforcement
+status, network mode, and any bypass are stored with each command result. The Proof Pack aggregates
+those records as `enforced`, `mixed`, `bypassed`, `policy_only`, or `not_used`. See
+[Sandbox design and adversarial evidence](sandbox.md).
 
 ## Credentials and redaction
 
@@ -93,7 +118,13 @@ interface expands the trust boundary and should only be done behind controls cho
 
 ## Residual risks
 
-- An approved command has the user's OS permissions and can ignore the workspace boundary.
+- A user-approved bypass has the user's OS permissions and can ignore the workspace boundary.
+- A backend profile is a containment layer, not a proof that malicious native code has no kernel or
+  platform escape; unfamiliar hostile repositories still belong in a disposable VM.
+- On Linux, OS enforcement requires Bubblewrap and usable unprivileged user namespaces. TraceForge
+  fails visibly to `policy_only` when its startup probe cannot construct the namespace.
+- The macOS profile permits loopback so project tests can bind local servers; another trusted local
+  process could still be reachable.
 - Read-only classification is syntactic; aliases/wrappers are treated as unknown, not trusted.
 - A benign repository may contain secrets in ordinary source files that the user asked the model
   to inspect.
@@ -104,4 +135,4 @@ interface expands the trust boundary and should only be done behind controls cho
 - Provider behavior and availability are external dependencies; retries do not guarantee service.
 
 The safe default for an unfamiliar repository is a disposable OS account, container, or virtual
-machine in addition to TraceForge's application-level controls.
+machine in addition to TraceForge's built-in controls.

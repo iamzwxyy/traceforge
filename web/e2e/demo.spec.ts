@@ -8,6 +8,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
 
   await page.goto("/");
   await expect(page.locator("textarea")).toHaveValue(/multi-tenant cache isolation/);
+  await expect(page.locator(".sandbox-status")).toContainText(/seatbelt|bubblewrap|Policy only/i);
 
   await page.getByRole("button", { name: "Browse" }).click();
   await expect(page.getByRole("heading", { name: "Choose a directory" })).toBeVisible();
@@ -44,6 +45,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByRole("heading", { name: "Proof Pack" })).toBeVisible();
   await expect(page.getByText("proven", { exact: true })).toBeVisible();
   await expect(page.getByText("STABLE EVIDENCE SHA-256")).toBeVisible();
+  await expect(page.getByText("COMMAND SANDBOX")).toBeVisible();
   await expect(page.getByRole("link", { name: "Download Markdown" }))
     .toHaveAttribute("href", /proof-pack\.md$/);
   expect(consoleErrors).toEqual([]);

@@ -139,6 +139,9 @@ class AgentRuntime:
                 api_key=api_key,
                 model=config.model,
                 base_url=config.base_url,
+                credential_file=(
+                    Path(config.credential_file) if config.credential_file else None
+                ),
             )
             provider: ModelProvider = OpenAICompatibleProvider(run_settings)
         else:
@@ -147,6 +150,9 @@ class AgentRuntime:
                 workspace=resolved,
                 model=config.model,
                 base_url=config.base_url,
+                credential_file=(
+                    Path(config.credential_file) if config.credential_file else None
+                ),
             )
             provider = self.provider_override
         manager = AgentManager(run_settings, self.storage, provider, broker=self.broker)

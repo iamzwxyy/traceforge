@@ -6,6 +6,7 @@ import re
 import shutil
 import signal
 import sys
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -15,6 +16,7 @@ from typing import Any, Literal
 from traceforge.config import Settings
 from traceforge.models import TaskPlan, ToolCall, ToolResult
 from traceforge.patching import FilePatch, PatchError, apply_file_patch, parse_unified_diff
+from traceforge.sandbox import CommandSandbox, SandboxStatus
 from traceforge.workspace import Workspace, WorkspaceViolation
 
 OutputCallback = Callable[[str], Awaitable[None]]
@@ -43,7 +45,14 @@ class ToolRegistry:
     def __init__(self, workspace: Workspace, settings: Settings) -> None:
         self.workspace = workspace
         self.settings = settings
+        self.sandbox = CommandSandbox(
+            workspace.root, credential_file=settings.credential_file
+        )
         self._processes: dict[str, asyncio.subprocess.Process] = {}
+
+    @property
+    def sandbox_status(self) -> SandboxStatus:
+        return self.sandbox.status
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
@@ -188,6 +197,7 @@ class ToolRegistry:
         call: ToolCall,
         *,
         output_callback: OutputCallback | None = None,
+        sandbox_bypass: bool = False,
     ) -> ToolResult:
         try:
             if call.name == "list_files":
@@ -205,6 +215,7 @@ class ToolRegistry:
                     run_id,
                     call,
                     output_callback=output_callback,
+                    sandbox_bypass=sandbox_bypass,
                     **call.arguments,
                 )
             else:
@@ -356,35 +367,60 @@ class ToolRegistry:
         cwd: str = ".",
         timeout_seconds: int | None = None,
         output_callback: OutputCallback | None = None,
+        sandbox_bypass: bool = False,
     ) -> ToolResult:
         if not argv or not all(isinstance(item, str) and item for item in argv):
             raise ValueError("argv must contain non-empty strings")
         outside_path = _outside_workspace_argument(argv, self.workspace.root)
         if outside_path is not None:
             raise ValueError(f"Command path is outside the workspace: {outside_path}")
-        environment = _command_environment(self.workspace.root)
-        executable = (
-            shutil.which(argv[0], path=environment["PATH"])
-            if not Path(argv[0]).is_absolute()
-            else argv[0]
-        )
-        if executable is None:
-            raise ValueError(f"Executable not found: {argv[0]}")
-        command_cwd = self.workspace.resolve_read(cwd)
-        if not command_cwd.is_dir():
-            raise ValueError(f"Command cwd is not a directory: {cwd}")
-        timeout = timeout_seconds or self.settings.command_timeout
-        if timeout > self.settings.max_command_timeout:
-            raise ValueError(f"timeout_seconds exceeds {self.settings.max_command_timeout}")
-        process = await asyncio.create_subprocess_exec(
-            executable,
-            *argv[1:],
-            cwd=command_cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-            env=environment,
-        )
+        command_temp = tempfile.TemporaryDirectory(prefix="traceforge-command-")
+        command_temp_path = Path(command_temp.name)
+        sandbox_home = command_temp_path / "home"
+        sandbox_tmp = command_temp_path / "tmp"
+        sandbox_cache = command_temp_path / "cache"
+        try:
+            for directory in (sandbox_home, sandbox_tmp, sandbox_cache):
+                directory.mkdir()
+            environment = _command_environment(
+                self.workspace.root,
+                home=sandbox_home,
+                temp=sandbox_tmp,
+                cache=sandbox_cache,
+            )
+            executable = (
+                shutil.which(argv[0], path=environment["PATH"])
+                if not Path(argv[0]).is_absolute()
+                else argv[0]
+            )
+            if executable is None:
+                raise ValueError(f"Executable not found: {argv[0]}")
+            command_cwd = self.workspace.resolve_read(cwd)
+            if not command_cwd.is_dir():
+                raise ValueError(f"Command cwd is not a directory: {cwd}")
+            timeout = timeout_seconds or self.settings.command_timeout
+            if timeout > self.settings.max_command_timeout:
+                raise ValueError(f"timeout_seconds exceeds {self.settings.max_command_timeout}")
+            launch = self.sandbox.prepare(
+                executable,
+                argv,
+                cwd=command_cwd,
+                command_temp=command_temp_path,
+                environment=environment,
+                bypass=sandbox_bypass,
+            )
+            process = await asyncio.create_subprocess_exec(
+                launch.program,
+                *launch.arguments,
+                cwd=command_cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+                env=environment,
+            )
+        except BaseException:
+            command_temp.cleanup()
+            raise
         self._processes[run_id] = process
         chunks: list[bytes] = []
         stored_size = 0
@@ -419,10 +455,16 @@ class ToolRegistry:
                 ok=False,
                 output=output,
                 error=f"Command timed out after {timeout} seconds",
-                metadata={"timeout": True, "truncated": truncated, "argv": argv},
+                metadata={
+                    "timeout": True,
+                    "truncated": truncated,
+                    "argv": argv,
+                    "sandbox": launch.metadata,
+                },
             )
         finally:
             self._processes.pop(run_id, None)
+            command_temp.cleanup()
         output = b"".join(chunks).decode(errors="replace")
         if truncated:
             output += f"\n... output truncated at {self.settings.stored_output_limit} bytes ...\n"
@@ -437,6 +479,7 @@ class ToolRegistry:
                 "truncated": truncated,
                 "argv": argv,
                 "cwd": self.workspace.relative(command_cwd),
+                "sandbox": launch.metadata,
             },
         )
 
@@ -507,7 +550,9 @@ def _outside_workspace_argument(argv: list[str], workspace: Path) -> str | None:
     return None
 
 
-def _command_environment(workspace: Path) -> dict[str, str]:
+def _command_environment(
+    workspace: Path, *, home: Path, temp: Path, cache: Path
+) -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -523,6 +568,17 @@ def _command_environment(workspace: Path) -> dict[str, str]:
     ordered = [str(path) for path in runtime_dirs if path.is_dir()]
     ordered.extend(path for path in existing if path and path not in ordered)
     environment["PATH"] = os.pathsep.join(ordered)
+    environment.update(
+        {
+            "HOME": str(home),
+            "TMPDIR": str(temp),
+            "TMP": str(temp),
+            "TEMP": str(temp),
+            "XDG_CACHE_HOME": str(cache),
+            "UV_CACHE_DIR": str(cache / "uv"),
+            "npm_config_cache": str(cache / "npm"),
+        }
+    )
     return environment
 
 

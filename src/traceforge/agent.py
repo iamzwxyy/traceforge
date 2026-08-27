@@ -578,6 +578,7 @@ class AgentManager:
                     result = self._apply_plan_update(run, call)
                 else:
                     assessment = self.tools.assess(call, run.plan)
+                    sandbox_bypass = False
                     if assessment.decision is PermissionDecision.DENY:
                         result = ToolResult(
                             tool_call_id=call.id,
@@ -598,11 +599,14 @@ class AgentManager:
                                 self._append_tool_result(run, result)
                                 await self._emit_tool_result(run, call, result)
                                 continue
+                            sandbox_bypass = call.name == "run_command"
                         await self._transition(run, RunState.EXECUTING)
                         await self.broker.emit(
                             run.id, EventType.TOOL_STARTED, call.model_dump(mode="json")
                         )
-                        result = await self.tools.execute(run.id, call)
+                        result = await self.tools.execute(
+                            run.id, call, sandbox_bypass=sandbox_bypass
+                        )
                 result = self._redact_result(result)
                 self._append_tool_result(run, result)
                 await self._update_checks_and_diff(run, call, result)

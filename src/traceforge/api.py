@@ -45,6 +45,7 @@ from traceforge.models import (
 from traceforge.proof import build_proof_pack, proof_pack_markdown
 from traceforge.provider import ModelProvider
 from traceforge.runtime import AgentRuntime, resolve_workspace
+from traceforge.sandbox import sandbox_status
 from traceforge.storage import Storage
 from traceforge.workspace import Workspace
 
@@ -204,6 +205,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             "base_url": config.base_url or "https://api.openai.com/v1",
             "api_key_configured": runtime.credential_configured(config),
             "suggested_task": settings.suggested_task,
+            "sandbox": sandbox_status(settings.workspace).as_dict(),
             "limits": {
                 "context": settings.context_limit,
                 "steps": settings.max_steps,

@@ -184,6 +184,13 @@ function Header({
           <span>{run?.workspace ?? status?.last_workspace ?? "Connecting…"}</span>
         </div>
         <div className="context-item"><Sparkles size={14} /><span>{status?.model ?? "—"}</span></div>
+        <div
+          className={`sandbox-status ${status?.sandbox.enforced ? "enforced" : status ? "degraded" : "pending"}`}
+          title={status?.sandbox.detail ?? "Detecting command sandbox…"}
+        >
+          <ShieldCheck size={13} />
+          <span>{!status ? "Detecting" : status.sandbox.enforced ? status.sandbox.backend : "Policy only"}</span>
+        </div>
         {run && <div className="context-item"><Wrench size={14} /><span>{run.step_count} steps</span></div>}
         {run && (
           <div
@@ -835,6 +842,7 @@ function ActivityItem({ event }: { event: RunEvent }) {
 function ToolActivityItem({ event }: { event: RunEvent }) {
   const call = (event.payload.call ?? {}) as { name?: string; arguments?: Record<string, unknown> };
   const result = (event.payload.result ?? {}) as { ok?: boolean; output?: string; error?: string; metadata?: Record<string, unknown> };
+  const sandbox = result.metadata?.sandbox as { status?: string; backend?: string } | undefined;
   const [expanded, setExpanded] = useState(!result.ok);
   return (
     <article className={`activity tool-card ${result.ok ? "ok" : "bad"}`}>
@@ -842,6 +850,7 @@ function ToolActivityItem({ event }: { event: RunEvent }) {
       <div className="tool-body">
         <button className="tool-summary" type="button" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
           <span className="tool-summary-copy"><span className="tool-title"><code>{call.name ?? "tool"}</code><em>{result.ok ? "completed" : "failed"}</em></span><span className="tool-args">{formatArguments(call.arguments)}</span></span>
+          {sandbox && <span className={`sandbox-evidence ${sandbox.status}`}>{sandbox.status === "enforced" ? sandbox.backend : sandbox.status}</span>}
           <ChevronDown className={`tool-chevron ${expanded ? "expanded" : ""}`} size={13} />
         </button>
         {expanded && (result.output || result.error) && <pre>{result.error ?? result.output}</pre>}
@@ -985,7 +994,7 @@ function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; run
         <div className="modal-heading"><div><p className="eyebrow">AUDITABLE COMPLETION</p><h2 id="proof-title">Proof Pack</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close proof pack"><X size={17} /></button></div>
         {!pack ? <div className="proof-loading"><LoaderCircle className="spin" size={18} /> Assembling persisted evidence…</div> : <>
           <div className={`proof-verdict ${pack.proof_status}`}><div className="evidence-seal"><Fingerprint size={22} /></div><div><span>PROOF STATUS</span><strong>{pack.proof_status.replaceAll("_", " ")}</strong><small>{pack.verification?.summary ?? "Evidence is still being assembled."}</small></div><div><span>FRESH CHECKS</span><strong>{pack.checks_fresh ? "YES" : "NO"}</strong></div></div>
-          <div className="proof-grid"><article><span>PLAN GATE</span><strong>{pack.plan_gate?.decision.replaceAll("_", " ") ?? "not assessed"}</strong><small>{pack.plan_gate?.reasons.join(" · ")}</small></article><article><span>CHANGE SCOPE</span><strong>{pack.changed_files.length} file{pack.changed_files.length === 1 ? "" : "s"}</strong><small>{pack.changed_files.join(" · ") || "No snapshots"} · {pack.diff_source.replaceAll("_", " ")}</small></article><article><span>ROLLBACK</span><strong>{pack.rollback.status}</strong><small>{pack.rollback.conflicts.length ? `${pack.rollback.conflicts.length} conflicts preserved` : "Conflict-aware"}</small></article><article><span>EVENT LEDGER</span><strong>{pack.event_count} events</strong><small>{pack.step_count} tool steps · {pack.repair_cycles} repairs</small></article></div>
+          <div className="proof-grid"><article><span>PLAN GATE</span><strong>{pack.plan_gate?.decision.replaceAll("_", " ") ?? "not assessed"}</strong><small>{pack.plan_gate?.reasons.join(" · ")}</small></article><article><span>CHANGE SCOPE</span><strong>{pack.changed_files.length} file{pack.changed_files.length === 1 ? "" : "s"}</strong><small>{pack.changed_files.join(" · ") || "No snapshots"} · {pack.diff_source.replaceAll("_", " ")}</small></article><article><span>COMMAND SANDBOX</span><strong>{pack.command_sandbox.status.replaceAll("_", " ")}</strong><small>{pack.command_sandbox.backends.join(" · ") || "No OS backend recorded"} · {pack.command_sandbox.sandboxed_commands} enforced</small></article><article><span>ROLLBACK</span><strong>{pack.rollback.status}</strong><small>{pack.rollback.conflicts.length ? `${pack.rollback.conflicts.length} conflicts preserved` : "Conflict-aware"}</small></article><article><span>EVENT LEDGER</span><strong>{pack.event_count} events</strong><small>{pack.step_count} tool steps · {pack.repair_cycles} repairs</small></article></div>
           <div className="proof-section"><div className="section-kicker">REQUEST</div><p>{pack.task}</p></div>
           <div className="proof-section"><div className="section-kicker">ACCEPTANCE EVIDENCE</div>{pack.plan?.acceptance_checks.map((check) => <div className="proof-check" key={check.id}><CheckCircle2 size={14} /><span><strong>{check.label}</strong><small>{check.evidence || check.command?.join(" ") || "Awaiting evidence"}</small></span><em>{check.status}</em></div>) ?? <p className="muted">No completion contract yet.</p>}</div>
           <div className="digest-card"><Fingerprint size={15} /><span><small>STABLE EVIDENCE SHA-256</small><code>{pack.evidence_sha256}</code></span></div>

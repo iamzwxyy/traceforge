@@ -262,6 +262,16 @@ class ProofRollback(BaseModel):
     conflicts: list[str] = Field(default_factory=list)
 
 
+class ProofCommandSandbox(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["enforced", "mixed", "bypassed", "policy_only", "not_used"]
+    backends: list[str] = Field(default_factory=list)
+    sandboxed_commands: int = Field(ge=0)
+    bypassed_commands: int = Field(ge=0)
+    policy_only_commands: int = Field(ge=0)
+
+
 class ProofPack(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -282,6 +292,7 @@ class ProofPack(BaseModel):
     checks_fresh: bool
     verification: VerificationReport | None = None
     rollback: ProofRollback
+    command_sandbox: ProofCommandSandbox
     event_count: int = Field(ge=0)
     event_chain_sha256: str
     step_count: int = Field(ge=0)

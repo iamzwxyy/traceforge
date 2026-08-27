@@ -24,6 +24,8 @@ const refreshEventTypes = new Set([
   "approval.requested",
   "approval.resolved",
   "verification.completed",
+  "repair.started",
+  "run.resumed",
   "run.completed",
   "rollback.completed",
 ]);

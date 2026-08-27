@@ -55,6 +55,10 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
     )
     app = create_app(settings, provider=provider)
     with TestClient(app) as client:
+        status_payload = client.get("/api/status").json()
+        assert status_payload["sandbox"]["backend"] in {"seatbelt", "bubblewrap", "none"}
+        assert isinstance(status_payload["sandbox"]["enforced"], bool)
+        assert status_payload["sandbox"]["detail"]
         response = client.post(
             "/api/runs", json={"task": "Observe this workspace", "verifier_enabled": False}
         )

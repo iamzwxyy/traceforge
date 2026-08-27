@@ -45,6 +45,9 @@ code, pre { font-family: var(--mono); }
 .workspace-path span { overflow: hidden; text-overflow: ellipsis; }
 .connection.online { color: var(--accent); border-color: rgba(62, 214, 157, 0.22); background: var(--accent-soft); }
 .connection.offline { color: var(--amber); }
+.sandbox-status { padding: 4px 7px; display: inline-flex; align-items: center; gap: 5px; color: var(--accent); border: 1px solid rgba(62, 214, 157, 0.22); border-radius: 5px; background: var(--accent-soft); font: 700 8px var(--mono); text-transform: uppercase; }
+.sandbox-status.degraded { color: var(--amber); border-color: rgba(240, 182, 91, 0.24); background: rgba(240, 182, 91, 0.08); }
+.sandbox-status.pending { color: var(--faint); border-color: var(--line); background: transparent; }
 .global-error { position: absolute; z-index: 20; top: 72px; left: 50%; transform: translateX(-50%); min-width: 400px; max-width: 720px; padding: 11px 14px; display: flex; align-items: center; gap: 9px; color: #ffd4d4; border: 1px solid rgba(241, 120, 120, 0.4); border-radius: 8px; background: rgba(62, 18, 24, 0.96); box-shadow: 0 14px 50px rgba(0, 0, 0, 0.4); font-size: 12px; }
 .global-error button { margin-left: auto; border: 0; background: transparent; cursor: pointer; }
 
@@ -210,6 +213,8 @@ code, pre { font-family: var(--mono); }
 .tool-args { margin: 5px 0 0; overflow: hidden; color: #7d8999; font: 9px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .tool-chevron { flex: 0 0 auto; color: #596579; transition: transform 160ms ease; }
 .tool-chevron.expanded { transform: rotate(180deg); }
+.sandbox-evidence { flex: 0 0 auto; padding: 2px 5px; color: var(--accent); border: 1px solid rgba(62, 214, 157, 0.2); border-radius: 4px; background: var(--accent-soft); font: 700 7px var(--mono); text-transform: uppercase; }
+.sandbox-evidence.bypassed, .sandbox-evidence.policy_only { color: var(--amber); border-color: rgba(240, 182, 91, 0.24); background: rgba(240, 182, 91, 0.08); }
 .tool-body pre, .approval-panel pre { max-height: 170px; margin: 0 9px 9px; padding: 9px; overflow: auto; color: #aeb9c7; border-radius: 5px; background: #090d13; font-size: 8px; line-height: 1.55; white-space: pre-wrap; }
 .evidence-activity > div:last-child { min-width: 0; padding-top: 2px; display: flex; flex-direction: column; gap: 3px; }
 .evidence-activity strong { color: #dce6ef; font-size: 10px; text-transform: capitalize; }
@@ -351,7 +356,7 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 11px; font-weight: 600; 
 .proof-verdict span { color: #6f7e90; font: 700 7px var(--mono); letter-spacing: 0.1em; }
 .proof-verdict strong { margin-top: 3px; font: 16px var(--mono); text-transform: uppercase; }
 .proof-verdict small { margin-top: 4px; color: #93a0ae; font-size: 9px; }
-.proof-grid { margin-top: 11px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.proof-grid { margin-top: 11px; display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 8px; }
 .proof-grid article { min-width: 0; padding: 10px; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; background: rgba(9, 13, 19, 0.65); }
 .proof-grid span { color: var(--faint); font: 700 7px var(--mono); letter-spacing: 0.1em; }
 .proof-grid strong { margin-top: 6px; overflow: hidden; color: #d5dee8; font-size: 10px; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }

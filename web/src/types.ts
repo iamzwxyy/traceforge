@@ -128,6 +128,11 @@ export interface AppStatus {
   base_url: string;
   api_key_configured: boolean;
   suggested_task: string | null;
+  sandbox: {
+    backend: "seatbelt" | "bubblewrap" | "none";
+    enforced: boolean;
+    detail: string;
+  };
   limits: {
     context: number;
     steps: number;
@@ -203,6 +208,13 @@ export interface ProofPack {
   checks_fresh: boolean;
   verification: VerificationReport | null;
   rollback: ProofRollback;
+  command_sandbox: {
+    status: "enforced" | "mixed" | "bypassed" | "policy_only" | "not_used";
+    backends: string[];
+    sandboxed_commands: number;
+    bypassed_commands: number;
+    policy_only_commands: number;
+  };
   event_count: number;
   event_chain_sha256: string;
   step_count: number;

@@ -14,6 +14,7 @@ class Settings:
     api_key: str
     base_url: str | None
     model: str
+    credential_file: Path | None = None
     context_limit: int = 64_000
     command_timeout: int = 120
     max_command_timeout: int = 600

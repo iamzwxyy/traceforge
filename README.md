@@ -27,8 +27,9 @@ Its differentiator is a defensible engineering loop with useful human control.
   and Rollback are available in one local web workbench.
 - **Low-friction workspaces.** Start a direct task in the last-used directory, or register a
   project when several runs should share a stable root. Neither mode copies or uploads files.
-- **Safety by construction.** Paths are workspace-bounded, symlink escapes and `.git` writes are
-  rejected, commands never use a shell, and dangerous operations are denied.
+- **Layered, inspectable command isolation.** Routine and planned commands run under macOS
+  Seatbelt or Linux Bubblewrap when available; the UI and Proof Pack distinguish enforced,
+  user-approved bypass, and policy-only execution instead of presenting approval as a sandbox.
 - **Recoverable execution.** Runs and events survive in SQLite. File snapshots support
   conflict-aware whole-run rollback without overwriting later user edits.
 
@@ -100,7 +101,8 @@ permissions, local execution, persistence, context compaction, retries, and term
 not use an agent framework or provider-hosted file/code tools.
 
 See [Architecture](docs/architecture.md), [Security model](docs/security.md),
-[AIME UI benchmark](docs/ui-benchmark.md), [Fault-injection evidence](docs/fault-injection.md), and
+[Sandbox evidence](docs/sandbox.md), [AIME UI benchmark](docs/ui-benchmark.md),
+[Fault-injection evidence](docs/fault-injection.md), and
 [Interview guide](docs/interview-guide.md) for the design rationale and failure semantics.
 
 ## Development
@@ -123,7 +125,7 @@ pnpm --filter traceforge-web build
 pnpm --filter traceforge-web e2e
 ```
 
-The current suite has 86 backend tests at 86.83% coverage (with a hard 85% gate), frontend unit
+The current suite has 92 backend tests at 86.19% coverage (with a hard 85% gate), frontend unit
 tests, a full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
 
 ## Repository map
@@ -140,9 +142,11 @@ scripts/              tracked-file credential scan
 ## Scope and limitations
 
 TraceForge v0.1 supports one active run per workspace and can run independent workspaces
-concurrently on macOS/Linux. It is local-first, not a multi-user service or an OS sandbox.
-Approved project commands execute with the current user's permissions, so the exact argv and risk
-reason are always shown for unknown actions. Binary file editing, Windows, parallel agents,
-browser automation, and plugin systems are outside v0.1.
+concurrently on macOS/Linux. It is local-first and not a multi-user service. OS isolation is
+backend-dependent: Seatbelt is built into supported macOS systems; Linux requires a working,
+non-setuid Bubblewrap installation. The header reports a visible **Policy only** state when no
+backend passes its startup probe. A user can explicitly approve an unknown command for one
+unsandboxed execution, which is recorded as a bypass. Binary file editing, Windows, parallel
+agents, browser automation, and plugin systems are outside v0.1.
 
 Licensed under the [MIT License](LICENSE).

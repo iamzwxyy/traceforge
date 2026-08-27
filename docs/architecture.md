@@ -20,6 +20,7 @@ flowchart TB
     Manager --> Context[ContextManager]
     Tools --> Guard[Workspace guard + snapshots]
     Tools --> Process[argv subprocess runner]
+    Process --> Sandbox[Seatbelt / Bubblewrap / explicit policy-only]
     Manager --> Broker[EventBroker]
     Broker --> DB[(SQLite WAL)]
     Guard --> DB
@@ -34,6 +35,8 @@ flowchart TB
 - `assess_plan_gate` is a deterministic policy projection over the task and structured plan; the
   model cannot label its own work low-risk.
 - `ToolRegistry` defines and executes the bounded local capability surface.
+- `CommandSandbox` probes an OS backend and constructs a per-command profile; it returns structured
+  enforcement metadata even when execution is policy-only or explicitly bypassed.
 - `Workspace` resolves paths, records the first pre-change snapshot, creates diffs, and rolls back.
 - `EventBroker` persists an event before publishing it, so reconnecting clients cannot miss a
   transition.
@@ -97,8 +100,11 @@ action approval, so automatic plan approval does not silently broaden the scope.
 ### Building
 
 The builder receives the original task and approved plan. It can call six local file/process tools
-plus the structured `update_plan` and `finish` controls. File mutations invalidate prior command evidence.
-`finish` is rejected until every command-backed acceptance check has a fresh passing result.
+plus the structured `update_plan` and `finish` controls. File mutations invalidate prior command
+evidence. Exact acceptance commands and known read-only commands enter the OS sandbox when its
+probe succeeds. An unknown executable action pauses; user approval grants one visibly recorded
+unsandboxed invocation rather than silently weakening later commands. `finish` is rejected until
+every command-backed acceptance check has a fresh passing result.
 
 The loop has three independent brakes:
 
@@ -125,7 +131,7 @@ the agent from citing stale tests after a repair.
 
 Tool output has two limits: at most 1 MiB is persisted and at most 16 KiB (head and tail) is sent
 back to the model. The complete public status still includes exit code, timeout, truncation, argv,
-and working directory metadata.
+working directory, and per-command sandbox metadata.
 
 ## Proof Pack projection
 
@@ -133,7 +139,8 @@ and working directory metadata.
 and sequenced events. For completed work it prefers the diff stored in the completion event; for
 earlier terminal states it uses the last persisted diff event, falling back to the live workspace
 only when no persisted diff exists. Later user edits therefore do not rewrite a successful run's
-historical delivery evidence.
+historical delivery evidence. It also counts commands by enforced, bypassed, and policy-only
+execution so the exported artifact cannot imply stronger isolation than the event ledger proves.
 
 The projection includes the visible plan and gate, touched paths, final diff, fresh check results,
 independent verdict, rollback outcome, counts, and two SHA-256 values: one for the event sequence

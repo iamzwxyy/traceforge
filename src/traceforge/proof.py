@@ -8,6 +8,7 @@ from typing import Any, Literal
 from traceforge.models import (
     CheckStatus,
     EventType,
+    ProofCommandSandbox,
     ProofPack,
     ProofRollback,
     RunEvent,
@@ -25,6 +26,7 @@ def build_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
     snapshots = storage.list_snapshots(run.id)
     diff, diff_source = _evidence_diff(run, storage, events)
     rollback = _rollback_evidence(events, has_snapshots=bool(snapshots))
+    command_sandbox = _command_sandbox_evidence(events)
     proof_status = _proof_status(run)
     checks = run.plan.acceptance_checks if run.plan else []
     checks_fresh = bool(checks) and all(
@@ -52,6 +54,7 @@ def build_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
             run.verification.model_dump(mode="json") if run.verification else None
         ),
         "rollback": rollback.model_dump(mode="json"),
+        "command_sandbox": command_sandbox.model_dump(mode="json"),
         "event_count": len(events),
         "event_chain_sha256": event_chain_sha256,
         "step_count": run.step_count,
@@ -148,6 +151,14 @@ def proof_pack_markdown(pack: ProofPack) -> str:
             f"- Removed: {', '.join(pack.rollback.removed) or 'none'}",
             f"- Conflicts preserved: {', '.join(pack.rollback.conflicts) or 'none'}",
             "",
+            "## Command sandbox",
+            "",
+            f"Status: **{pack.command_sandbox.status}**",
+            f"- Backends: {', '.join(pack.command_sandbox.backends) or 'none'}",
+            f"- OS-sandboxed commands: {pack.command_sandbox.sandboxed_commands}",
+            f"- User-approved bypasses: {pack.command_sandbox.bypassed_commands}",
+            f"- Policy-only commands: {pack.command_sandbox.policy_only_commands}",
+            "",
         ]
     )
     return "\n".join(lines)
@@ -178,6 +189,56 @@ def _rollback_evidence(
             conflicts=list(payload.get("conflicts", [])),
         )
     return ProofRollback(status="available" if has_snapshots else "not_available")
+
+
+def _command_sandbox_evidence(events: list[RunEvent]) -> ProofCommandSandbox:
+    statuses: list[str] = []
+    backends: set[str] = set()
+    for event in events:
+        if event.type is not EventType.TOOL_COMPLETED:
+            continue
+        call = event.payload.get("call")
+        result = event.payload.get("result")
+        if not isinstance(call, dict) or call.get("name") != "run_command":
+            continue
+        if not isinstance(result, dict):
+            continue
+        metadata = result.get("metadata")
+        sandbox = metadata.get("sandbox") if isinstance(metadata, dict) else None
+        if not isinstance(sandbox, dict):
+            statuses.append("policy_only")
+            continue
+        status = str(sandbox.get("status", "policy_only"))
+        if status not in {"enforced", "bypassed", "policy_only"}:
+            status = "policy_only"
+        statuses.append(status)
+        backend = str(sandbox.get("backend", "none"))
+        if backend != "none":
+            backends.add(backend)
+    counts = {
+        status: statuses.count(status)
+        for status in ("enforced", "bypassed", "policy_only")
+    }
+    overall: Literal["enforced", "mixed", "bypassed", "policy_only", "not_used"]
+    if not statuses:
+        overall = "not_used"
+    elif len(set(statuses)) > 1:
+        overall = "mixed"
+    else:
+        single = statuses[0]
+        if single == "enforced":
+            overall = "enforced"
+        elif single == "bypassed":
+            overall = "bypassed"
+        else:
+            overall = "policy_only"
+    return ProofCommandSandbox(
+        status=overall,
+        backends=sorted(backends),
+        sandboxed_commands=counts["enforced"],
+        bypassed_commands=counts["bypassed"],
+        policy_only_commands=counts["policy_only"],
+    )
 
 
 def _evidence_diff(

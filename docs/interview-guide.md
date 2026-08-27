@@ -19,7 +19,7 @@ plus one read-only verifier instead of many parallel agents.
 | 0:10-0:25 | Clarification card, plan, and risk gate | Options prevent a silent compatibility assumption; the gate explains why approval is required. |
 | 0:25-1:05 | Accelerated tool timeline and diff | Bounded native tools, dynamic plan status, real test command, stale-check invalidation. |
 | 1:05-1:30 | Checks and verifier tabs | Exit code and output are evidence; verifier has no write/execute tools. |
-| 1:30-1:50 | Evidence board and Proof Pack | Final verdict, persisted diff source, integrity digest, and conflict-aware recovery. |
+| 1:30-1:50 | Evidence board and Proof Pack | Final verdict, persisted diff source, command-sandbox evidence, integrity digest, and conflict-aware recovery. |
 | 1:50-2:00 | Architecture diagram | Model proposes; TraceForge controls and proves. |
 
 ## Likely questions
@@ -59,9 +59,19 @@ claim is more defensible than calling the artifact tamper-proof.
 
 ### Why not run everything in Docker?
 
-The product targets a low-friction local demo on macOS/Linux. Application-level boundaries make
-normal mistakes safer and the README clearly states they are not an OS sandbox. For hostile code,
-an external container/VM is the correct additional boundary.
+The product targets a low-friction local demo on macOS/Linux. Routine commands use built-in
+Seatbelt on macOS or Bubblewrap on Linux when its probe succeeds, so the common path gets real OS
+enforcement without requiring a daemon or image build. The UI says `Policy only` when unavailable
+and records a user-approved escape as `bypassed`. This is still not a claim that arbitrary hostile
+native code is harmless; a disposable VM remains the correct outer boundary for that threat.
+
+### Is approval the same as sandboxing?
+
+No. Policy decides whether an action is routine, approval records a human decision, and the OS
+sandbox constrains what a process can technically do. Planned checks normally stay sandboxed. An
+unknown command pauses; approving it creates one unsandboxed invocation and a visible bypass event.
+The header, tool row, and Proof Pack all expose the actual state, including degraded policy-only
+machines.
 
 ### What happens on a crash in the middle of a command?
 
@@ -77,8 +87,8 @@ recoverable view of the same source of truth rather than a best-effort stream.
 
 ### What would you build next?
 
-First: fault-injection scenarios and OS-level sandbox profiles with explicit degraded states.
-Second: richer language-aware patch validation. Third: evaluation across a fixed task corpus.
+First: evaluation across a fixed task corpus and a polished release/demo rehearsal. Second: richer
+language-aware patch validation. Third: optional stronger Linux profiles and signed evidence.
 Parallel writers and plugins come later because they complicate attribution and recovery more than
 they improve this v0.1 demo.
 
@@ -86,6 +96,7 @@ they improve this v0.1 demo.
 
 - `src/traceforge/agent.py`: state machine and clarify/build/verify loop
 - `src/traceforge/tools.py`: schemas, permission classification, process control
+- `src/traceforge/sandbox.py`: OS backend probe, profiles, and explicit degraded/bypass metadata
 - `src/traceforge/workspace.py`: path boundary, snapshots, diff, rollback
 - `src/traceforge/storage.py`: WAL persistence and migrations
 - `src/traceforge/api.py`: public data boundary and sequenced WebSocket
