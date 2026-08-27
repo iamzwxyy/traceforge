@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Ubuntu quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install locked dependencies
+        run: |
+          uv sync --locked --all-extras
+          pnpm install --frozen-lockfile
+          pnpm --filter traceforge-web exec playwright install --with-deps chromium
+
+      - name: Python quality
+        run: |
+          uv run ruff check src tests scripts
+          uv run mypy src
+          uv run pytest --cov=traceforge --cov-report=term -q
+          uv run python scripts/check_secrets.py
+
+      - name: Web quality
+        run: |
+          pnpm --filter traceforge-web lint
+          pnpm --filter traceforge-web typecheck
+          pnpm --filter traceforge-web test --run
+          pnpm --filter traceforge-web build
+          pnpm --filter traceforge-web e2e
+
+      - name: Build distribution
+        run: uv build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: traceforge-dist
+          path: dist/*
+
+  macos-smoke:
+    name: macOS smoke
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install and smoke test
+        run: |
+          uv sync --locked --all-extras
+          uv run traceforge --help
+          uv run pytest -q tests/test_demo.py tests/test_workspace.py
+          uv build
