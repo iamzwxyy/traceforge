@@ -1,13 +1,126 @@
 # TraceForge
 
-TraceForge is a local coding agent that makes its completion evidence visible. It turns a task into an approved plan, edits a bounded workspace, runs explicit checks, and asks an independent read-only verifier to assess the diff and command evidence.
+TraceForge is a local coding agent that makes completion evidence visible. It turns a request
+into an approved plan, works through a bounded set of native tools, runs explicit acceptance
+checks, and asks an independent read-only verifier to judge the result.
 
-> The project is under active construction. See [PLAN.md](PLAN.md) for the agreed product contract.
+The project is intentionally focused: no pet, plugin market, hosted execution, or IDE clone.
+Its differentiator is a defensible engineering loop with useful human control.
 
-## Safety baseline
+## Why it stands out
 
-- Model credentials are read only from environment variables.
-- File tools cannot escape the selected workspace or write into `.git`.
-- Commands use argv execution rather than a shell and unknown or risky actions require approval.
-- Every agent-authored file change is snapshotted for conflict-aware whole-run rollback.
+- **Material clarification, not guesswork.** Complex requests can pause for one to three
+  questions, each with mutually exclusive options and a recommended choice.
+- **Plan as a completion contract.** No mutation starts before plan approval. Builder progress,
+  check status, exact commands, and evidence stay visible.
+- **Independent verification.** The verifier cannot write files or run commands. A rejection
+  returns concrete findings to the builder for at most two repair cycles.
+- **Evidence-first UI.** Timeline, unified diff, check output, verdict, approvals, Stop, Resume,
+  and Rollback are available in one local web workbench.
+- **Safety by construction.** Paths are workspace-bounded, symlink escapes and `.git` writes are
+  rejected, commands never use a shell, and dangerous operations are denied.
+- **Recoverable execution.** Runs and events survive in SQLite. File snapshots support
+  conflict-aware whole-run rollback without overwriting later user edits.
 
+## Try the complete demo
+
+Requirements: macOS or Linux, Python 3.12, and [uv](https://docs.astral.sh/uv/).
+No API key or Node.js installation is needed for the packaged demo.
+
+```bash
+git clone <REPOSITORY_URL>
+cd traceforge
+uv sync --locked --all-extras
+uv run traceforge demo
+```
+
+Open <http://127.0.0.1:8765>. The task is prefilled. Start it, choose the recommended API
+compatibility option, approve the plan, and watch TraceForge repair a real cross-tenant cache
+isolation bug. The demo changes a disposable copy, executes four real Pytest tests, and produces
+a read-only verifier verdict.
+
+## Run against your own workspace
+
+TraceForge accepts an OpenAI-compatible Chat Completions endpoint with native tool calling.
+
+```bash
+export OPENAI_API_KEY="..."
+export OPENAI_MODEL="your-tool-calling-model"
+# Optional for compatible providers:
+export OPENAI_BASE_URL="https://provider.example/v1"
+
+uv run traceforge serve --workspace /absolute/path/to/project --port 8765
+```
+
+Only four configuration variables are read:
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | yes | Provider credential; never returned by the API or UI |
+| `OPENAI_MODEL` | no | Defaults to `gpt-5.6-sol` |
+| `OPENAI_BASE_URL` | no | OpenAI-compatible endpoint |
+| `TRACEFORGE_CONTEXT_LIMIT` | no | Token-window estimate; defaults to 64,000 |
+
+## How a run works
+
+```mermaid
+flowchart LR
+    A[Task] --> B[Inspect and clarify]
+    B --> C[Plan approval]
+    C --> D[Builder and native tools]
+    D --> E[Acceptance checks]
+    E --> F[Read-only verifier]
+    F -->|pass| G[Evidence board]
+    F -->|findings, max 2| D
+    D -. snapshots .-> H[Conflict-aware rollback]
+```
+
+The model proposes actions; TraceForge owns the state machine, message history, tool dispatch,
+permissions, local execution, persistence, context compaction, retries, and termination. It does
+not use an agent framework or provider-hosted file/code tools.
+
+See [Architecture](docs/architecture.md), [Security model](docs/security.md), and
+[Interview guide](docs/interview-guide.md) for the design rationale and failure semantics.
+
+## Development
+
+Frontend sources require Node.js 22 and pnpm 11. The production bundle is committed under the
+Python package so end users still need only Python.
+
+```bash
+uv sync --locked --all-extras
+pnpm install --frozen-lockfile
+
+uv run ruff check src tests scripts
+uv run mypy src
+uv run pytest --cov=traceforge --cov-report=term -q
+
+pnpm --filter traceforge-web lint
+pnpm --filter traceforge-web typecheck
+pnpm --filter traceforge-web test --run
+pnpm --filter traceforge-web build
+pnpm --filter traceforge-web e2e
+```
+
+The current suite has 48 backend tests with a hard 85% coverage gate, frontend unit tests, a
+full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
+
+## Repository map
+
+```text
+src/traceforge/       agent core, tools, persistence, API, CLI, packaged UI
+web/                  React workbench and Playwright test
+demo/tenant-cache-api bundled real-task fixture
+tests/                unit, adversarial, integration, recovery, and API tests
+docs/                 architecture, security, and interview rationale
+scripts/              tracked-file credential scan
+```
+
+## Scope and limitations
+
+TraceForge v0.1 supports one active run per workspace on macOS/Linux. It is local-first, not a
+multi-user service or an OS sandbox. Approved project commands execute with the current user's
+permissions, so the exact argv and risk reason are always shown for unknown actions. Binary file
+editing, Windows, parallel agents, browser automation, and plugin systems are outside v0.1.
+
+Licensed under the [MIT License](LICENSE).
