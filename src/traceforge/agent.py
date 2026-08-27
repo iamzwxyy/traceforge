@@ -320,6 +320,20 @@ class AgentManager:
                         ),
                     }
                 )
+                self.storage.save_run(run)
+                await self.broker.emit(
+                    run.id,
+                    EventType.REPAIR_STARTED,
+                    {
+                        "cycle": run.repair_cycles,
+                        "limit": self.settings.max_repair_cycles,
+                        "verdict": report.verdict.value,
+                        "summary": report.summary,
+                        "findings": [
+                            finding.model_dump(mode="json") for finding in report.findings
+                        ],
+                    },
+                )
                 await self._transition(run, RunState.EXECUTING)
         except asyncio.CancelledError:
             current = self.storage.get_run(run_id)
@@ -344,7 +358,29 @@ class AgentManager:
         previous = run.interrupted_from
         run.interrupted_from = None
         run.error = None
-        self._repair_incomplete_tool_protocol(run)
+        repaired_calls = self._repair_incomplete_tool_protocol(run)
+        if run.clarification is not None and not run.plan_approved:
+            strategy = "await_clarification"
+        elif run.plan is not None and not run.plan_approved:
+            strategy = (
+                "persisted_fast_path"
+                if run.plan_gate and run.plan_gate.decision == "auto_approved"
+                else "await_plan_approval"
+            )
+        elif run.plan_approved:
+            strategy = "inspect_before_execution"
+        else:
+            strategy = "restart_planning"
+        self.storage.save_run(run)
+        await self.broker.emit(
+            run.id,
+            EventType.RUN_RESUMED,
+            {
+                "interrupted_from": previous.value if previous else None,
+                "strategy": strategy,
+                "incomplete_tool_calls_repaired": repaired_calls,
+            },
+        )
         if run.clarification is not None and not run.plan_approved:
             await self._transition(run, RunState.AWAITING_CLARIFICATION)
             answers = await self._await_clarification(run)
@@ -1081,12 +1117,12 @@ class AgentManager:
         ]
 
     @staticmethod
-    def _repair_incomplete_tool_protocol(run: RunRecord) -> None:
+    def _repair_incomplete_tool_protocol(run: RunRecord) -> int:
         if not run.messages:
-            return
+            return 0
         last = run.messages[-1]
         if last.get("role") != "assistant" or not last.get("tool_calls"):
-            return
+            return 0
         for call in last["tool_calls"]:
             run.messages.append(
                 {
@@ -1101,6 +1137,7 @@ class AgentManager:
                     ),
                 }
             )
+        return len(last["tool_calls"])
 
 
 def _model_tool(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:

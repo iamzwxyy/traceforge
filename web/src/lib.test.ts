@@ -57,10 +57,32 @@ describe("mission control helpers", () => {
       { ...event(2), type: "tool.completed" },
       { ...event(3), type: "state.changed", payload: { state: "verifying" } },
       { ...event(4), type: "verification.completed" },
+      { ...event(5), type: "repair.started", payload: { cycle: 1 } },
+      { ...event(6), type: "state.changed", payload: { state: "executing" } },
+      { ...event(7), type: "tool.completed" },
+    ]);
+
+    expect(chapters.at(-1)?.label).toBe("Repair cycle 1");
+    expect(chapters.at(-1)?.events[0].type).toBe("repair.started");
+  });
+
+  it("starts a separate recovery chapter after an interrupted execution", () => {
+    const chapters = buildActivityChapters([
+      { ...event(1), type: "state.changed", payload: { state: "executing" } },
+      { ...event(2), type: "tool.completed" },
+      { ...event(3), type: "state.changed", payload: { state: "interrupted" } },
+      {
+        ...event(4),
+        type: "run.resumed",
+        payload: { strategy: "inspect_before_execution" },
+      },
       { ...event(5), type: "state.changed", payload: { state: "executing" } },
       { ...event(6), type: "tool.completed" },
     ]);
 
-    expect(chapters.at(-1)?.label).toBe("Repair cycle 1");
+    expect(chapters.map((chapter) => chapter.label)).toEqual([
+      "Build & checks",
+      "Recovery · resumed safely",
+    ]);
   });
 });

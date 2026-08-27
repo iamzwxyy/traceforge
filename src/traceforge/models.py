@@ -65,6 +65,8 @@ class EventType(StrEnum):
     APPROVAL_RESOLVED = "approval.resolved"
     DIFF_UPDATED = "diff.updated"
     VERIFICATION_COMPLETED = "verification.completed"
+    REPAIR_STARTED = "repair.started"
+    RUN_RESUMED = "run.resumed"
     ERROR = "error"
     RUN_COMPLETED = "run.completed"
     ROLLBACK_COMPLETED = "rollback.completed"

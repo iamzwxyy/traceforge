@@ -164,7 +164,12 @@ Startup migrations add compatible columns to early v0.1 databases. WebSocket cli
 events after their last sequence; the server replays persisted rows before subscribing to new
 ones. One workspace permits one active or interrupted run to avoid overlapping writes; different
 workspaces use separate managers and may run concurrently. On process startup, every unfinished
-run is marked interrupted before any workspace manager is created.
+run is marked interrupted before any workspace manager is created. The same SQLite transaction
+appends a `state.changed` event with the previous phase and `cause=process_restart`, so the recovery
+audit cannot disagree with the run row. Resume appends a `run.resumed` event with its
+application-selected strategy and the number of incomplete tool calls closed without replay. A
+verifier rejection similarly appends `repair.started` before builder work continues. See
+[Fault-injection evidence](fault-injection.md) for the deterministic failure matrix.
 
 ## Rollback algorithm
 

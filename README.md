@@ -100,8 +100,8 @@ permissions, local execution, persistence, context compaction, retries, and term
 not use an agent framework or provider-hosted file/code tools.
 
 See [Architecture](docs/architecture.md), [Security model](docs/security.md),
-[AIME UI benchmark](docs/ui-benchmark.md), and [Interview guide](docs/interview-guide.md) for the
-design rationale and failure semantics.
+[AIME UI benchmark](docs/ui-benchmark.md), [Fault-injection evidence](docs/fault-injection.md), and
+[Interview guide](docs/interview-guide.md) for the design rationale and failure semantics.
 
 ## Development
 
@@ -123,7 +123,7 @@ pnpm --filter traceforge-web build
 pnpm --filter traceforge-web e2e
 ```
 
-The current suite has 83 backend tests at 86.53% coverage (with a hard 85% gate), frontend unit
+The current suite has 86 backend tests at 86.83% coverage (with a hard 85% gate), frontend unit
 tests, a full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
 
 ## Repository map

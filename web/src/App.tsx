@@ -809,6 +809,23 @@ function ActivityItem({ event }: { event: RunEvent }) {
       </article>
     );
   }
+  if (event.type === "run.resumed") {
+    const repaired = Number(event.payload.incomplete_tool_calls_repaired ?? 0);
+    return (
+      <article className="activity evidence-activity recovery-activity">
+        <div className="activity-icon"><RotateCcw size={15} /></div>
+        <div><span className="activity-label">DURABLE RECOVERY</span><strong>{String(event.payload.strategy ?? "resumed").replaceAll("_", " ")}</strong><p>{repaired > 0 ? `${repaired} incomplete tool call${repaired === 1 ? "" : "s"} closed without replay` : "Current workspace will be inspected before any new action."}</p></div>
+      </article>
+    );
+  }
+  if (event.type === "repair.started") {
+    return (
+      <article className="activity evidence-activity repair-activity">
+        <div className="activity-icon"><Wrench size={15} /></div>
+        <div><span className="activity-label">BOUNDED REPAIR</span><strong>cycle {String(event.payload.cycle ?? "?")} of {String(event.payload.limit ?? "?")}</strong><p>{String(event.payload.summary ?? "Independent verification requested a repair.")}</p></div>
+      </article>
+    );
+  }
   if (event.type === "error") {
     return <Notice icon={<OctagonX size={17} />} title="Error" danger>{String(event.payload.message ?? "Unknown error")}</Notice>;
   }
@@ -1022,6 +1039,12 @@ function eventSummary(event: RunEvent): string {
     return `${decision} · ${risk} risk`;
   }
   if (event.type === "diff.updated") return "Workspace diff changed";
+  if (event.type === "run.resumed") {
+    return `Recovery: ${String(event.payload.strategy ?? "resumed").replaceAll("_", " ")}`;
+  }
+  if (event.type === "repair.started") {
+    return `Repair cycle ${String(event.payload.cycle ?? "?")} started`;
+  }
   return "Evidence recorded";
 }
 

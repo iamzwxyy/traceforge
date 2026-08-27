@@ -65,6 +65,13 @@ def test_mark_active_runs_interrupted(storage: Storage, settings: Settings) -> N
     assert storage.get_run("run-active").state is RunState.INTERRUPTED
     assert storage.get_run("run-done").state is RunState.SUCCEEDED
     assert storage.get_run("run-interrupted").interrupted_from is RunState.EXECUTING
+    interruption = storage.get_events("run-active")[-1]
+    assert interruption.type is EventType.STATE_CHANGED
+    assert interruption.payload == {
+        "state": "interrupted",
+        "previous": "executing",
+        "cause": "process_restart",
+    }
 
 
 def test_projects_provider_config_and_preferences(
@@ -124,6 +131,10 @@ def test_mark_all_active_runs_interrupted(storage: Storage, settings: Settings) 
     assert storage.mark_all_active_runs_interrupted() == 2
     assert storage.get_run("one").state is RunState.INTERRUPTED
     assert storage.get_run("two").state is RunState.INTERRUPTED
+    assert all(
+        storage.get_events(run_id)[-1].payload["cause"] == "process_restart"
+        for run_id in ("one", "two")
+    )
 
 
 def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:

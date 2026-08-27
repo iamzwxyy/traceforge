@@ -149,51 +149,66 @@ class Storage:
             )
 
     def mark_active_runs_interrupted(self, workspace: Path) -> int:
-        active = tuple(
-            state.value
-            for state in RunState
-            if not state.terminal and state is not RunState.INTERRUPTED
-        )
-        placeholders = ",".join("?" for _ in active)
-        with self._lock, self._connection:
-            cursor = self._connection.execute(
-                f"""
-                UPDATE runs
-                SET interrupted_from = state, state = ?, error = ?, updated_at = ?
-                WHERE workspace = ? AND state IN ({placeholders})
-                """,
-                (
-                    RunState.INTERRUPTED.value,
-                    "TraceForge stopped before this run reached a terminal state.",
-                    utc_now().isoformat(),
-                    str(workspace),
-                    *active,
-                ),
-            )
-            return cursor.rowcount
+        return self._mark_runs_interrupted("workspace = ?", (str(workspace),))
 
     def mark_all_active_runs_interrupted(self) -> int:
+        return self._mark_runs_interrupted("1 = 1", ())
+
+    def _mark_runs_interrupted(self, scope: str, parameters: tuple[str, ...]) -> int:
         active = tuple(
             state.value
             for state in RunState
             if not state.terminal and state is not RunState.INTERRUPTED
         )
         placeholders = ",".join("?" for _ in active)
+        now = utc_now()
         with self._lock, self._connection:
-            cursor = self._connection.execute(
+            rows = self._connection.execute(
                 f"""
-                UPDATE runs
-                SET interrupted_from = state, state = ?, error = ?, updated_at = ?
-                WHERE state IN ({placeholders})
+                SELECT id, state FROM runs
+                WHERE {scope} AND state IN ({placeholders})
                 """,
-                (
-                    RunState.INTERRUPTED.value,
-                    "TraceForge stopped before this run reached a terminal state.",
-                    utc_now().isoformat(),
-                    *active,
-                ),
-            )
-            return cursor.rowcount
+                (*parameters, *active),
+            ).fetchall()
+            for row in rows:
+                self._connection.execute(
+                    """
+                    UPDATE runs
+                    SET interrupted_from = state, state = ?, error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        RunState.INTERRUPTED.value,
+                        "TraceForge stopped before this run reached a terminal state.",
+                        now.isoformat(),
+                        row["id"],
+                    ),
+                )
+                sequence = self._connection.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE run_id = ?",
+                    (row["id"],),
+                ).fetchone()[0]
+                self._connection.execute(
+                    """
+                    INSERT INTO events(run_id, seq, type, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["id"],
+                        sequence,
+                        EventType.STATE_CHANGED.value,
+                        json.dumps(
+                            {
+                                "state": RunState.INTERRUPTED.value,
+                                "previous": row["state"],
+                                "cause": "process_restart",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now.isoformat(),
+                    ),
+                )
+            return len(rows)
 
     def create_run(self, run: RunRecord) -> None:
         with self._lock, self._connection:

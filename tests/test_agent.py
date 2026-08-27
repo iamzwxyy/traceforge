@@ -495,6 +495,115 @@ async def test_verifier_failure_triggers_one_repair_cycle(
     assert (settings.workspace / "result.txt").read_text() == "final\n"
     assert completed.plan is not None
     assert completed.plan.acceptance_checks[0].status.value == "passed"
+    repair = next(
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.REPAIR_STARTED
+    )
+    assert repair.payload["cycle"] == 1
+    assert repair.payload["verdict"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_repair_cannot_reuse_a_passing_check_from_before_the_edit(
+    settings: Settings, storage: Storage
+) -> None:
+    check = [
+        "python3",
+        "-c",
+        "from pathlib import Path; assert Path('result.txt').exists()",
+    ]
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_plan_arguments(check))
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="create",
+                        name="create_file",
+                        arguments={"path": "result.txt", "content": "draft\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[ToolCall(id="check-1", name="run_command", arguments={"argv": check})]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-1",
+                        name="finish",
+                        arguments={"summary": "Draft", "evidence": ["initial check"]},
+                    )
+                ]
+            ),
+            _verification("fail", "The value is still a draft."),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="repair",
+                        name="apply_patch",
+                        arguments={
+                            "patch": (
+                                "--- a/result.txt\n+++ b/result.txt\n"
+                                "@@ -1 +1 @@\n-draft\n+final\n"
+                            )
+                        },
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-stale",
+                        name="finish",
+                        arguments={"summary": "Final", "evidence": ["old check"]},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[ToolCall(id="check-2", name="run_command", arguments={"argv": check})]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-2",
+                        name="finish",
+                        arguments={"summary": "Final", "evidence": ["fresh check"]},
+                    )
+                ]
+            ),
+            _verification("pass", "The repaired value and fresh check satisfy the plan."),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Create a final value with current evidence")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    await manager.decide_plan(run.id, PlanDecision(decision="approve"))
+
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert (settings.workspace / "result.txt").read_text() == "final\n"
+    assert completed.plan is not None
+    assert completed.plan.acceptance_checks[0].status.value == "passed"
+    assert any(
+        "need fresh passing evidence" in (message.get("content") or "")
+        for request, _tools in provider.requests
+        for message in request
+        if message.get("role") == "tool"
+    )
+    check_events = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TOOL_COMPLETED
+        and event.payload["call"]["name"] == "run_command"
+    ]
+    assert len(check_events) == 2
 
 
 @pytest.mark.asyncio
@@ -649,6 +758,75 @@ async def test_shutdown_resume_plan_then_rollback(
     rollback = await second.rollback(run.id)
     assert rollback.conflicts == []
     assert storage.get_run(run.id).state is RunState.ROLLED_BACK
+    resumed = next(
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.RUN_RESUMED
+    )
+    assert resumed.payload["strategy"] == "await_plan_approval"
+
+
+@pytest.mark.asyncio
+async def test_resume_closes_an_incomplete_tool_call_without_replaying_it(
+    settings: Settings, storage: Storage
+) -> None:
+    interrupted_call = ModelResponse(
+        tool_calls=[
+            ToolCall(
+                id="unknown-side-effect",
+                name="create_file",
+                arguments={"path": "must-not-be-replayed.txt", "content": "unsafe\n"},
+            )
+        ]
+    ).as_assistant_message()
+    run = RunRecord(
+        id="resume-incomplete-tool",
+        task="Recover without guessing whether the last action ran",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.EXECUTING,
+        verifier_enabled=False,
+        plan=TaskPlan.model_validate(_review_plan()),
+        plan_approved=True,
+        messages=[interrupted_call],
+    )
+    storage.create_run(run)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={
+                            "summary": "Recovered after inspection",
+                            "evidence": ["no action replayed"],
+                        },
+                    )
+                ]
+            )
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    await manager.resume(run.id)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert not (settings.workspace / "must-not-be-replayed.txt").exists()
+    resumed = next(
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.RUN_RESUMED
+    )
+    assert resumed.payload == {
+        "interrupted_from": "executing",
+        "strategy": "inspect_before_execution",
+        "incomplete_tool_calls_repaired": 1,
+    }
+    first_request = provider.requests[0][0]
+    synthetic = next(message for message in first_request if message.get("role") == "tool")
+    assert "stopped before this tool call completed" in synthetic["content"]
 
 
 @pytest.mark.asyncio

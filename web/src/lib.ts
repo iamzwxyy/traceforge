@@ -63,6 +63,8 @@ const activityEventTypes = new Set([
   "tool.completed",
   "plan.gated",
   "verification.completed",
+  "repair.started",
+  "run.resumed",
   "error",
 ]);
 
@@ -85,13 +87,22 @@ export function buildActivityChapters(events: RunEvent[]): ActivityChapter[] {
       }
       continue;
     }
+    if (event.type === "run.resumed") {
+      const strategy = String(event.payload.strategy ?? "");
+      phase = strategy.includes("planning") || strategy.includes("clarification")
+        || strategy.includes("plan_approval") ? "planning" : "building";
+      current = null;
+    } else if (event.type === "repair.started") {
+      phase = "building";
+      current = null;
+    }
     if (!activityEventTypes.has(event.type)) continue;
     if (!current) {
       occurrences[phase] += 1;
       current = {
         id: `${phase}-${event.seq}`,
         phase,
-        label: chapterLabel(phase, occurrences[phase]),
+        label: chapterLabel(phase, occurrences[phase], event),
         events: [],
       };
       chapters.push(current);
@@ -110,7 +121,11 @@ function phaseForState(state: string): ActivityPhase | null {
   return null;
 }
 
-function chapterLabel(phase: ActivityPhase, occurrence: number): string {
+function chapterLabel(phase: ActivityPhase, occurrence: number, firstEvent: RunEvent): string {
+  if (firstEvent.type === "run.resumed") return "Recovery · resumed safely";
+  if (firstEvent.type === "repair.started") {
+    return `Repair cycle ${String(firstEvent.payload.cycle ?? occurrence)}`;
+  }
   if (phase === "planning") return "Planning & decisions";
   if (phase === "building") return occurrence === 1 ? "Build & checks" : `Repair cycle ${occurrence - 1}`;
   return occurrence === 1 ? "Independent verification" : `Verification round ${occurrence}`;

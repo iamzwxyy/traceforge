@@ -69,6 +69,28 @@ def test_rollback_skips_user_modified_file(workspace: Workspace, storage: Storag
     assert result.conflicts == ["file.txt"]
 
 
+def test_rollback_restores_safe_files_while_preserving_one_conflict(
+    workspace: Workspace, storage: Storage
+) -> None:
+    _create_run(storage, workspace)
+    safe = workspace.root / "safe.txt"
+    conflicted = workspace.root / "conflicted.txt"
+    safe.write_text("before safe\n")
+    conflicted.write_text("before conflict\n")
+    for target in (safe, conflicted):
+        workspace.snapshot("run-1", target)
+        target.write_text("agent\n")
+        workspace.record_agent_version("run-1", target)
+    conflicted.write_text("user keeps this\n")
+
+    result = workspace.rollback("run-1")
+
+    assert safe.read_text() == "before safe\n"
+    assert conflicted.read_text() == "user keeps this\n"
+    assert result.restored == ["safe.txt"]
+    assert result.conflicts == ["conflicted.txt"]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode test")
 def test_rollback_restores_permissions(workspace: Workspace, storage: Storage) -> None:
     _create_run(storage, workspace)
