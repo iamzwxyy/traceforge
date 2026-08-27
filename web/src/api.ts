@@ -6,6 +6,7 @@ import type {
   Project,
   ProofPack,
   ProviderConfig,
+  ProviderUpdate,
   ProviderProbe,
   Run,
   RunEvent,
@@ -55,7 +56,7 @@ export const api = {
   chooseDirectory: () =>
     request<DirectoryChoice>("/api/filesystem/choose-directory", { method: "POST" }),
   getProvider: () => request<ProviderConfig>("/api/provider"),
-  updateProvider: (config: Pick<ProviderConfig, "model" | "base_url" | "credential_file">) =>
+  updateProvider: (config: ProviderUpdate) =>
     request<ProviderConfig>("/api/provider", {
       method: "PUT",
       body: JSON.stringify(config),

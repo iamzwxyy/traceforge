@@ -8,6 +8,7 @@ import type {
   ProofPack,
   ProviderConfig,
   ProviderProbe,
+  ProviderUpdate,
   Run,
   RunEvent,
   RunTarget,
@@ -205,7 +206,7 @@ export function useTraceForge() {
   }, []);
 
   const saveProvider = useCallback(
-    async (config: Pick<ProviderConfig, "model" | "base_url" | "credential_file">) => {
+    async (config: ProviderUpdate) => {
       setError(null);
       try {
         const saved = await api.updateProvider(config);

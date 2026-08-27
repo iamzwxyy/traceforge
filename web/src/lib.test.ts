@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { buildActivityChapters, mergeEvents, parseDiff, preferNewerRun, presentState } from "./lib";
+import {
+  buildActivityChapters,
+  mergeEvents,
+  parseDiff,
+  preferNewerRun,
+  presentState,
+  shouldSubmitPrompt,
+} from "./lib";
 import type { Run, RunEvent } from "./types";
 
 function event(seq: number): RunEvent {
@@ -34,6 +41,13 @@ describe("mission control helpers", () => {
 
   it("presents evidence-backed success distinctly", () => {
     expect(presentState("succeeded")).toEqual({ label: "已证实", tone: "success" });
+  });
+
+  it("submits prompts on Enter while preserving Shift+Enter and IME composition", () => {
+    expect(shouldSubmitPrompt({ key: "Enter", shiftKey: false, isComposing: false })).toBe(true);
+    expect(shouldSubmitPrompt({ key: "Enter", shiftKey: true, isComposing: false })).toBe(false);
+    expect(shouldSubmitPrompt({ key: "Enter", shiftKey: false, isComposing: true })).toBe(false);
+    expect(shouldSubmitPrompt({ key: "a", shiftKey: false, isComposing: false })).toBe(false);
   });
 
   it("groups persisted activity into progressive-disclosure chapters", () => {

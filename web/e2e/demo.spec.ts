@@ -16,6 +16,8 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.locator(".sandbox-status")).toContainText(/seatbelt|bubblewrap|仅策略限制/i);
 
   await page.getByRole("button", { name: "模型设置" }).click();
+  await expect(page.locator('input[type="password"]')).toHaveAttribute("type", "password");
+  await page.getByText("高级：使用已有凭证文件").click();
   await page.getByLabel(/凭证文件路径/).fill("/does/not/exist");
   await page.getByRole("button", { name: "保存设置" }).click();
   const settingsError = page.getByRole("alert");
@@ -31,7 +33,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
 
   await expect(page.getByRole("button", { name: "添加项目" })).toBeDisabled();
 
-  await page.getByRole("button", { name: "开始任务" }).click();
+  await page.locator("textarea").press("Enter");
 
   await expect(page.getByRole("heading", { name: /选择会影响具体实现/ })).toBeVisible();
   await page.getByRole("radio", { name: /保留公共 API/ }).check();

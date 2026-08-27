@@ -33,9 +33,7 @@ def _plan_response() -> ModelResponse:
                 arguments={
                     "summary": "Observe the workspace",
                     "steps": [{"id": "observe", "title": "Observe"}],
-                    "acceptance_checks": [
-                        {"id": "observed", "label": "Workspace was observed"}
-                    ],
+                    "acceptance_checks": [{"id": "observed", "label": "Workspace was observed"}],
                 },
             )
         ]
@@ -74,9 +72,7 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
         assert waiting["context_tokens"] < waiting["context_limit"]
         assert waiting["context_limit"] == settings.context_limit
 
-        decision = client.post(
-            f"/api/runs/{run_id}/plan-decision", json={"decision": "approve"}
-        )
+        decision = client.post(f"/api/runs/{run_id}/plan-decision", json={"decision": "approve"})
         assert decision.status_code == 202
         completed = _wait_for_state(client, run_id, "succeeded")
         assert completed["verification"]["verdict"] == "inconclusive"
@@ -129,9 +125,7 @@ def test_projects_direct_tasks_and_directory_browser(settings: Settings, tmp_pat
     app = create_app(settings, provider=provider)
 
     with TestClient(app) as client:
-        browsed = client.get(
-            "/api/filesystem/directories", params={"path": str(tmp_path)}
-        )
+        browsed = client.get("/api/filesystem/directories", params={"path": str(tmp_path)})
         assert browsed.status_code == 200
         assert {entry["name"] for entry in browsed.json()["children"]} >= {
             "existing-project",
@@ -171,9 +165,7 @@ def test_projects_direct_tasks_and_directory_browser(settings: Settings, tmp_pat
         project_run = _wait_for_state(client, project.json()["id"], "awaiting_plan_approval")
         assert project_run["project_id"] == opened.json()["id"]
         assert project_run["workspace"] == str(existing_root.resolve())
-        assert client.get("/api/status").json()["last_workspace"] == str(
-            direct_root.resolve()
-        )
+        assert client.get("/api/status").json()["last_workspace"] == str(direct_root.resolve())
 
 
 def test_direct_task_allocates_an_isolated_workspace(settings: Settings) -> None:
@@ -235,9 +227,7 @@ def test_macos_directory_picker_reports_capability(
     selected.mkdir()
     app = create_app(settings, provider=ScriptedProvider([]))
     monkeypatch.setattr("traceforge.api.platform.system", lambda: "Darwin")
-    monkeypatch.setattr(
-        "traceforge.api._choose_macos_directory", lambda _initial: str(selected)
-    )
+    monkeypatch.setattr("traceforge.api._choose_macos_directory", lambda _initial: str(selected))
 
     with TestClient(app) as client:
         picked = client.post("/api/filesystem/choose-directory")
@@ -312,9 +302,57 @@ def test_provider_config_uses_a_file_reference_without_returning_secret(
         assert tested.json()["ok"] is True
 
 
-def test_provider_config_rejects_loose_credential_permissions(
-    settings: Settings, tmp_path
+def test_provider_config_stores_direct_api_key_in_owner_only_file(
+    settings: Settings,
 ) -> None:
+    secret = "tf-test-direct-key-4f392a"
+    app = create_app(settings, provider=ScriptedProvider([]))
+
+    with TestClient(app) as client:
+        updated = client.put(
+            "/api/provider",
+            json={
+                "model": "direct-key-model",
+                "base_url": "https://provider.example/v1",
+                "credential_file": None,
+                "api_key": secret,
+            },
+        )
+
+        assert updated.status_code == 200
+        payload = updated.json()
+        credential = Path(payload["credential_file"])
+        assert payload["credential_source"] == "file"
+        assert payload["api_key_configured"] is True
+        assert "api_key" not in payload
+        assert secret not in updated.text
+        assert credential.parent == settings.data_dir.resolve()
+        assert credential.read_text(encoding="utf-8") == f"{secret}\n"
+        assert credential.stat().st_mode & 0o777 == 0o600
+
+    for database_file in settings.data_dir.glob("traceforge.db*"):
+        assert secret.encode() not in database_file.read_bytes()
+
+
+def test_provider_config_rejects_multiple_credential_sources(settings: Settings) -> None:
+    app = create_app(settings, provider=ScriptedProvider([]))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/api/provider",
+            json={
+                "model": "model",
+                "credential_file": "/tmp/provider.key",
+                "api_key": "must-not-be-reflected",
+            },
+        )
+
+        assert response.status_code == 422
+        assert "either an API key or a credential file" in response.text
+        assert "must-not-be-reflected" not in response.text
+
+
+def test_provider_config_rejects_loose_credential_permissions(settings: Settings, tmp_path) -> None:
     credential = tmp_path / "provider.key"
     credential.write_text("probe\n")
     credential.chmod(0o644)
@@ -388,9 +426,7 @@ def test_api_allows_provider_repair_then_resume_after_transient_outage(
         resumed = client.post(f"/api/runs/{run_id}/resume")
         assert resumed.status_code == 200
         _wait_for_state(client, run_id, "awaiting_plan_approval")
-        approved = client.post(
-            f"/api/runs/{run_id}/plan-decision", json={"decision": "approve"}
-        )
+        approved = client.post(f"/api/runs/{run_id}/plan-decision", json={"decision": "approve"})
         assert approved.status_code == 202
         completed = _wait_for_state(client, run_id, "succeeded")
         assert completed["error"] is None

@@ -46,7 +46,13 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import ReactMarkdown from "react-markdown";
-import { buildActivityChapters, isActiveState, parseDiff, presentState } from "./lib";
+import {
+  buildActivityChapters,
+  isActiveState,
+  parseDiff,
+  presentState,
+  shouldSubmitPrompt,
+} from "./lib";
 import type {
   ClarificationAnswer,
   DirectoryListing,
@@ -55,6 +61,7 @@ import type {
   ProofPack,
   ProviderConfig,
   ProviderProbe,
+  ProviderUpdate,
   Run,
   RunEvent,
   RunState,
@@ -640,6 +647,20 @@ function TaskComposer({
           onChange={(event) => setTask(event.target.value)}
           readOnly={demoMode}
           aria-readonly={demoMode}
+          onKeyDown={(event) => {
+            if (
+              shouldSubmitPrompt({
+                key: event.key,
+                shiftKey: event.shiftKey,
+                isComposing: event.nativeEvent.isComposing,
+              })
+              && providerReady
+              && !submitting
+            ) {
+              event.preventDefault();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
           placeholder="例如：修复多租户缓存串读，保持 TTL 语义，补充回归测试并确保全部检查通过。"
           rows={6}
         />
@@ -849,20 +870,22 @@ function ProviderDialog({
 }: {
   provider: ProviderConfig;
   onClose: () => void;
-  onSave: (config: Pick<ProviderConfig, "model" | "base_url" | "credential_file">) => Promise<ProviderConfig>;
+  onSave: (config: ProviderUpdate) => Promise<ProviderConfig>;
   onTest: () => Promise<ProviderProbe>;
 }) {
   const [model, setModel] = useState(provider.model);
   const [baseUrl, setBaseUrl] = useState(provider.base_url ?? "");
+  const [apiKey, setApiKey] = useState("");
   const [credentialFile, setCredentialFile] = useState(provider.credential_file ?? "");
   const [working, setWorking] = useState<"save" | "test" | null>(null);
   const [probe, setProbe] = useState<ProviderProbe | null>(null);
   const { dialogRef, onDialogKeyDown } = useDialogFocus(onClose);
 
-  const config = {
+  const config: ProviderUpdate = {
     model: model.trim(),
     base_url: baseUrl.trim() || null,
-    credential_file: credentialFile.trim() || null,
+    credential_file: apiKey.trim() ? null : credentialFile.trim() || null,
+    ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
   };
 
   return (
@@ -876,16 +899,24 @@ function ProviderDialog({
           {provider.api_key_configured ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}
           <div>
             <strong>{provider.api_key_configured ? "凭证来源已就绪" : "需要凭证"}</strong>
-            <small>{provider.credential_source === "file" ? "仅所有者可读的本地文件" : provider.credential_source === "environment" ? provider.credential_env : "在下方添加文件路径，或设置 OPENAI_API_KEY"}</small>
+            <small>{provider.credential_source === "file" ? "已安全保存在仅当前用户可读的本地文件" : provider.credential_source === "environment" ? provider.credential_env : "在下方输入 API Key，或设置 OPENAI_API_KEY"}</small>
           </div>
         </div>
         <label className="field-label"><span>模型</span><input value={model} onChange={(event) => setModel(event.target.value)} data-dialog-initial-focus /></label>
         <label className="field-label"><span>OpenAI 兼容接口地址</span><input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.deepseek.com" /></label>
         <label className="field-label">
-          <span>凭证文件路径</span>
-          <input value={credentialFile} onChange={(event) => setCredentialFile(event.target.value)} placeholder="/absolute/path/to/owner-only-key-file" />
-          <small>文件必须只有一行，并使用仅所有者权限（chmod 600）。文件内容不会被保存或返回。</small>
+          <span>API Key</span>
+          <input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={provider.api_key_configured ? "已配置；留空则保持不变" : "输入模型服务的 API Key"} />
+          <small>只写入本机仅当前用户可读的私密文件；页面、数据库与运行记录都不会保存或回显 Key。</small>
         </label>
+        <details className="advanced-settings">
+          <summary>高级：使用已有凭证文件</summary>
+          <label className="field-label">
+            <span>凭证文件路径</span>
+            <input value={credentialFile} onChange={(event) => setCredentialFile(event.target.value)} placeholder="/absolute/path/to/owner-only-key-file" disabled={Boolean(apiKey.trim())} />
+            <small>文件必须只有一行，并使用仅所有者权限（chmod 600）。输入 API Key 时会忽略此路径。</small>
+          </label>
+        </details>
         {probe && (
           <div className={`probe-result ${probe.ok ? "ready" : "failed"}`} role="status">
             {probe.ok ? <CheckCircle2 size={16} /> : <OctagonX size={16} />}

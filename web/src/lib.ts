@@ -54,6 +54,14 @@ export function isActiveState(state: RunState): boolean {
   return !["succeeded", "failed", "cancelled", "interrupted", "rolled_back"].includes(state);
 }
 
+export function shouldSubmitPrompt(event: {
+  key: string;
+  shiftKey: boolean;
+  isComposing: boolean;
+}): boolean {
+  return event.key === "Enter" && !event.shiftKey && !event.isComposing;
+}
+
 export type ActivityPhase = "planning" | "building" | "verifying";
 
 export interface ActivityChapter {

@@ -73,11 +73,13 @@ a strict preflight after configuration, add `--require-os-sandbox --probe-model`
 one real native tool-call request and fails if the selected model cannot complete it.
 
 Open <http://127.0.0.1:8765>, then use the settings button to choose the model, compatible base
-URL, and a local credential file. The file must contain exactly one line and have owner-only
-permissions (`chmod 600`). TraceForge saves only its absolute path; the credential value is read
-when constructing the provider and is never returned by the API or UI.
+URL, and API key. TraceForge atomically writes the key to an owner-only (`0600`) file in its local
+data directory; SQLite saves only that file's absolute path, and the value is never returned by
+the API or UI. Advanced users may instead reference an existing one-line owner-only credential
+file.
 
-Click **新建任务** to enter only the request; TraceForge creates a unique task directory beneath
+Click **新建任务** to enter only the request; press Enter to submit or Shift+Enter for a newline.
+TraceForge creates a unique task directory beneath
 the `--workspace` default root. Click **添加项目** to select a reusable project root, then use the
 plus button beside that folder for project-scoped tasks. Direct runs stay at the top level.
 
@@ -149,7 +151,7 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
 ```
 
-The current suite has 116 backend tests at 86.63% coverage (with a hard 85% gate), seven frontend
+The current suite has 118 backend tests at 86.47% coverage (with a hard 85% gate), eight frontend
 unit tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.

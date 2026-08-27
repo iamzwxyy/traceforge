@@ -174,7 +174,8 @@ SQLite uses WAL mode and six tables:
 - `events`: per-run monotonically increasing sequence and JSON payload;
 - `snapshots`: original bytes, mode, original hash, and last agent-written hash per path.
 - `projects`: reusable display names and canonical local root directories;
-- `provider_config`: one model/base-URL/credential-file reference, never the secret value;
+- `provider_config`: one model/base-URL/credential-file reference, never the secret value; direct
+  key entry is atomically materialized as an owner-only managed file before this row is updated;
 - `preferences`: small local UI choices such as the last direct-task workspace.
 
 Startup migrations add compatible columns to early v0.1 databases. WebSocket clients request

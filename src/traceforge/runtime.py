@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 from time import monotonic
@@ -17,6 +18,7 @@ from traceforge.provider import ModelProvider, OpenAICompatibleProvider, Provide
 from traceforge.storage import Storage
 
 _CREDENTIAL_MAX_BYTES = 16 * 1024
+_MANAGED_CREDENTIAL_NAME = "provider-credential.key"
 _PROBE_TOOL = {
     "type": "function",
     "function": {
@@ -57,6 +59,45 @@ def validate_credential_file(raw: str | Path) -> Path:
     if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o077:
         raise ValueError("Credential file must be owner-only; run chmod 600 on it")
     return resolved
+
+
+def store_managed_api_key(settings: Settings, raw: str) -> Path:
+    """Atomically store a provider key without exposing it to persisted config."""
+
+    value = raw.strip()
+    encoded = value.encode("utf-8")
+    if not value or "\n" in value or "\r" in value:
+        raise ValueError("API key must contain exactly one non-empty line")
+    if len(encoded) > _CREDENTIAL_MAX_BYTES:
+        raise ValueError("API key must be smaller than 16 KiB")
+
+    data_dir = settings.data_dir.resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    destination = data_dir / _MANAGED_CREDENTIAL_NAME
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".provider-credential-", dir=data_dir)
+    temporary = Path(temporary_name)
+    try:
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(encoded + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        if os.name == "posix":
+            destination.chmod(0o600)
+            directory_descriptor = os.open(data_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        raise
+    return validate_credential_file(destination)
 
 
 def _read_api_key(settings: Settings, config: ProviderConfig) -> str:
@@ -139,9 +180,7 @@ class AgentRuntime:
                 api_key=api_key,
                 model=config.model,
                 base_url=config.base_url,
-                credential_file=(
-                    Path(config.credential_file) if config.credential_file else None
-                ),
+                credential_file=(Path(config.credential_file) if config.credential_file else None),
             )
             provider: ModelProvider = OpenAICompatibleProvider(run_settings)
         else:
@@ -150,16 +189,16 @@ class AgentRuntime:
                 workspace=resolved,
                 model=config.model,
                 base_url=config.base_url,
-                credential_file=(
-                    Path(config.credential_file) if config.credential_file else None
-                ),
+                credential_file=(Path(config.credential_file) if config.credential_file else None),
             )
             provider = self.provider_override
         manager = AgentManager(run_settings, self.storage, provider, broker=self.broker)
         self._managers[resolved] = manager
         return manager
 
-    async def save_provider_config(self, config: ProviderConfig) -> ProviderConfig:
+    async def save_provider_config(
+        self, config: ProviderConfig, *, api_key: str | None = None
+    ) -> ProviderConfig:
         if self.storage.has_live_run():
             raise RunConflictError(
                 "Pause, stop, or finish running work before changing model settings"
@@ -177,6 +216,10 @@ class AgentRuntime:
             parsed = urlparse(config.base_url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError("Base URL must be an absolute http:// or https:// URL")
+        if api_key is not None:
+            if config.credential_file:
+                raise ValueError("Choose either an API key or a credential file, not both")
+            config.credential_file = str(store_managed_api_key(self.settings, api_key))
         await self.shutdown()
         self.storage.save_provider_config(config)
         return self.provider_config

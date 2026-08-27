@@ -130,6 +130,10 @@ code, pre { font-family: var(--mono); }
 .field-label input, .field-label select, .path-entry input { width: 100%; min-height: 38px; padding: 0 10px; color: #dce4ed; border: 1px solid #2b3647; border-radius: 6px; background: #0b1017; outline: none; font-size: 13px; }
 .field-label select { overflow: hidden; text-overflow: ellipsis; }
 .field-label > small { color: #667488; font-size: 11px; line-height: 1.45; }
+.advanced-settings { margin-top: 12px; border: 1px solid #202a38; border-radius: 6px; background: rgba(255, 255, 255, 0.012); }
+.advanced-settings > summary { padding: 10px 12px; color: #8693a5; cursor: pointer; font-size: 12px; }
+.advanced-settings > .field-label { padding: 2px 12px 12px; }
+.advanced-settings input:disabled { opacity: 0.5; cursor: not-allowed; }
 .directory-field > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
 .project-target-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 7px; }
 .path-preview { margin-top: 12px; padding: 9px 10px; display: flex; flex-direction: column; gap: 5px; border: 1px solid var(--line-soft); border-radius: 6px; background: #0a0f16; }

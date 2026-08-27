@@ -160,6 +160,13 @@ export interface ProviderConfig {
   updated_at: string;
 }
 
+export interface ProviderUpdate {
+  model: string;
+  base_url: string | null;
+  credential_file: string | null;
+  api_key?: string;
+}
+
 export interface ProviderProbe {
   ok: boolean;
   model: string;

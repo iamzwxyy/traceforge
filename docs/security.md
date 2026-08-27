@@ -88,11 +88,14 @@ those records as `enforced`, `mixed`, `bypassed`, `policy_only`, or `not_used`. 
 
 ## Credentials and redaction
 
-The real provider reads a credential from either `OPENAI_API_KEY` or a user-selected local file.
-The file reference must resolve to a regular file smaller than 16 KiB; on POSIX it must be
-owner-only, and its content must be exactly one non-empty line. SQLite stores only the canonical
-file path. Public status/configuration responses expose the source and readiness flag, never the
-value. The connection check verifies native tool calling rather than only endpoint reachability.
+The real provider reads a credential from `OPENAI_API_KEY`, a user-selected local file, or the
+owner-only managed file created by direct API-key entry. Direct entry is accepted as a redacted
+request field, atomically written with `0600` permissions, and never placed in SQLite. Validation
+errors omit request inputs so a rejected key cannot be reflected in a 422 response. Every file
+reference must resolve to a regular file smaller than 16 KiB; on POSIX it must be owner-only, and
+its content must be exactly one non-empty line. Public status/configuration responses expose the
+source and readiness flag, never the value. The connection check verifies native tool calling
+rather than only endpoint reachability.
 
 Before any model-proposed child command starts, TraceForge removes environment variables whose
 names indicate keys, passwords, passphrases, secrets, tokens, or credentials, as well as common

@@ -143,7 +143,7 @@ def doctor(
                 credential_detail = "OPENAI_API_KEY is set"
             else:
                 credential_ready = False
-                credential_detail = "configure a credential file in Model settings"
+                credential_detail = "enter an API key in Model settings"
             _doctor_line(
                 "PASS" if credential_ready else "WARN",
                 "Model credential",

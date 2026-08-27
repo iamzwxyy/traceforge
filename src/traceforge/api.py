@@ -21,9 +21,10 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from traceforge import __version__
 from traceforge.agent import InvalidRunAction, PlanDecision, RunConflictError
@@ -87,6 +88,13 @@ class UpdateProviderRequest(BaseModel):
     model: str = Field(min_length=1, max_length=200)
     base_url: str | None = Field(default=None, max_length=2_000)
     credential_file: str | None = Field(default=None, max_length=4_096)
+    api_key: SecretStr | None = Field(default=None, max_length=16 * 1024)
+
+    @model_validator(mode="after")
+    def validate_credential_source(self) -> UpdateProviderRequest:
+        if self.api_key is not None and self.credential_file:
+            raise ValueError("Choose either an API key or a credential file, not both")
+        return self
 
 
 class ProviderConfigView(BaseModel):
@@ -147,9 +155,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     storage = Storage(settings.data_dir / "traceforge.db")
     storage.mark_all_active_runs_interrupted()
     broker = EventBroker(storage)
-    runtime = AgentRuntime(
-        settings, storage, broker, provider_override=provider
-    )
+    runtime = AgentRuntime(settings, storage, broker, provider_override=provider)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -196,6 +202,20 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     @app.exception_handler(ValueError)
     async def value_error_handler(_request: Request, exc: ValueError) -> JSONResponse:
         return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        errors = [
+            {
+                "type": error.get("type", "value_error"),
+                "loc": error.get("loc", ()),
+                "msg": error.get("msg", "Invalid request"),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:
@@ -250,7 +270,8 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 model=body.model,
                 base_url=body.base_url,
                 credential_file=body.credential_file,
-            )
+            ),
+            api_key=(body.api_key.get_secret_value() if body.api_key is not None else None),
         )
         return provider_view(saved)
 
@@ -298,10 +319,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         records = storage.list_runs(project_id=project_id)
         if direct_only:
             records = [run for run in records if run.project_id is None]
-        return [
-            RunView.from_record(run, context_limit=settings.context_limit)
-            for run in records
-        ]
+        return [RunView.from_record(run, context_limit=settings.context_limit) for run in records]
 
     @app.post("/api/runs", response_model=RunView, status_code=status.HTTP_201_CREATED)
     async def create_run(body: CreateRunRequest) -> RunView:
@@ -312,9 +330,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                     "for real tasks"
                 )
             if body.project_id or body.workspace or body.create_direct_workspace:
-                raise ValueError(
-                    "The fixed demo only runs in its disposable demo workspace"
-                )
+                raise ValueError("The fixed demo only runs in its disposable demo workspace")
         project_id = body.project_id
         created_workspace: Path | None = None
         if project_id:
@@ -347,9 +363,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     @app.get("/api/runs/{run_id}", response_model=RunView)
     async def get_run(run_id: str) -> RunView:
-        return RunView.from_record(
-            storage.get_run(run_id), context_limit=settings.context_limit
-        )
+        return RunView.from_record(storage.get_run(run_id), context_limit=settings.context_limit)
 
     @app.get("/api/runs/{run_id}/events", response_model=list[RunEvent])
     async def get_events(
@@ -382,9 +396,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         )
 
     @app.post("/api/runs/{run_id}/answers", status_code=status.HTTP_202_ACCEPTED)
-    async def answer_questions(
-        run_id: str, body: ClarificationAnswersRequest
-    ) -> dict[str, bool]:
+    async def answer_questions(run_id: str, body: ClarificationAnswersRequest) -> dict[str, bool]:
         await runtime.manager_for_run(run_id).answer_clarification(run_id, body.answers)
         return {"accepted": True}
 
@@ -483,9 +495,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             pass
         finally:
             pending_tasks = [
-                task
-                for task in (receive_task, event_task)
-                if task is not None and not task.done()
+                task for task in (receive_task, event_task) if task is not None and not task.done()
             ]
             for task in pending_tasks:
                 task.cancel()
@@ -509,9 +519,7 @@ def _prepare_project_root(raw: str, *, create: bool) -> tuple[Path, bool]:
     try:
         parent = candidate.parent.resolve(strict=True)
     except OSError as exc:
-        raise ValueError(
-            f"Project parent directory does not exist: {candidate.parent}"
-        ) from exc
+        raise ValueError(f"Project parent directory does not exist: {candidate.parent}") from exc
     if not parent.is_dir():
         raise ValueError(f"Project parent is not a directory: {parent}")
     try:
@@ -530,20 +538,18 @@ def _create_direct_workspace(default_root: Path) -> Path:
         except FileExistsError:
             continue
         except OSError as exc:
-            raise ValueError(
-                f"Could not create a direct-task directory under: {root}"
-            ) from exc
+            raise ValueError(f"Could not create a direct-task directory under: {root}") from exc
         return resolve_workspace(candidate)
     raise ValueError(f"Could not allocate a unique direct-task directory under: {root}")
 
 
 def _choose_macos_directory(initial_path: Path) -> str | None:
     script = (
-        'on run argv\n'
+        "on run argv\n"
         'set chosenFolder to choose folder with prompt "选择 TraceForge 项目文件夹" '
-        'default location POSIX file (item 1 of argv)\n'
-        'return POSIX path of chosenFolder\n'
-        'end run'
+        "default location POSIX file (item 1 of argv)\n"
+        "return POSIX path of chosenFolder\n"
+        "end run"
     )
     try:
         result = subprocess.run(
