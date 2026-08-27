@@ -101,3 +101,111 @@ def test_websocket_replays_persisted_events(settings: Settings) -> None:
             first = websocket.receive_json()
             assert first["seq"] == 1
             assert first["type"] == "state.changed"
+
+
+def test_projects_direct_tasks_and_directory_browser(settings: Settings, tmp_path) -> None:
+    provider = ScriptedProvider([_plan_response(), _plan_response()])
+    existing_root = tmp_path / "existing-project"
+    existing_root.mkdir()
+    created_root = tmp_path / "created-project"
+    direct_root = tmp_path / "direct-work"
+    direct_root.mkdir()
+    app = create_app(settings, provider=provider)
+
+    with TestClient(app) as client:
+        browsed = client.get(
+            "/api/filesystem/directories", params={"path": str(tmp_path)}
+        )
+        assert browsed.status_code == 200
+        assert {entry["name"] for entry in browsed.json()["children"]} >= {
+            "existing-project",
+            "direct-work",
+        }
+
+        opened = client.post(
+            "/api/projects",
+            json={"name": "Existing", "root": str(existing_root)},
+        )
+        created = client.post(
+            "/api/projects",
+            json={
+                "name": "Created",
+                "root": str(created_root),
+                "create_directory": True,
+            },
+        )
+        assert opened.status_code == 201
+        assert created.status_code == 201 and created_root.is_dir()
+        assert len(client.get("/api/projects").json()) == 2
+
+        direct = client.post(
+            "/api/runs",
+            json={"task": "Direct", "workspace": str(direct_root)},
+        )
+        assert direct.status_code == 201
+        direct_run = _wait_for_state(client, direct.json()["id"], "awaiting_plan_approval")
+        assert direct_run["project_id"] is None
+        assert direct_run["workspace"] == str(direct_root.resolve())
+
+        project = client.post(
+            "/api/runs",
+            json={"task": "Project", "project_id": opened.json()["id"]},
+        )
+        assert project.status_code == 201
+        project_run = _wait_for_state(client, project.json()["id"], "awaiting_plan_approval")
+        assert project_run["project_id"] == opened.json()["id"]
+        assert project_run["workspace"] == str(existing_root.resolve())
+        assert client.get("/api/status").json()["last_workspace"] == str(
+            direct_root.resolve()
+        )
+
+
+def test_provider_config_uses_a_file_reference_without_returning_secret(
+    settings: Settings, tmp_path
+) -> None:
+    credential = tmp_path / "provider.key"
+    credential.write_text("credential-value\n")
+    credential.chmod(0o600)
+    app = create_app(settings, provider=ScriptedProvider([]))
+
+    with TestClient(app) as client:
+        updated = client.put(
+            "/api/provider",
+            json={
+                "model": "deepseek-v4-flash-vision-exp",
+                "base_url": "https://api.deepseek.com",
+                "credential_file": str(credential),
+            },
+        )
+        assert updated.status_code == 200
+        payload = updated.json()
+        assert payload["credential_source"] == "file"
+        assert payload["credential_file"] == str(credential.resolve())
+        assert payload["api_key_configured"] is True
+        assert "credential-value" not in updated.text
+
+        tested = client.post("/api/provider/test")
+        assert tested.status_code == 200
+        assert tested.json()["ok"] is True
+
+
+def test_provider_config_rejects_loose_credential_permissions(
+    settings: Settings, tmp_path
+) -> None:
+    credential = tmp_path / "provider.key"
+    credential.write_text("probe\n")
+    credential.chmod(0o644)
+    app = create_app(settings, provider=ScriptedProvider([]))
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/api/provider",
+            json={
+                "model": "model",
+                "base_url": "https://provider.example/v1",
+                "credential_file": str(credential),
+            },
+        )
+
+        assert response.status_code == 422
+        assert "chmod 600" in response.json()["detail"]

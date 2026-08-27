@@ -3,8 +3,10 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from traceforge.config import Settings
-from traceforge.models import EventType, RunRecord, RunState
+from traceforge.models import EventType, ProjectRecord, ProviderConfig, RunRecord, RunState
 from traceforge.storage import SnapshotRecord, Storage
 
 
@@ -65,6 +67,65 @@ def test_mark_active_runs_interrupted(storage: Storage, settings: Settings) -> N
     assert storage.get_run("run-interrupted").interrupted_from is RunState.EXECUTING
 
 
+def test_projects_provider_config_and_preferences(
+    storage: Storage, settings: Settings, tmp_path: Path
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    project = ProjectRecord(id="project-1", name="Project One", root=str(project_root.resolve()))
+    storage.create_project(project)
+    before_touch = storage.get_project(project.id).last_opened_at
+
+    storage.create_run(
+        RunRecord(
+            id="project-run",
+            task="Build",
+            workspace=project.root,
+            project_id=project.id,
+        )
+    )
+    storage.touch_project(project.id)
+    storage.set_preference("last_workspace", project.root)
+    provider = ProviderConfig(
+        model="deepseek-tool-model",
+        base_url="https://provider.example/v1",
+        credential_file=str(tmp_path / "credential"),
+    )
+    storage.save_provider_config(provider)
+
+    assert storage.list_projects()[0].id == project.id
+    assert storage.get_project(project.id).last_opened_at >= before_touch
+    assert storage.list_runs(project_id=project.id)[0].project_id == project.id
+    assert storage.list_runs()[0].id == "project-run"
+    assert storage.get_preference("last_workspace") == project.root
+    assert storage.get_provider_config(
+        ProviderConfig(model=settings.model, base_url=settings.base_url)
+    ).model == "deepseek-tool-model"
+
+    with pytest.raises(ValueError, match="already uses"):
+        storage.create_project(
+            ProjectRecord(id="project-2", name="Duplicate", root=project.root)
+        )
+
+
+def test_mark_all_active_runs_interrupted(storage: Storage, settings: Settings) -> None:
+    other = settings.workspace.parent / "other"
+    other.mkdir()
+    for run_id, workspace in (("one", settings.workspace), ("two", other)):
+        storage.create_run(
+            RunRecord(
+                id=run_id,
+                task="Work",
+                workspace=str(workspace),
+                state=RunState.EXECUTING,
+            )
+        )
+
+    assert storage.mark_all_active_runs_interrupted() == 2
+    assert storage.get_run("one").state is RunState.INTERRUPTED
+    assert storage.get_run("two").state is RunState.INTERRUPTED
+
+
 def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:
     database = tmp_path / "legacy.db"
     connection = sqlite3.connect(database)
@@ -89,5 +150,6 @@ def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:
         loaded = migrated.get_run("new")
         assert loaded.plan_approved is False
         assert loaded.interrupted_from is None
+        assert loaded.project_id is None
     finally:
         migrated.close()

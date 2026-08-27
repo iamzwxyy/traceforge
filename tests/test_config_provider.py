@@ -143,3 +143,20 @@ async def test_provider_stops_after_three_transient_failures(settings, monkeypat
     provider = OpenAICompatibleProvider(settings)
     with pytest.raises(ProviderError, match="after three attempts"):
         await provider.complete([])
+
+
+@pytest.mark.asyncio
+async def test_provider_wraps_non_retryable_api_errors(settings, monkeypatch) -> None:
+    class RejectedError(Exception):
+        pass
+
+    completions = _FakeCompletions([RejectedError("invalid model")])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    monkeypatch.setattr(provider_module, "AsyncOpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(provider_module, "APIError", RejectedError)
+    provider = OpenAICompatibleProvider(settings)
+
+    with pytest.raises(ProviderError, match="request was rejected"):
+        await provider.complete([])
+
+    assert len(completions.kwargs) == 1

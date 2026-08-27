@@ -199,12 +199,33 @@ class RunEvent(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class ProjectRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str = Field(min_length=1, max_length=120)
+    root: str
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    last_opened_at: datetime = Field(default_factory=utc_now)
+
+
+class ProviderConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1, max_length=200)
+    base_url: str | None = Field(default=None, max_length=2_000)
+    credential_file: str | None = Field(default=None, max_length=4_096)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class RunRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
     task: str
     workspace: str
+    project_id: str | None = None
     state: RunState = RunState.CREATED
     verifier_enabled: bool = True
     plan: TaskPlan | None = None

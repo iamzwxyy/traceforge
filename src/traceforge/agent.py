@@ -150,7 +150,13 @@ class AgentManager:
         self._shutting_down = False
         self.storage.mark_active_runs_interrupted(settings.workspace)
 
-    async def start_run(self, task: str, *, verifier_enabled: bool = True) -> RunRecord:
+    async def start_run(
+        self,
+        task: str,
+        *,
+        verifier_enabled: bool = True,
+        project_id: str | None = None,
+    ) -> RunRecord:
         clean_task = task.strip()
         if not clean_task:
             raise ValueError("Task must not be empty")
@@ -160,6 +166,7 @@ class AgentManager:
             id=uuid4().hex,
             task=clean_task,
             workspace=str(self.settings.workspace),
+            project_id=project_id,
             verifier_enabled=verifier_enabled,
         )
         self.storage.create_run(run)

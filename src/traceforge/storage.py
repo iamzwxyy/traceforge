@@ -14,6 +14,8 @@ from traceforge.models import (
     ApprovalRequest,
     ClarificationRequest,
     EventType,
+    ProjectRecord,
+    ProviderConfig,
     RunEvent,
     RunRecord,
     RunState,
@@ -59,6 +61,7 @@ class Storage:
                     id TEXT PRIMARY KEY,
                     task TEXT NOT NULL,
                     workspace TEXT NOT NULL,
+                    project_id TEXT,
                     state TEXT NOT NULL,
                     verifier_enabled INTEGER NOT NULL,
                     plan_json TEXT,
@@ -97,6 +100,28 @@ class Storage:
                     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    root TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_opened_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_config (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    model TEXT NOT NULL,
+                    base_url TEXT,
+                    credential_file TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS preferences (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_runs_workspace_updated
                     ON runs(workspace, updated_at DESC);
                 """
@@ -108,12 +133,17 @@ class Storage:
             migrations = {
                 "plan_approved": "INTEGER NOT NULL DEFAULT 0",
                 "interrupted_from": "TEXT",
+                "project_id": "TEXT",
             }
             for column, declaration in migrations.items():
                 if column not in columns:
                     self._connection.execute(
                         f"ALTER TABLE runs ADD COLUMN {column} {declaration}"
                     )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_project_updated "
+                "ON runs(project_id, updated_at DESC)"
+            )
 
     def mark_active_runs_interrupted(self, workspace: Path) -> int:
         active = tuple(
@@ -139,16 +169,39 @@ class Storage:
             )
             return cursor.rowcount
 
+    def mark_all_active_runs_interrupted(self) -> int:
+        active = tuple(
+            state.value
+            for state in RunState
+            if not state.terminal and state is not RunState.INTERRUPTED
+        )
+        placeholders = ",".join("?" for _ in active)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                f"""
+                UPDATE runs
+                SET interrupted_from = state, state = ?, error = ?, updated_at = ?
+                WHERE state IN ({placeholders})
+                """,
+                (
+                    RunState.INTERRUPTED.value,
+                    "TraceForge stopped before this run reached a terminal state.",
+                    utc_now().isoformat(),
+                    *active,
+                ),
+            )
+            return cursor.rowcount
+
     def create_run(self, run: RunRecord) -> None:
         with self._lock, self._connection:
             self._connection.execute(
                 """
                 INSERT INTO runs (
-                    id, task, workspace, state, verifier_enabled, plan_json,
+                    id, task, workspace, project_id, state, verifier_enabled, plan_json,
                     clarification_json, pending_approval_json, verification_json,
                     messages_json, plan_approved, interrupted_from, step_count,
                     repair_cycles, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._run_values(run),
             )
@@ -160,7 +213,7 @@ class Storage:
             cursor = self._connection.execute(
                 """
                 UPDATE runs SET
-                    task = ?, workspace = ?, state = ?, verifier_enabled = ?,
+                    task = ?, workspace = ?, project_id = ?, state = ?, verifier_enabled = ?,
                     plan_json = ?, clarification_json = ?, pending_approval_json = ?,
                     verification_json = ?, messages_json = ?, plan_approved = ?,
                     interrupted_from = ?, step_count = ?, repair_cycles = ?,
@@ -179,12 +232,28 @@ class Storage:
             raise KeyError(f"Run not found: {run_id}")
         return self._row_to_run(row)
 
-    def list_runs(self, workspace: Path, *, limit: int = 100) -> list[RunRecord]:
+    def list_runs(
+        self,
+        workspace: Path | None = None,
+        *,
+        project_id: str | None = None,
+        limit: int = 100,
+    ) -> list[RunRecord]:
         with self._lock:
-            rows = self._connection.execute(
-                "SELECT * FROM runs WHERE workspace = ? ORDER BY updated_at DESC LIMIT ?",
-                (str(workspace), limit),
-            ).fetchall()
+            if workspace is not None:
+                rows = self._connection.execute(
+                    "SELECT * FROM runs WHERE workspace = ? ORDER BY updated_at DESC LIMIT ?",
+                    (str(workspace), limit),
+                ).fetchall()
+            elif project_id is not None:
+                rows = self._connection.execute(
+                    "SELECT * FROM runs WHERE project_id = ? ORDER BY updated_at DESC LIMIT ?",
+                    (project_id, limit),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    "SELECT * FROM runs ORDER BY updated_at DESC LIMIT ?", (limit,)
+                ).fetchall()
         return [self._row_to_run(row) for row in rows]
 
     def has_active_run(self, workspace: Path) -> bool:
@@ -196,6 +265,113 @@ class Storage:
                 (str(workspace), *active),
             ).fetchone()
         return row is not None
+
+    def has_any_active_run(self) -> bool:
+        active = tuple(state.value for state in RunState if not state.terminal)
+        placeholders = ",".join("?" for _ in active)
+        with self._lock:
+            row = self._connection.execute(
+                f"SELECT 1 FROM runs WHERE state IN ({placeholders}) LIMIT 1", active
+            ).fetchone()
+        return row is not None
+
+    def create_project(self, project: ProjectRecord) -> None:
+        try:
+            with self._lock, self._connection:
+                self._connection.execute(
+                    """
+                    INSERT INTO projects(id, name, root, created_at, updated_at, last_opened_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project.id,
+                        project.name,
+                        project.root,
+                        project.created_at.isoformat(),
+                        project.updated_at.isoformat(),
+                        project.last_opened_at.isoformat(),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"A project already uses this directory: {project.root}") from exc
+
+    def get_project(self, project_id: str) -> ProjectRecord:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Project not found: {project_id}")
+        return self._row_to_project(row)
+
+    def list_projects(self) -> list[ProjectRecord]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM projects ORDER BY last_opened_at DESC, name COLLATE NOCASE"
+            ).fetchall()
+        return [self._row_to_project(row) for row in rows]
+
+    def touch_project(self, project_id: str) -> None:
+        now = utc_now().isoformat()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE projects SET updated_at = ?, last_opened_at = ? WHERE id = ?",
+                (now, now, project_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Project not found: {project_id}")
+
+    def get_provider_config(self, default: ProviderConfig) -> ProviderConfig:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM provider_config WHERE id = 1"
+            ).fetchone()
+        if row is None:
+            return default
+        return ProviderConfig(
+            model=row["model"],
+            base_url=row["base_url"],
+            credential_file=row["credential_file"],
+            updated_at=datetime.fromisoformat(row["updated_at"]).astimezone(UTC),
+        )
+
+    def save_provider_config(self, config: ProviderConfig) -> None:
+        config.updated_at = utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO provider_config(id, model, base_url, credential_file, updated_at)
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    model = excluded.model,
+                    base_url = excluded.base_url,
+                    credential_file = excluded.credential_file,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    config.model,
+                    config.base_url,
+                    config.credential_file,
+                    config.updated_at.isoformat(),
+                ),
+            )
+
+    def get_preference(self, key: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM preferences WHERE key = ?", (key,)
+            ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def set_preference(self, key: str, value: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO preferences(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
 
     def append_event(
         self, run_id: str, event_type: EventType, payload: dict[str, Any] | None = None
@@ -299,6 +475,7 @@ class Storage:
             run.id,
             run.task,
             run.workspace,
+            run.project_id,
             run.state.value,
             int(run.verifier_enabled),
             _dump_model(run.plan),
@@ -321,6 +498,7 @@ class Storage:
             id=row["id"],
             task=row["task"],
             workspace=row["workspace"],
+            project_id=row["project_id"],
             state=RunState(row["state"]),
             verifier_enabled=bool(row["verifier_enabled"]),
             plan=_load_model(TaskPlan, row["plan_json"]),
@@ -337,6 +515,17 @@ class Storage:
             error=row["error"],
             created_at=datetime.fromisoformat(row["created_at"]).astimezone(UTC),
             updated_at=datetime.fromisoformat(row["updated_at"]).astimezone(UTC),
+        )
+
+    @staticmethod
+    def _row_to_project(row: sqlite3.Row) -> ProjectRecord:
+        return ProjectRecord(
+            id=row["id"],
+            name=row["name"],
+            root=row["root"],
+            created_at=datetime.fromisoformat(row["created_at"]).astimezone(UTC),
+            updated_at=datetime.fromisoformat(row["updated_at"]).astimezone(UTC),
+            last_opened_at=datetime.fromisoformat(row["last_opened_at"]).astimezone(UTC),
         )
 
 

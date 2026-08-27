@@ -29,7 +29,7 @@ def serve(
     from traceforge.api import create_app
     from traceforge.config import Settings
 
-    settings = Settings.from_env(workspace)
+    settings = Settings.from_env(workspace, require_api_key=False)
     uvicorn.run(create_app(settings), host=host, port=port)
 
 

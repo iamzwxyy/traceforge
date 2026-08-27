@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, RateLimitError
+from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, RateLimitError
 
 from traceforge.config import Settings
 from traceforge.models import ToolCall
@@ -91,6 +91,8 @@ class OpenAICompatibleProvider:
                     ) from exc
                 await asyncio.sleep(delay)
                 delay *= 2
+            except APIError as exc:
+                raise ProviderError(f"Model request was rejected: {exc}") from exc
         raise AssertionError("Retry loop ended unexpectedly")
 
 

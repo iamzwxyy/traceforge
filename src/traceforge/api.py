@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
+from uuid import uuid4
 
 from fastapi import (
     FastAPI,
@@ -20,10 +21,10 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from traceforge import __version__
-from traceforge.agent import AgentManager, InvalidRunAction, PlanDecision, RunConflictError
+from traceforge.agent import InvalidRunAction, PlanDecision, RunConflictError
 from traceforge.config import Settings
 from traceforge.context import ContextManager
 from traceforge.events import EventBroker
@@ -31,14 +32,18 @@ from traceforge.models import (
     ApprovalRequest,
     ClarificationAnswer,
     ClarificationRequest,
+    ProjectRecord,
+    ProviderConfig,
     RunEvent,
     RunRecord,
     RunState,
     TaskPlan,
     VerificationReport,
 )
-from traceforge.provider import ModelProvider, OpenAICompatibleProvider
+from traceforge.provider import ModelProvider
+from traceforge.runtime import AgentRuntime, resolve_workspace
 from traceforge.storage import Storage
+from traceforge.workspace import Workspace
 
 
 class CreateRunRequest(BaseModel):
@@ -46,6 +51,42 @@ class CreateRunRequest(BaseModel):
 
     task: str = Field(min_length=1, max_length=20_000)
     verifier_enabled: bool = True
+    project_id: str | None = None
+    workspace: str | None = Field(default=None, max_length=4_096)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> CreateRunRequest:
+        if self.project_id and self.workspace:
+            raise ValueError("Choose either a project or a direct-task workspace, not both")
+        return self
+
+
+class CreateProjectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    root: str = Field(min_length=1, max_length=4_096)
+    create_directory: bool = False
+
+
+class UpdateProviderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(min_length=1, max_length=200)
+    base_url: str | None = Field(default=None, max_length=2_000)
+    credential_file: str | None = Field(default=None, max_length=4_096)
+
+
+class ProviderConfigView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    base_url: str | None
+    credential_source: str
+    credential_file: str | None
+    credential_env: str = "OPENAI_API_KEY"
+    api_key_configured: bool
+    updated_at: datetime
 
 
 class ClarificationAnswersRequest(BaseModel):
@@ -66,6 +107,7 @@ class RunView(BaseModel):
     id: str
     task: str
     workspace: str
+    project_id: str | None
     state: RunState
     verifier_enabled: bool
     plan: TaskPlan | None
@@ -90,18 +132,16 @@ class RunView(BaseModel):
 
 def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> FastAPI:
     storage = Storage(settings.data_dir / "traceforge.db")
+    storage.mark_all_active_runs_interrupted()
     broker = EventBroker(storage)
-    manager = AgentManager(
-        settings,
-        storage,
-        provider or OpenAICompatibleProvider(settings),
-        broker=broker,
+    runtime = AgentRuntime(
+        settings, storage, broker, provider_override=provider
     )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
-        await manager.shutdown()
+        await runtime.shutdown()
         storage.close()
 
     app = FastAPI(
@@ -113,7 +153,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     )
     app.state.settings = settings
     app.state.storage = storage
-    app.state.manager = manager
+    app.state.runtime = runtime
     app.state.broker = broker
 
     @app.middleware("http")
@@ -140,18 +180,25 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     async def run_conflict_handler(_request: Request, exc: RunConflictError) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
+    @app.exception_handler(ValueError)
+    async def value_error_handler(_request: Request, exc: ValueError) -> JSONResponse:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
     @app.get("/healthz")
     async def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
     @app.get("/api/status")
     async def get_status() -> dict[str, Any]:
+        config = runtime.provider_config
+        last_workspace = storage.get_preference("last_workspace") or str(settings.workspace)
         return {
             "version": __version__,
             "workspace": str(settings.workspace),
-            "model": settings.model,
-            "base_url": settings.masked_base_url,
-            "api_key_configured": bool(settings.api_key),
+            "last_workspace": last_workspace,
+            "model": config.model,
+            "base_url": config.base_url or "https://api.openai.com/v1",
+            "api_key_configured": runtime.credential_configured(config),
             "suggested_task": settings.suggested_task,
             "limits": {
                 "context": settings.context_limit,
@@ -160,16 +207,101 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             },
         }
 
+    def provider_view(config: ProviderConfig | None = None) -> ProviderConfigView:
+        selected = config or runtime.provider_config
+        if selected.credential_file:
+            source = "file"
+        elif settings.api_key:
+            source = "environment"
+        else:
+            source = "missing"
+        return ProviderConfigView(
+            model=selected.model,
+            base_url=selected.base_url,
+            credential_source=source,
+            credential_file=selected.credential_file,
+            api_key_configured=runtime.credential_configured(selected),
+            updated_at=selected.updated_at,
+        )
+
+    @app.get("/api/provider", response_model=ProviderConfigView)
+    async def get_provider_config() -> ProviderConfigView:
+        return provider_view()
+
+    @app.put("/api/provider", response_model=ProviderConfigView)
+    async def update_provider_config(body: UpdateProviderRequest) -> ProviderConfigView:
+        saved = await runtime.save_provider_config(
+            ProviderConfig(
+                model=body.model,
+                base_url=body.base_url,
+                credential_file=body.credential_file,
+            )
+        )
+        return provider_view(saved)
+
+    @app.post("/api/provider/test")
+    async def test_provider_connection() -> dict[str, Any]:
+        return await runtime.test_connection()
+
+    @app.get("/api/projects", response_model=list[ProjectRecord])
+    async def list_projects() -> list[ProjectRecord]:
+        return storage.list_projects()
+
+    @app.post("/api/projects", response_model=ProjectRecord, status_code=status.HTTP_201_CREATED)
+    async def create_project(body: CreateProjectRequest) -> ProjectRecord:
+        name = body.name.strip()
+        if not name:
+            raise ValueError("Project name must not be empty")
+        root, created = _prepare_project_root(body.root, create=body.create_directory)
+        project = ProjectRecord(id=uuid4().hex, name=name, root=str(root))
+        try:
+            storage.create_project(project)
+        except Exception:
+            if created:
+                _remove_empty_directory(root)
+            raise
+        return project
+
+    @app.get("/api/filesystem/directories")
+    async def list_directories(path: str | None = None) -> dict[str, Any]:
+        selected = resolve_workspace(
+            path or storage.get_preference("last_workspace") or settings.workspace
+        )
+        return _directory_listing(selected)
+
     @app.get("/api/runs", response_model=list[RunView])
-    async def list_runs() -> list[RunView]:
+    async def list_runs(project_id: str | None = None, direct_only: bool = False) -> list[RunView]:
+        if project_id and direct_only:
+            raise ValueError("project_id and direct_only cannot be combined")
+        records = storage.list_runs(project_id=project_id)
+        if direct_only:
+            records = [run for run in records if run.project_id is None]
         return [
             RunView.from_record(run, context_limit=settings.context_limit)
-            for run in storage.list_runs(settings.workspace)
+            for run in records
         ]
 
     @app.post("/api/runs", response_model=RunView, status_code=status.HTTP_201_CREATED)
     async def create_run(body: CreateRunRequest) -> RunView:
-        run = await manager.start_run(body.task, verifier_enabled=body.verifier_enabled)
+        project_id = body.project_id
+        if project_id:
+            project = storage.get_project(project_id)
+            workspace = project.root
+            storage.touch_project(project_id)
+        else:
+            workspace = (
+                body.workspace
+                or storage.get_preference("last_workspace")
+                or str(settings.workspace)
+            )
+            workspace = str(resolve_workspace(workspace))
+            storage.set_preference("last_workspace", workspace)
+        run = await runtime.start_run(
+            body.task,
+            workspace,
+            verifier_enabled=body.verifier_enabled,
+            project_id=project_id,
+        )
         return RunView.from_record(run, context_limit=settings.context_limit)
 
     @app.get("/api/runs/{run_id}", response_model=RunView)
@@ -188,19 +320,19 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     @app.get("/api/runs/{run_id}/diff")
     async def get_diff(run_id: str) -> dict[str, str]:
-        storage.get_run(run_id)
-        return {"diff": manager.workspace.diff(run_id)}
+        run = storage.get_run(run_id)
+        return {"diff": Workspace(Path(run.workspace), storage).diff(run_id)}
 
     @app.post("/api/runs/{run_id}/answers", status_code=status.HTTP_202_ACCEPTED)
     async def answer_questions(
         run_id: str, body: ClarificationAnswersRequest
     ) -> dict[str, bool]:
-        await manager.answer_clarification(run_id, body.answers)
+        await runtime.manager_for_run(run_id).answer_clarification(run_id, body.answers)
         return {"accepted": True}
 
     @app.post("/api/runs/{run_id}/plan-decision", status_code=status.HTTP_202_ACCEPTED)
     async def decide_plan(run_id: str, body: PlanDecision) -> dict[str, bool]:
-        await manager.decide_plan(run_id, body)
+        await runtime.manager_for_run(run_id).decide_plan(run_id, body)
         return {"accepted": True}
 
     @app.post(
@@ -213,24 +345,26 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         run = storage.get_run(run_id)
         if run.pending_approval is None or run.pending_approval.id != approval_id:
             raise HTTPException(status_code=409, detail="Approval is no longer pending")
-        await manager.decide_action(run_id, approved=body.approved)
+        await runtime.manager_for_run(run_id).decide_action(run_id, approved=body.approved)
         return {"accepted": True}
 
     @app.post("/api/runs/{run_id}/cancel", response_model=RunView)
     async def cancel_run(run_id: str) -> RunView:
         return RunView.from_record(
-            await manager.cancel(run_id), context_limit=settings.context_limit
+            await runtime.manager_for_run(run_id).cancel(run_id),
+            context_limit=settings.context_limit,
         )
 
     @app.post("/api/runs/{run_id}/resume", response_model=RunView)
     async def resume_run(run_id: str) -> RunView:
         return RunView.from_record(
-            await manager.resume(run_id), context_limit=settings.context_limit
+            await runtime.manager_for_run(run_id).resume(run_id),
+            context_limit=settings.context_limit,
         )
 
     @app.post("/api/runs/{run_id}/rollback")
     async def rollback_run(run_id: str) -> dict[str, list[str]]:
-        result = await manager.rollback(run_id)
+        result = await runtime.manager_for_run(run_id).rollback(run_id)
         return {
             "restored": result.restored,
             "removed": result.removed,
@@ -299,6 +433,54 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
 def _allowed_origin(origin: str) -> bool:
     return bool(re.fullmatch(r"https?://(?:127\.0\.0\.1|localhost)(?::\d+)?", origin))
+
+
+def _prepare_project_root(raw: str, *, create: bool) -> tuple[Path, bool]:
+    candidate = Path(raw).expanduser()
+    if not create:
+        return resolve_workspace(candidate), False
+    if candidate.exists():
+        raise ValueError(f"Project directory already exists: {candidate}")
+    try:
+        parent = candidate.parent.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            f"Project parent directory does not exist: {candidate.parent}"
+        ) from exc
+    if not parent.is_dir():
+        raise ValueError(f"Project parent is not a directory: {parent}")
+    try:
+        candidate.mkdir()
+    except OSError as exc:
+        raise ValueError(f"Could not create project directory: {candidate}") from exc
+    return resolve_workspace(candidate), True
+
+
+def _remove_empty_directory(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def _directory_listing(selected: Path) -> dict[str, Any]:
+    try:
+        children = sorted(
+            (
+                {"name": child.name, "path": str(child)}
+                for child in selected.iterdir()
+                if child.is_dir() and not child.name.startswith(".")
+            ),
+            key=lambda item: item["name"].casefold(),
+        )
+    except OSError as exc:
+        raise ValueError(f"Directory cannot be listed: {selected}") from exc
+    parent = selected.parent if selected.parent != selected else None
+    return {
+        "current": str(selected),
+        "parent": str(parent) if parent else None,
+        "children": children,
+    }
 
 
 def _mount_frontend(app: FastAPI) -> None:
