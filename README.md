@@ -57,8 +57,15 @@ TraceForge accepts an OpenAI-compatible Chat Completions endpoint with native to
 It can launch before credentials are configured:
 
 ```bash
+uv run traceforge doctor --workspace /absolute/path/to/project --port 8765
 uv run traceforge serve --workspace /absolute/path/to/project --port 8765
 ```
+
+`doctor` checks workspace and state-directory writes, SQLite startup/migrations, the packaged web
+bundle, listen-address availability, OS sandbox enforcement, and the configured credential source
+without printing its value. Missing model setup is a warning because the UI can configure it. For
+a strict preflight after configuration, add `--require-os-sandbox --probe-model`; the latter makes
+one real native tool-call request and fails if the selected model cannot complete it.
 
 Open <http://127.0.0.1:8765>, then use the settings button to choose the model, compatible base
 URL, and a local credential file. The file must contain exactly one line and have owner-only
@@ -135,7 +142,7 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
 ```
 
-The current suite has 102 backend tests at 86.22% coverage (with a hard 85% gate), frontend unit
+The current suite has 106 backend tests at 86.36% coverage (with a hard 85% gate), frontend unit
 tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
