@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -237,24 +237,29 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         await websocket.accept()
         queue = broker.subscribe(run_id)
         last_seq = after_seq
+        receive_task: asyncio.Task[MutableMapping[str, Any]] | None = None
+        event_task: asyncio.Task[RunEvent] | None = None
         try:
             for event in storage.get_events(run_id, after_seq=after_seq):
                 await websocket.send_json(event.model_dump(mode="json"))
                 last_seq = event.seq
+            receive_task = asyncio.create_task(websocket.receive())
             while True:
+                assert receive_task is not None
                 event_task = asyncio.create_task(queue.get())
-                receive_task = asyncio.create_task(websocket.receive())
-                done, pending = await asyncio.wait(
+                done, _pending = await asyncio.wait(
                     {event_task, receive_task}, return_when=asyncio.FIRST_COMPLETED
                 )
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
                 if receive_task in done:
                     message = receive_task.result()
                     if message["type"] == "websocket.disconnect":
+                        event_task.cancel()
+                        await asyncio.gather(event_task, return_exceptions=True)
                         break
+                    receive_task = asyncio.create_task(websocket.receive())
                 if event_task not in done:
+                    event_task.cancel()
+                    await asyncio.gather(event_task, return_exceptions=True)
                     continue
                 event = event_task.result()
                 if event.seq <= last_seq:
@@ -264,6 +269,14 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         except (WebSocketDisconnect, asyncio.CancelledError):
             pass
         finally:
+            pending_tasks = [
+                task
+                for task in (receive_task, event_task)
+                if task is not None and not task.done()
+            ]
+            for task in pending_tasks:
+                task.cancel()
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
             broker.unsubscribe(run_id, queue)
 
     _mount_frontend(app)

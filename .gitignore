@@ -15,5 +15,6 @@ web/playwright-report/
 web/test-results/
 dist/
 build/
+artifacts/
 *.egg-info/
 推免考核题目学生版.pdf

@@ -97,8 +97,11 @@ class OpenAICompatibleProvider:
 class ScriptedProvider:
     """Deterministic provider used by integration tests and local product demos."""
 
-    def __init__(self, responses: list[ModelResponse]) -> None:
+    def __init__(
+        self, responses: list[ModelResponse], *, delay_seconds: float = 0
+    ) -> None:
         self._responses = responses.copy()
+        self._delay_seconds = delay_seconds
         self.requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]] | None]] = []
 
     async def complete(
@@ -107,6 +110,8 @@ class ScriptedProvider:
         tools: list[dict[str, Any]] | None = None,
     ) -> ModelResponse:
         self.requests.append((messages, tools))
+        if self._delay_seconds:
+            await asyncio.sleep(self._delay_seconds)
         if not self._responses:
             raise ProviderError("Scripted provider has no remaining responses")
         return self._responses.pop(0)
