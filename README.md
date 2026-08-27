@@ -1,5 +1,7 @@
 # TraceForge
 
+[![CI](https://github.com/iamzwxyy/traceforge/actions/workflows/ci.yml/badge.svg)](https://github.com/iamzwxyy/traceforge/actions/workflows/ci.yml)
+
 TraceForge is a local coding agent that makes completion evidence visible. It turns a request
 into an approved plan, works through a bounded set of native tools, runs explicit acceptance
 checks, and asks an independent read-only verifier to judge the result.
@@ -28,7 +30,7 @@ Requirements: macOS or Linux, Python 3.12, and [uv](https://docs.astral.sh/uv/).
 No API key or Node.js installation is needed for the packaged demo.
 
 ```bash
-git clone <REPOSITORY_URL>
+git clone https://github.com/iamzwxyy/traceforge.git
 cd traceforge
 uv sync --locked --all-extras
 uv run traceforge demo
