@@ -92,6 +92,43 @@ async def test_command_prefers_traceforge_runtime_and_rejects_external_paths(
 
 
 @pytest.mark.asyncio
+async def test_command_scrubs_ambient_credentials_from_child_environment(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage.create_run(RunRecord(id="run-1", task="Run", workspace=str(workspace.root)))
+    monkeypatch.setenv("TRACEFORGE_TEST_API_KEY", "credential-probe")
+    monkeypatch.setenv("TRACEFORGE_TEST_PASSPHRASE", "passphrase-probe")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-probe.sock")
+    monkeypatch.setenv("TRACEFORGE_TEST_PLAIN", "visible")
+    registry = ToolRegistry(workspace, settings)
+
+    result = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="environment",
+            name="run_command",
+            arguments={
+                "argv": [
+                    "python",
+                    "-c",
+                    (
+                        "import os; print('|'.join(os.getenv(name, 'absent') for name in "
+                        "['TRACEFORGE_TEST_API_KEY', 'TRACEFORGE_TEST_PASSPHRASE', "
+                        "'SSH_AUTH_SOCK', 'TRACEFORGE_TEST_PLAIN']))"
+                    ),
+                ]
+            },
+        ),
+    )
+
+    assert result.ok
+    assert result.output.strip() == "absent|absent|absent|visible"
+
+
+@pytest.mark.asyncio
 async def test_create_patch_command_and_rollback(
     settings: Settings, workspace: Workspace, storage: Storage
 ) -> None:

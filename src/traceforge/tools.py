@@ -19,6 +19,12 @@ from traceforge.workspace import Workspace, WorkspaceViolation
 
 OutputCallback = Callable[[str], Awaitable[None]]
 
+SENSITIVE_ENV_NAME_PATTERN = re.compile(
+    r"KEY|PASSWORD|PASSWD|PASSPHRASE|SECRET|TOKEN|CREDENTIAL",
+    re.IGNORECASE,
+)
+SENSITIVE_ENV_EXACT = {"GPG_AGENT_INFO", "SSH_AUTH_SOCK"}
+
 
 class PermissionDecision(StrEnum):
     ALLOW = "allow"
@@ -475,7 +481,12 @@ def _outside_workspace_argument(argv: list[str], workspace: Path) -> str | None:
 
 
 def _command_environment(workspace: Path) -> dict[str, str]:
-    environment = os.environ.copy()
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in SENSITIVE_ENV_EXACT
+        and SENSITIVE_ENV_NAME_PATTERN.search(key) is None
+    }
     runtime_dirs = [
         workspace / ".venv" / "bin",
         workspace / "venv" / "bin",
