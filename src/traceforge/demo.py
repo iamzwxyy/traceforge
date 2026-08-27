@@ -11,10 +11,10 @@ DEMO_TASK = (
 _FIX_PATCH = """\
 --- a/src/tenant_cache_api/cache.py
 +++ b/src/tenant_cache_api/cache.py
-@@ -20 +20 @@
+@@ -17 +17 @@
 -        self._entries: dict[str, CacheEntry[T]] = {}
 +        self._entries: dict[tuple[str, str], CacheEntry[T]] = {}
-@@ -30,8 +30,8 @@
+@@ -27,8 +27,8 @@
          \"\"\"Return a fresh cached profile or load it for the requesting tenant.\"\"\"
 -        del tenant_id  # The cache currently forgets to include tenant scope.
 +        cache_key = (tenant_id, profile_id)

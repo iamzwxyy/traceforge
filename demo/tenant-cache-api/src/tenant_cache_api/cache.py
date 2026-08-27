@@ -3,18 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from time import monotonic
-from typing import Generic, TypeVar
-
-T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
-class CacheEntry(Generic[T]):
+class CacheEntry[T]:
     value: T
     expires_at: float
 
 
-class TenantTTLCache(Generic[T]):
+class TenantTTLCache[T]:
     def __init__(self, *, clock: Callable[[], float] = monotonic) -> None:
         self._clock = clock
         self._entries: dict[str, CacheEntry[T]] = {}

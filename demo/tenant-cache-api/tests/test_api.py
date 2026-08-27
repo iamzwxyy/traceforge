@@ -1,5 +1,4 @@
 from fastapi.testclient import TestClient
-
 from tenant_cache_api.main import app
 
 
