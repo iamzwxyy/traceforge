@@ -212,9 +212,10 @@ class RunRecord(BaseModel):
     pending_approval: ApprovalRequest | None = None
     verification: VerificationReport | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
+    plan_approved: bool = False
+    interrupted_from: RunState | None = None
     step_count: int = 0
     repair_cycles: int = 0
     error: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
-

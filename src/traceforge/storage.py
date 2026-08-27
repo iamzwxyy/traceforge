@@ -66,6 +66,8 @@ class Storage:
                     pending_approval_json TEXT,
                     verification_json TEXT,
                     messages_json TEXT NOT NULL DEFAULT '[]',
+                    plan_approved INTEGER NOT NULL DEFAULT 0,
+                    interrupted_from TEXT,
                     step_count INTEGER NOT NULL DEFAULT 0,
                     repair_cycles INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
@@ -107,7 +109,7 @@ class Storage:
             cursor = self._connection.execute(
                 f"""
                 UPDATE runs
-                SET state = ?, error = ?, updated_at = ?
+                SET interrupted_from = state, state = ?, error = ?, updated_at = ?
                 WHERE workspace = ? AND state IN ({placeholders})
                 """,
                 (
@@ -127,8 +129,9 @@ class Storage:
                 INSERT INTO runs (
                     id, task, workspace, state, verifier_enabled, plan_json,
                     clarification_json, pending_approval_json, verification_json,
-                    messages_json, step_count, repair_cycles, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    messages_json, plan_approved, interrupted_from, step_count,
+                    repair_cycles, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._run_values(run),
             )
@@ -142,8 +145,9 @@ class Storage:
                 UPDATE runs SET
                     task = ?, workspace = ?, state = ?, verifier_enabled = ?,
                     plan_json = ?, clarification_json = ?, pending_approval_json = ?,
-                    verification_json = ?, messages_json = ?, step_count = ?,
-                    repair_cycles = ?, error = ?, created_at = ?, updated_at = ?
+                    verification_json = ?, messages_json = ?, plan_approved = ?,
+                    interrupted_from = ?, step_count = ?, repair_cycles = ?,
+                    error = ?, created_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (*values[1:], values[0]),
@@ -285,6 +289,8 @@ class Storage:
             _dump_model(run.pending_approval),
             _dump_model(run.verification),
             json.dumps(run.messages, ensure_ascii=False),
+            int(run.plan_approved),
+            run.interrupted_from.value if run.interrupted_from else None,
             run.step_count,
             run.repair_cycles,
             run.error,
@@ -305,6 +311,10 @@ class Storage:
             pending_approval=_load_model(ApprovalRequest, row["pending_approval_json"]),
             verification=_load_model(VerificationReport, row["verification_json"]),
             messages=json.loads(row["messages_json"]),
+            plan_approved=bool(row["plan_approved"]),
+            interrupted_from=(
+                RunState(row["interrupted_from"]) if row["interrupted_from"] else None
+            ),
             step_count=row["step_count"],
             repair_cycles=row["repair_cycles"],
             error=row["error"],

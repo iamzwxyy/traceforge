@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from traceforge.config import Settings
 from traceforge.models import TaskPlan, ToolCall, ToolResult
@@ -29,7 +29,7 @@ class PermissionDecision(StrEnum):
 class PermissionAssessment:
     decision: PermissionDecision
     reason: str
-    risk: str = "unknown"
+    risk: Literal["unknown", "elevated", "dangerous"] = "unknown"
 
 
 class ToolRegistry:
@@ -218,7 +218,11 @@ class ToolRegistry:
             relative_dir = self.workspace.relative(current_path)
             if relative_dir != ".":
                 rows.append(f"{relative_dir}/")
-            rows.extend(self.workspace.relative(current_path / name) for name in sorted(files))
+            rows.extend(
+                self.workspace.relative(current_path / name)
+                for name in sorted(files)
+                if not _is_secret_file(name)
+            )
             if len(rows) >= 1_000:
                 rows.append("... output truncated at 1,000 entries")
                 break
@@ -228,6 +232,8 @@ class ToolRegistry:
         file_path = self.workspace.resolve_read(path)
         if not file_path.is_file():
             raise ValueError(f"Not a file: {path}")
+        if _is_secret_file(file_path.name):
+            raise ValueError("Secret-bearing environment files cannot be read by the agent")
         content = file_path.read_text(encoding="utf-8")
         lines = content.splitlines()
         if end_line is None:
@@ -242,6 +248,7 @@ class ToolRegistry:
     async def _search_text(self, query: str, path: str = ".", glob: str | None = None) -> str:
         target = self.workspace.resolve_read(path)
         argv = ["rg", "-n", "--no-heading", "--color", "never"]
+        argv.extend(["--glob", "!.env", "--glob", "!.env.*", "--glob", ".env.example"])
         if glob:
             argv.extend(["--glob", glob])
         argv.extend([query, str(target)])
@@ -261,6 +268,8 @@ class ToolRegistry:
         files = [target] if target.is_file() else target.rglob(glob or "*")
         for file_path in files:
             if not file_path.is_file() or ".git" in file_path.parts:
+                continue
+            if _is_secret_file(file_path.name):
                 continue
             try:
                 for number, line in enumerate(file_path.read_text().splitlines(), start=1):
@@ -441,3 +450,7 @@ def _for_model(output: str, limit: int) -> str:
         return output
     half = limit // 2
     return f"{output[:half]}\n... output truncated ...\n{output[-half:]}"
+
+
+def _is_secret_file(name: str) -> bool:
+    return name == ".env" or (name.startswith(".env.") and name != ".env.example")
