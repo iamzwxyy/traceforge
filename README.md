@@ -136,7 +136,9 @@ uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to
 ```
 
 The current suite has 102 backend tests at 86.22% coverage (with a hard 85% gate), frontend unit
-tests, a full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
+tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+keyboard-safe dialogs, responsive layouts, and reload recovery. Dependencies are locked; CI also
+runs an Ubuntu quality job and a macOS smoke job.
 
 ## Repository map
 

@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { expectNoWcagViolations } from "./a11y";
 
 test("demo proves a tenant-isolation fix without runtime errors", async ({ page }) => {
   const consoleErrors: string[] = [];
@@ -47,6 +48,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
 
   await expect(page.getByRole("heading", { name: "Work proven, not merely reported" }))
     .toBeVisible({ timeout: 15_000 });
+  await expectNoWcagViolations(page, "completed run");
   await expect(page.getByText("4 passed", { exact: false }).first()).toBeVisible();
   await expect(page.getByText(/\d+(\.\d+)?k? \/ 64k ctx/)).toBeVisible();
   await expect(page.getByText("Live", { exact: true })).toBeVisible();
@@ -56,21 +58,33 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
     .toHaveAttribute("aria-expanded", "false");
   await expect(page.getByRole("button", { name: /Independent verification/ }))
     .toHaveAttribute("aria-expanded", "true");
+
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Work proven, not merely reported" }))
+    .toBeVisible();
+  await expect(page.getByText("Live", { exact: true })).toBeVisible();
+  await expect(page.getByText("4 passed", { exact: false }).first()).toBeVisible();
   await page.getByRole("button", { name: "Proof Pack" }).click();
   await expect(page.getByRole("heading", { name: "Proof Pack" })).toBeVisible();
   await expect(page.getByText("proven", { exact: true })).toBeVisible();
   await expect(page.getByText("STABLE EVIDENCE SHA-256")).toBeVisible();
   await expect(page.getByText("COMMAND SANDBOX")).toBeVisible();
   await expect(page.getByText(/\d+ enforced · 0 blocked before run/)).toBeVisible();
+  await expectNoWcagViolations(page, "proof pack dialog");
   await expect(page.getByRole("link", { name: "Download Markdown" }))
     .toHaveAttribute("href", /proof-pack\.md$/);
-  await page.getByRole("button", { name: "Close", exact: true }).click();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Proof Pack" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Proof Pack" })).toBeFocused();
   await page.getByRole("button", { name: "Rollback", exact: true }).click();
   const rollbackDialog = page.getByRole("dialog", { name: "Rollback this run?" });
   await expect(rollbackDialog).toBeVisible();
   await expect(rollbackDialog).toContainText("Later user edits are preserved as conflicts");
-  await rollbackDialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(rollbackDialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+  await expectNoWcagViolations(page, "rollback dialog");
+  await page.keyboard.press("Escape");
   await expect(rollbackDialog).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Rollback", exact: true })).toBeFocused();
   await page.getByRole("button", { name: "Rollback", exact: true }).click();
   await page.getByRole("button", { name: "Rollback files" }).click();
   await expect(page.getByText("Rolled back", { exact: true }).first()).toBeVisible();
@@ -82,5 +96,6 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByText("Run stopped", { exact: true }).last()).toBeVisible();
   await expect(page.getByText(/Any file changes already made remain in the workspace/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Rollback", exact: true })).toBeVisible();
+  await expectNoWcagViolations(page, "stopped run");
   expect(consoleErrors).toEqual([]);
 });

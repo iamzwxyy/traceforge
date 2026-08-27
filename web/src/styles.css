@@ -13,7 +13,7 @@
   --line-soft: #171e2a;
   --text: #edf2f8;
   --muted: #8390a3;
-  --faint: #536074;
+  --faint: #748297;
   --accent: #76e4b8;
   --accent-strong: #3ed69d;
   --accent-soft: rgba(62, 214, 157, 0.11);
@@ -104,7 +104,7 @@ code, pre { font-family: var(--mono); }
 .directory-field > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
 .project-target-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 7px; }
 .path-preview { margin-top: 12px; padding: 9px 10px; display: flex; flex-direction: column; gap: 5px; border: 1px solid var(--line-soft); border-radius: 6px; background: #0a0f16; }
-.path-preview span { color: var(--faint); font-size: 8px; }
+.path-preview span { color: #7a889c; font-size: 8px; }
 .path-preview code { overflow: hidden; color: #a9bacd; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .task-composer textarea { width: 100%; padding: 16px; resize: vertical; color: var(--text); border: 0; background: transparent; font-size: 13px; line-height: 1.6; outline: none; }
 .task-composer textarea::placeholder { color: #596579; }
@@ -145,7 +145,7 @@ code, pre { font-family: var(--mono); }
 .directory-list > button:hover { color: var(--accent); background: rgba(62, 214, 157, 0.08); }
 .directory-list > button > span { min-width: 0; display: flex; flex-direction: column; }
 .directory-list strong { color: #d3dce7; font-size: 10px; font-weight: 560; }
-.directory-list small { margin-top: 2px; overflow: hidden; color: #526075; font: 7px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.directory-list small { margin-top: 2px; overflow: hidden; color: #7a889c; font: 7px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .directory-list .thinking-row { min-height: 210px; }
 .selected-path { color: #7d8ca0; font: 8px var(--mono) !important; }
 .inline-error { margin: 9px 0 0; color: #efa0a0; font-size: 9px; }

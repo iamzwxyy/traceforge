@@ -35,7 +35,14 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import { buildActivityChapters, isActiveState, parseDiff, presentState } from "./lib";
 import type {
@@ -55,6 +62,56 @@ import type {
 import { useTraceForge } from "./useTraceForge";
 
 type InspectorTab = "timeline" | "diff" | "checks" | "verifier";
+
+function dialogFocusables(dialog: HTMLElement): HTMLElement[] {
+  return Array.from(dialog.querySelectorAll<HTMLElement>(
+    "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), "
+      + "textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+  ));
+}
+
+function useDialogFocus(onClose: () => void) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const closeRef = useRef(onClose);
+  useEffect(() => {
+    closeRef.current = onClose;
+  }, [onClose]);
+  useEffect(() => {
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    const initial = dialog?.querySelector<HTMLElement>("[data-dialog-initial-focus]")
+      ?? (dialog ? dialogFocusables(dialog)[0] : null)
+      ?? dialog;
+    initial?.focus();
+    return () => {
+      if (previous?.isConnected) previous.focus();
+    };
+  }, []);
+  const onDialogKeyDown = useCallback((event: ReactKeyboardEvent<HTMLElement>) => {
+    const dialog = dialogRef.current;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeRef.current();
+      return;
+    }
+    if (event.key !== "Tab" || !dialog) return;
+    const focusable = dialogFocusables(dialog);
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (!first || !last) {
+      event.preventDefault();
+      dialog.focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }, []);
+  return { dialogRef, onDialogKeyDown };
+}
 
 export default function App() {
   const forge = useTraceForge();
@@ -472,6 +529,7 @@ function DirectoryDialog({
   const [path, setPath] = useState(initialPath ?? "");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const { dialogRef, onDialogKeyDown } = useDialogFocus(onClose);
 
   const load = useCallback((nextPath?: string) => {
     setLoading(true);
@@ -489,13 +547,13 @@ function DirectoryDialog({
 
   return (
     <div className="modal-backdrop" role="presentation">
-      <section className="modal directory-modal" role="dialog" aria-modal="true" aria-labelledby="directory-title">
+      <section ref={dialogRef} className="modal directory-modal" role="dialog" aria-modal="true" aria-labelledby="directory-title" tabIndex={-1} onKeyDown={onDialogKeyDown}>
         <div className="modal-heading">
           <div><p className="eyebrow">LOCAL WORKSPACE</p><h2 id="directory-title">Choose a directory</h2></div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close directory browser"><X size={17} /></button>
         </div>
         <div className="path-entry">
-          <input value={path} onChange={(event) => setPath(event.target.value)} aria-label="Directory path" />
+          <input value={path} onChange={(event) => setPath(event.target.value)} aria-label="Directory path" data-dialog-initial-focus />
           <button className="button" type="button" onClick={() => load(path)}>Go</button>
         </div>
         {error && <p className="inline-error">{error}</p>}
@@ -541,6 +599,7 @@ function ProjectDialog({
   const [directory, setDirectory] = useState(initialDirectory);
   const [folderName, setFolderName] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const { dialogRef, onDialogKeyDown } = useDialogFocus(onClose);
   const root = mode === "create"
     ? `${directory.replace(/\/$/, "")}/${folderName.trim()}`
     : directory;
@@ -548,7 +607,7 @@ function ProjectDialog({
 
   return (
     <div className="modal-backdrop" role="presentation">
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="project-title">
+      <section ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="project-title" tabIndex={-1} onKeyDown={onDialogKeyDown}>
         <div className="modal-heading">
           <div><p className="eyebrow">PROJECT WORKSPACE</p><h2 id="project-title">Add a project</h2></div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close project dialog"><X size={17} /></button>
@@ -557,7 +616,7 @@ function ProjectDialog({
           <button type="button" className={mode === "open" ? "active" : ""} onClick={() => setMode("open")}>Open existing</button>
           <button type="button" className={mode === "create" ? "active" : ""} onClick={() => setMode("create")}>Create empty</button>
         </div>
-        <label className="field-label"><span>Project name</span><input value={name} onChange={(event) => setName(event.target.value)} autoFocus /></label>
+        <label className="field-label"><span>Project name</span><input value={name} onChange={(event) => setName(event.target.value)} data-dialog-initial-focus /></label>
         <DirectoryField
           label={mode === "create" ? "Parent directory" : "Existing directory"}
           value={directory}
@@ -608,6 +667,7 @@ function ProviderDialog({
   const [credentialFile, setCredentialFile] = useState(provider.credential_file ?? "");
   const [working, setWorking] = useState<"save" | "test" | null>(null);
   const [probe, setProbe] = useState<ProviderProbe | null>(null);
+  const { dialogRef, onDialogKeyDown } = useDialogFocus(onClose);
 
   const config = {
     model: model.trim(),
@@ -617,7 +677,7 @@ function ProviderDialog({
 
   return (
     <div className="modal-backdrop" role="presentation">
-      <section className="modal provider-modal" role="dialog" aria-modal="true" aria-labelledby="provider-title">
+      <section ref={dialogRef} className="modal provider-modal" role="dialog" aria-modal="true" aria-labelledby="provider-title" tabIndex={-1} onKeyDown={onDialogKeyDown}>
         <div className="modal-heading">
           <div><p className="eyebrow">MODEL PROVIDER</p><h2 id="provider-title">Connection settings</h2></div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close model settings"><X size={17} /></button>
@@ -629,7 +689,7 @@ function ProviderDialog({
             <small>{provider.credential_source === "file" ? "Owner-only local file" : provider.credential_source === "environment" ? provider.credential_env : "Add a file path below or set OPENAI_API_KEY"}</small>
           </div>
         </div>
-        <label className="field-label"><span>Model</span><input value={model} onChange={(event) => setModel(event.target.value)} /></label>
+        <label className="field-label"><span>Model</span><input value={model} onChange={(event) => setModel(event.target.value)} data-dialog-initial-focus /></label>
         <label className="field-label"><span>OpenAI-compatible base URL</span><input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.deepseek.com" /></label>
         <label className="field-label">
           <span>Credential file path</span>
@@ -763,35 +823,41 @@ function RunStage({
         {run.state === "succeeded" && <EvidenceBoard run={run} onProof={onProof} />}
       </div>
       {confirmRollback && (
-        <div className="modal-backdrop" role="presentation">
-          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="rollback-title">
-            <div className="modal-heading">
-              <div><p className="eyebrow">CONFLICT-AWARE ROLLBACK</p><h2 id="rollback-title">Rollback this run?</h2></div>
-              <button className="icon-button" type="button" onClick={() => setConfirmRollback(false)} aria-label="Close rollback confirmation"><X size={17} /></button>
-            </div>
-            <p className="modal-copy">
-              TraceForge will restore files changed by this run. Later user edits are preserved as
-              conflicts, but a completed rollback cannot be automatically redone.
-            </p>
-            <div className="modal-actions">
-              <span>Only this run&apos;s recorded snapshots are considered.</span>
-              <div className="button-row">
-                <button className="button ghost" type="button" onClick={() => setConfirmRollback(false)}>Cancel</button>
-                <button
-                  className="button warning"
-                  type="button"
-                  onClick={() => {
-                    setConfirmRollback(false);
-                    onRollback();
-                  }}
-                >
-                  <RotateCcw size={14} /> Rollback files
-                </button>
-              </div>
-            </div>
-          </section>
-        </div>
+        <RollbackDialog
+          onClose={() => setConfirmRollback(false)}
+          onConfirm={() => {
+            setConfirmRollback(false);
+            onRollback();
+          }}
+        />
       )}
+    </div>
+  );
+}
+
+function RollbackDialog({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
+  const { dialogRef, onDialogKeyDown } = useDialogFocus(onClose);
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="rollback-title" tabIndex={-1} onKeyDown={onDialogKeyDown}>
+        <div className="modal-heading">
+          <div><p className="eyebrow">CONFLICT-AWARE ROLLBACK</p><h2 id="rollback-title">Rollback this run?</h2></div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close rollback confirmation"><X size={17} /></button>
+        </div>
+        <p className="modal-copy">
+          TraceForge will restore files changed by this run. Later user edits are preserved as
+          conflicts, but a completed rollback cannot be automatically redone.
+        </p>
+        <div className="modal-actions">
+          <span>Only this run&apos;s recorded snapshots are considered.</span>
+          <div className="button-row">
+            <button className="button ghost" type="button" onClick={onClose} data-dialog-initial-focus>Cancel</button>
+            <button className="button warning" type="button" onClick={onConfirm}>
+              <RotateCcw size={14} /> Rollback files
+            </button>
+          </div>
+        </div>
+      </section>
     </div>
   );
 }
@@ -1004,7 +1070,7 @@ function Inspector({ run, events, diff, tab, onTab }: { run: Run | null; events:
   ];
   return (
     <aside className="inspector panel-edge">
-      <nav className="inspector-tabs">{tabs.map(({ id, label, icon: Icon }) => <button type="button" className={tab === id ? "active" : ""} onClick={() => onTab(id)} key={id}><Icon size={14} /><span>{label}</span></button>)}</nav>
+      <nav className="inspector-tabs" aria-label="Run evidence views">{tabs.map(({ id, label, icon: Icon }) => <button type="button" className={tab === id ? "active" : ""} aria-label={label} title={label} onClick={() => onTab(id)} key={id}><Icon size={14} /><span>{label}</span></button>)}</nav>
       <div className="inspector-content">
         {!run && <div className="inspector-empty"><FileDiff size={26} /><p>Select a run to inspect evidence.</p></div>}
         {run && tab === "timeline" && <Timeline events={events} />}
@@ -1040,9 +1106,10 @@ function PlanGateSummary({ gate }: { gate: PlanGate }) {
 }
 
 function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; runId: string; onClose: () => void }) {
+  const { dialogRef, onDialogKeyDown } = useDialogFocus(onClose);
   return (
     <div className="modal-backdrop" role="presentation">
-      <section className="modal proof-modal" role="dialog" aria-modal="true" aria-labelledby="proof-title">
+      <section ref={dialogRef} className="modal proof-modal" role="dialog" aria-modal="true" aria-labelledby="proof-title" tabIndex={-1} onKeyDown={onDialogKeyDown}>
         <div className="modal-heading"><div><p className="eyebrow">AUDITABLE COMPLETION</p><h2 id="proof-title">Proof Pack</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close proof pack"><X size={17} /></button></div>
         {!pack ? <div className="proof-loading"><LoaderCircle className="spin" size={18} /> Assembling persisted evidence…</div> : <>
           <div className={`proof-verdict ${pack.proof_status}`}><div className="evidence-seal"><Fingerprint size={22} /></div><div><span>PROOF STATUS</span><strong>{pack.proof_status.replaceAll("_", " ")}</strong><small>{pack.verification?.summary ?? "Evidence is still being assembled."}</small></div><div><span>FRESH CHECKS</span><strong>{pack.checks_fresh ? "YES" : "NO"}</strong></div></div>
