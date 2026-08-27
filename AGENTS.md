@@ -16,6 +16,8 @@
 - Frontend code must pass `pnpm --filter traceforge-web lint`, `pnpm --filter traceforge-web typecheck`, and `pnpm --filter traceforge-web test --run`.
 - Run the narrowest relevant tests while iterating, then the complete validation suite before claiming completion.
 - New behavior requires tests. Security boundaries require adversarial tests.
+- User-visible features, state semantics, workflows, or scope changes must update `FEATURES.md`
+  in the same commit so the repository guide remains an accurate product and request tracker.
 - Keep commits focused and preserve the visible development history.
 
 ## Definition of done

@@ -33,7 +33,7 @@ describe("mission control helpers", () => {
   });
 
   it("presents evidence-backed success distinctly", () => {
-    expect(presentState("succeeded")).toEqual({ label: "Proven", tone: "success" });
+    expect(presentState("succeeded")).toEqual({ label: "已证实", tone: "success" });
   });
 
   it("groups persisted activity into progressive-disclosure chapters", () => {
@@ -48,9 +48,9 @@ describe("mission control helpers", () => {
     const chapters = buildActivityChapters(events);
 
     expect(chapters.map((chapter) => chapter.label)).toEqual([
-      "Planning & decisions",
-      "Build & checks",
-      "Independent verification",
+      "规划与决策",
+      "执行与检查",
+      "独立验证",
     ]);
     expect(chapters.map((chapter) => chapter.events.map((item) => item.seq))).toEqual([
       [1],
@@ -70,7 +70,7 @@ describe("mission control helpers", () => {
       { ...event(7), type: "tool.completed" },
     ]);
 
-    expect(chapters.at(-1)?.label).toBe("Repair cycle 1");
+    expect(chapters.at(-1)?.label).toBe("修复轮次 1");
     expect(chapters.at(-1)?.events[0].type).toBe("repair.started");
   });
 
@@ -89,8 +89,8 @@ describe("mission control helpers", () => {
     ]);
 
     expect(chapters.map((chapter) => chapter.label)).toEqual([
-      "Build & checks",
-      "Recovery · resumed safely",
+      "执行与检查",
+      "恢复 · 已安全继续",
     ]);
   });
 });

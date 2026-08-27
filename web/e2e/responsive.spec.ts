@@ -11,8 +11,8 @@ const viewports = [
 test("new-task layout stays operable without horizontal overflow", async ({ page }) => {
   await page.setViewportSize({ width: viewports[0].width, height: 768 });
   await page.goto("/");
-  const heading = page.getByRole("heading", { name: "What should TraceForge prove?" });
-  await page.getByRole("button", { name: "New run" }).click();
+  const heading = page.getByRole("heading", { name: "你希望 TraceForge 完成并证明什么？" });
+  await page.getByRole("button", { name: "新建任务" }).click();
   await expect(heading).toBeVisible();
   for (const viewport of viewports) {
     await page.setViewportSize({ width: viewport.width, height: 768 });
@@ -25,9 +25,9 @@ test("new-task layout stays operable without horizontal overflow", async ({ page
       .toBe(true);
   }
 
-  const browse = page.getByRole("button", { name: "Browse" });
+  const browse = page.getByRole("button", { name: "浏览" });
   await browse.click();
-  const dialog = page.getByRole("dialog", { name: "Choose a directory" });
+  const dialog = page.getByRole("dialog", { name: "选择目录" });
   const bounds = await dialog.boundingBox();
   expect(bounds).not.toBeNull();
   expect(bounds!.x).toBeGreaterThanOrEqual(0);

@@ -6,18 +6,18 @@ export interface StatePresentation {
 }
 
 const states: Record<RunState, StatePresentation> = {
-  created: { label: "Created", tone: "idle" },
-  planning: { label: "Planning", tone: "active" },
-  awaiting_clarification: { label: "Needs input", tone: "waiting" },
-  awaiting_plan_approval: { label: "Plan review", tone: "waiting" },
-  executing: { label: "Building", tone: "active" },
-  awaiting_action_approval: { label: "Approval", tone: "waiting" },
-  verifying: { label: "Verifying", tone: "active" },
-  succeeded: { label: "Proven", tone: "success" },
-  failed: { label: "Failed", tone: "danger" },
-  cancelled: { label: "Stopped", tone: "danger" },
-  interrupted: { label: "Interrupted", tone: "waiting" },
-  rolled_back: { label: "Rolled back", tone: "idle" },
+  created: { label: "已创建", tone: "idle" },
+  planning: { label: "正在规划", tone: "active" },
+  awaiting_clarification: { label: "等待补充", tone: "waiting" },
+  awaiting_plan_approval: { label: "等待审批", tone: "waiting" },
+  executing: { label: "正在执行", tone: "active" },
+  awaiting_action_approval: { label: "动作审批", tone: "waiting" },
+  verifying: { label: "正在验证", tone: "active" },
+  succeeded: { label: "已证实", tone: "success" },
+  failed: { label: "失败", tone: "danger" },
+  cancelled: { label: "已停止", tone: "danger" },
+  interrupted: { label: "已中断", tone: "waiting" },
+  rolled_back: { label: "已回滚", tone: "idle" },
 };
 
 export function presentState(state: RunState): StatePresentation {
@@ -128,11 +128,11 @@ function phaseForState(state: string): ActivityPhase | null {
 }
 
 function chapterLabel(phase: ActivityPhase, occurrence: number, firstEvent: RunEvent): string {
-  if (firstEvent.type === "run.resumed") return "Recovery · resumed safely";
+  if (firstEvent.type === "run.resumed") return "恢复 · 已安全继续";
   if (firstEvent.type === "repair.started") {
-    return `Repair cycle ${String(firstEvent.payload.cycle ?? occurrence)}`;
+    return `修复轮次 ${String(firstEvent.payload.cycle ?? occurrence)}`;
   }
-  if (phase === "planning") return "Planning & decisions";
-  if (phase === "building") return occurrence === 1 ? "Build & checks" : `Repair cycle ${occurrence - 1}`;
-  return occurrence === 1 ? "Independent verification" : `Verification round ${occurrence}`;
+  if (phase === "planning") return "规划与决策";
+  if (phase === "building") return occurrence === 1 ? "执行与检查" : `修复轮次 ${occurrence - 1}`;
+  return occurrence === 1 ? "独立验证" : `验证轮次 ${occurrence}`;
 }

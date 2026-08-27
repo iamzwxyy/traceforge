@@ -1,11 +1,13 @@
+# ruff: noqa: RUF001  # Chinese demo copy intentionally uses Chinese punctuation.
+
 from __future__ import annotations
 
 from traceforge.models import ToolCall
 from traceforge.provider import ModelResponse, ScriptedProvider
 
 DEMO_TASK = (
-    "Fix the multi-tenant cache isolation bug without changing TTL or cache-hit behavior. "
-    "Add a regression test and prove the full test suite passes."
+    "修复多租户缓存隔离问题，不能改变 TTL 或缓存命中行为。"
+    "补充回归测试，并证明完整测试套件通过。"
 )
 
 _FIX_PATCH = """\
@@ -46,7 +48,7 @@ def scripted_demo_provider() -> ScriptedProvider:
     return ScriptedProvider(
         [
             ModelResponse(
-                content="I'll first map the small service and its current test boundary.",
+                content="我会先梳理这个小型服务及其现有测试边界。",
                 tool_calls=[
                     ToolCall(
                         id="demo-list",
@@ -73,23 +75,21 @@ def scripted_demo_provider() -> ScriptedProvider:
                             "questions": [
                                 {
                                     "id": "compatibility",
-                                    "prompt": "How much API compatibility should the fix preserve?",
+                                    "prompt": "这次修复需要保留到什么程度的 API 兼容性？",
                                     "options": [
                                         {
                                             "id": "preserve",
-                                            "label": "Preserve public API",
+                                            "label": "保留公共 API",
                                             "description": (
-                                                "Keep the current call signature and isolate only "
-                                                "the internal cache key."
+                                                "保持现有调用签名，只隔离内部缓存键。"
                                             ),
                                             "recommended": True,
                                         },
                                         {
                                             "id": "redesign",
-                                            "label": "Redesign cache API",
+                                            "label": "重新设计缓存 API",
                                             "description": (
-                                                "Introduce a new tenant-scoped key type and "
-                                                "migrate callers."
+                                                "引入新的租户级键类型，并迁移调用方。"
                                             ),
                                         },
                                     ],
@@ -106,32 +106,31 @@ def scripted_demo_provider() -> ScriptedProvider:
                         name="submit_plan",
                         arguments={
                             "summary": (
-                                "Scope cache entries by tenant and profile while preserving the "
-                                "public API and TTL behavior."
+                                "按租户和资料 ID 隔离缓存项，同时保留公共 API 和 TTL 行为。"
                             ),
                             "steps": [
                                 {
                                     "id": "inspect",
-                                    "title": "Inspect the cache implementation",
-                                    "description": "Confirm the faulty key and existing semantics.",
+                                    "title": "检查缓存实现",
+                                    "description": "确认错误的缓存键和现有语义。",
                                 },
                                 {
                                     "id": "fix",
-                                    "title": "Use a tenant-scoped cache key",
+                                    "title": "使用租户级缓存键",
                                     "description": (
-                                        "Keep lookup, expiry, and loader behavior unchanged."
+                                        "保持查找、过期和加载行为不变。"
                                     ),
                                 },
                                 {
                                     "id": "regression",
-                                    "title": "Add cross-tenant regression coverage",
-                                    "description": "Prove equal profile IDs cannot share values.",
+                                    "title": "补充跨租户回归测试",
+                                    "description": "证明相同资料 ID 不会跨租户共享值。",
                                 },
                             ],
                             "acceptance_checks": [
                                 {
                                     "id": "pytest",
-                                    "label": "All cache and API tests pass",
+                                    "label": "所有缓存和 API 测试通过",
                                     "command": check,
                                 }
                             ],
@@ -140,15 +139,14 @@ def scripted_demo_provider() -> ScriptedProvider:
                                 "tests/test_tenant_isolation.py",
                             ],
                             "risks": [
-                                "Changing the key must not reset the TTL or defeat "
-                                "same-tenant hits."
+                                "修改缓存键不能重置 TTL，也不能破坏同一租户内的缓存命中。"
                             ],
                         },
                     )
                 ]
             ),
             ModelResponse(
-                content="The approved plan keeps the change deliberately narrow.",
+                content="已批准的计划会刻意保持较小的变更范围。",
                 tool_calls=[
                     ToolCall(
                         id="demo-read-cache",
@@ -199,8 +197,7 @@ def scripted_demo_provider() -> ScriptedProvider:
             ),
             ModelResponse(
                 content=(
-                    "The implementation and regression are in place; now I'll collect "
-                    "fresh evidence."
+                    "实现和回归测试已经就位；接下来收集新鲜证据。"
                 ),
                 tool_calls=[
                     ToolCall(
@@ -217,12 +214,11 @@ def scripted_demo_provider() -> ScriptedProvider:
                         name="finish",
                         arguments={
                             "summary": (
-                                "Scoped cache entries by (tenant_id, profile_id) and added a "
-                                "cross-tenant regression test."
+                                "已按 (tenant_id, profile_id) 隔离缓存项，并补充跨租户回归测试。"
                             ),
                             "evidence": [
-                                "python -m pytest -q passed",
-                                "existing hit and TTL tests remained green",
+                                "python -m pytest -q 已通过",
+                                "现有缓存命中和 TTL 测试仍然通过",
                             ],
                         },
                     )
@@ -236,9 +232,8 @@ def scripted_demo_provider() -> ScriptedProvider:
                         arguments={
                             "verdict": "pass",
                             "summary": (
-                                "The diff scopes every cache read and write by tenant plus "
-                                "profile. "
-                                "Fresh tests cover isolation, cache hits, expiry, and the HTTP API."
+                                "差异中的每次缓存读写都同时按租户和资料 ID 隔离。"
+                                "新鲜测试覆盖隔离、缓存命中、过期和 HTTP API。"
                             ),
                             "findings": [],
                         },

@@ -9,6 +9,8 @@ checks, and asks an independent read-only verifier to judge the result.
 The project is intentionally focused: no pet, plugin market, hosted execution, or IDE clone.
 Its differentiator is a defensible engineering loop with useful human control.
 
+中文使用说明、完整功能状态和需求追踪见 [功能手册](FEATURES.md)。
+
 ## Why it stands out
 
 - **Material clarification, not guesswork.** Complex requests can pause for one to three
@@ -166,7 +168,7 @@ evaluation/           pinned real-model repair fixtures
 TraceForge v0.1 supports one active run per workspace and can run independent workspaces
 concurrently on macOS/Linux. It is local-first and not a multi-user service. OS isolation is
 backend-dependent: Seatbelt is built into supported macOS systems; Linux requires a working,
-non-setuid Bubblewrap installation. The header reports a visible **Policy only** state when no
+non-setuid Bubblewrap installation. The header reports a visible **仅策略限制** state when no
 backend passes its startup probe. A user can explicitly approve an unknown command for one
 unsandboxed execution, which is recorded as a bypass. Binary file editing, Windows, parallel
 agents, browser automation, and plugin systems are outside v0.1.
