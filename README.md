@@ -104,7 +104,7 @@ pnpm --filter traceforge-web build
 pnpm --filter traceforge-web e2e
 ```
 
-The current suite has 48 backend tests with a hard 85% coverage gate, frontend unit tests, a
+The current suite has 52 backend tests with a hard 85% coverage gate, frontend unit tests, a
 full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
 
 ## Repository map
