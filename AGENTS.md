@@ -5,7 +5,9 @@
 - Build a local, explainable coding agent. Do not use agent frameworks or hosted code/file execution tools.
 - Keep the agent core independent from FastAPI and React so it can be tested without the web application.
 - Use OpenAI-compatible native tool calling. Own history management, tool dispatch, approvals, termination, recovery, and verification in this repository.
-- Never read, print, store, or commit API keys. Configuration comes from environment variables only.
+- Never print, persist, expose, or commit API-key values. Provider credentials may come from the
+  process environment or an owner-only local file reference; store only the file path, resolve the
+  value inside provider construction, and scrub credential-like variables from child commands.
 - Support macOS and Linux. Do not add Windows-specific branches in v1.
 
 ## Engineering expectations

@@ -19,6 +19,8 @@ Its differentiator is a defensible engineering loop with useful human control.
   returns concrete findings to the builder for at most two repair cycles.
 - **Evidence-first UI.** Timeline, unified diff, check output, verdict, approvals, Stop, Resume,
   and Rollback are available in one local web workbench.
+- **Low-friction workspaces.** Start a direct task in the last-used directory, or register a
+  project when several runs should share a stable root. Neither mode copies or uploads files.
 - **Safety by construction.** Paths are workspace-bounded, symlink escapes and `.git` writes are
   rejected, commands never use a shell, and dangerous operations are denied.
 - **Recoverable execution.** Runs and events survive in SQLite. File snapshots support
@@ -41,27 +43,34 @@ compatibility option, approve the plan, and watch TraceForge repair a real cross
 isolation bug. The demo changes a disposable copy, executes four real Pytest tests, and produces
 a read-only verifier verdict.
 
-## Run against your own workspace
+## Run against your own workspaces
 
 TraceForge accepts an OpenAI-compatible Chat Completions endpoint with native tool calling.
+It can launch before credentials are configured:
 
 ```bash
-export OPENAI_API_KEY="..."
-export OPENAI_MODEL="your-tool-calling-model"
-# Optional for compatible providers:
-export OPENAI_BASE_URL="https://provider.example/v1"
-
 uv run traceforge serve --workspace /absolute/path/to/project --port 8765
 ```
 
-Only four configuration variables are read:
+Open <http://127.0.0.1:8765>, then use the settings button to choose the model, compatible base
+URL, and a local credential file. The file must contain exactly one line and have owner-only
+permissions (`chmod 600`). TraceForge saves only its absolute path; the credential value is read
+when constructing the provider and is never returned by the API or UI.
+
+The composer defaults to a direct task and remembers its last directory. Select **Project** to
+open an existing directory or create a new empty one as a reusable project root.
+
+Environment variables remain available as a non-persisted fallback:
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | yes | Provider credential; never returned by the API or UI |
+| `OPENAI_API_KEY` | no | Fallback provider credential; never returned by the API or UI |
 | `OPENAI_MODEL` | no | Defaults to `gpt-5.6-sol` |
 | `OPENAI_BASE_URL` | no | OpenAI-compatible endpoint |
 | `TRACEFORGE_CONTEXT_LIMIT` | no | Token-window estimate; defaults to 64,000 |
+
+Before the first real run, use **Test connection**. The probe requires the selected model to
+complete a native function call, so a successful HTTP response alone is not treated as readiness.
 
 ## How a run works
 
@@ -104,7 +113,7 @@ pnpm --filter traceforge-web build
 pnpm --filter traceforge-web e2e
 ```
 
-The current suite has 52 backend tests with a hard 85% coverage gate, frontend unit tests, a
+The current suite has 69 backend tests with a hard 85% coverage gate, frontend unit tests, a
 full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
 
 ## Repository map
@@ -120,9 +129,10 @@ scripts/              tracked-file credential scan
 
 ## Scope and limitations
 
-TraceForge v0.1 supports one active run per workspace on macOS/Linux. It is local-first, not a
-multi-user service or an OS sandbox. Approved project commands execute with the current user's
-permissions, so the exact argv and risk reason are always shown for unknown actions. Binary file
-editing, Windows, parallel agents, browser automation, and plugin systems are outside v0.1.
+TraceForge v0.1 supports one active run per workspace and can run independent workspaces
+concurrently on macOS/Linux. It is local-first, not a multi-user service or an OS sandbox.
+Approved project commands execute with the current user's permissions, so the exact argv and risk
+reason are always shown for unknown actions. Binary file editing, Windows, parallel agents,
+browser automation, and plugin systems are outside v0.1.
 
 Licensed under the [MIT License](LICENSE).

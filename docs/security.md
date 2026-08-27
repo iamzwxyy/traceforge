@@ -41,10 +41,18 @@ descendants.
 
 ## Credentials and redaction
 
-The real provider reads credentials from environment variables. `/api/status` returns only whether
-a key is configured. Model and tool text are redacted for the configured key and token-shaped
-`sk-...` values before public events are emitted. The CI scanner examines Git-tracked UTF-8 files
-for private-key headers and common credential literals.
+The real provider reads a credential from either `OPENAI_API_KEY` or a user-selected local file.
+The file reference must resolve to a regular file smaller than 16 KiB; on POSIX it must be
+owner-only, and its content must be exactly one non-empty line. SQLite stores only the canonical
+file path. Public status/configuration responses expose the source and readiness flag, never the
+value. The connection check verifies native tool calling rather than only endpoint reachability.
+
+Before any model-proposed child command starts, TraceForge removes environment variables whose
+names indicate keys, passwords, passphrases, secrets, tokens, or credentials, as well as common
+agent socket variables. Normal variables such as `PATH` remain available. Model and tool text are
+also redacted for the configured credential and token-shaped `sk-...` values before public events
+are emitted. The CI scanner examines Git-tracked UTF-8 files for private-key headers and common
+credential literals.
 
 If a credential is ever committed, deleting the file is insufficient: revoke the credential,
 replace it, and remove it from history before publishing.

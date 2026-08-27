@@ -12,7 +12,8 @@ first-class data rather than rendering a chat transcript around an opaque model 
 ```mermaid
 flowchart TB
     UI[React workbench] <-->|REST + sequenced WebSocket| API[FastAPI]
-    API --> Manager[AgentManager state machine]
+    API --> Runtime[AgentRuntime workspace router]
+    Runtime --> Manager[AgentManager per active workspace]
     Manager --> Provider[ModelProvider]
     Manager --> Tools[ToolRegistry]
     Manager --> Context[ContextManager]
@@ -24,6 +25,8 @@ flowchart TB
 ```
 
 - `ModelProvider` only translates OpenAI-compatible tool calls. It does not own the loop.
+- `AgentRuntime` resolves canonical workspace roots and lazily creates one manager per directory,
+  allowing independent workspaces to progress concurrently without overlapping writers.
 - `AgentManager` is the product core: phases, approvals, retries, evidence freshness, repair
   cycles, cancellation, resume, and completion.
 - `ToolRegistry` defines and executes the bounded local capability surface.
@@ -120,15 +123,21 @@ hidden reasoning is neither requested nor displayed.
 
 ## Persistence and recovery
 
-SQLite uses WAL mode and three tables:
+SQLite uses WAL mode and six tables:
 
-- `runs`: public state plus internal messages, plan approval, and interrupted origin;
+- `runs`: public state, optional project association, internal messages, plan approval, and
+  interrupted origin;
 - `events`: per-run monotonically increasing sequence and JSON payload;
 - `snapshots`: original bytes, mode, original hash, and last agent-written hash per path.
+- `projects`: reusable display names and canonical local root directories;
+- `provider_config`: one model/base-URL/credential-file reference, never the secret value;
+- `preferences`: small local UI choices such as the last direct-task workspace.
 
 Startup migrations add compatible columns to early v0.1 databases. WebSocket clients request
 events after their last sequence; the server replays persisted rows before subscribing to new
-ones. One workspace permits one active or interrupted run to avoid overlapping writes.
+ones. One workspace permits one active or interrupted run to avoid overlapping writes; different
+workspaces use separate managers and may run concurrently. On process startup, every unfinished
+run is marked interrupted before any workspace manager is created.
 
 ## Rollback algorithm
 
@@ -144,10 +153,11 @@ post-agent user change.
 
 ## HTTP and event surface
 
-The same-origin service defaults to `127.0.0.1`. REST creates and controls runs, returns current
-state/diff/events, and resolves plan or action decisions. WebSocket pushes the persisted event
-stream. Origins are restricted to localhost, and responses include CSP, frame denial, referrer,
-and MIME-sniffing headers. The React production build is part of the Python wheel.
+The same-origin service defaults to `127.0.0.1`. REST manages direct-task directories, projects,
+provider references, connection probes, and run controls; it returns current state/diff/events and
+resolves plan or action decisions. WebSocket pushes the persisted event stream. Origins are
+restricted to localhost, and responses include CSP, frame denial, referrer, and MIME-sniffing
+headers. The React production build is part of the Python wheel.
 
 ## Why one agent loop
 
