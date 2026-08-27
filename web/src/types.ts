@@ -128,6 +128,7 @@ export interface AppStatus {
   base_url: string;
   api_key_configured: boolean;
   suggested_task: string | null;
+  mode: "demo" | "standard";
   sandbox: {
     backend: "seatbelt" | "bubblewrap" | "none";
     enforced: boolean;
@@ -177,9 +178,15 @@ export interface DirectoryListing {
   children: DirectoryEntry[];
 }
 
+export interface DirectoryChoice {
+  supported: boolean;
+  path: string | null;
+}
+
 export interface RunTarget {
   project_id?: string;
   workspace?: string;
+  create_direct_workspace?: boolean;
 }
 
 export interface ProofRollback {

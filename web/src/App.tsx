@@ -19,6 +19,8 @@ import {
   LoaderCircle,
   MessageSquareMore,
   OctagonX,
+  PanelLeft,
+  PanelRight,
   Pause,
   Play,
   Plus,
@@ -113,11 +115,51 @@ function useDialogFocus(onClose: () => void) {
   return { dialogRef, onDialogKeyDown };
 }
 
+function useDrawerFocus(open: boolean, onClose: () => void) {
+  const drawerRef = useRef<HTMLElement>(null);
+  const closeRef = useRef(onClose);
+  useEffect(() => {
+    closeRef.current = onClose;
+  }, [onClose]);
+  useEffect(() => {
+    if (!open) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    drawerRef.current?.querySelector<HTMLElement>("[data-drawer-initial-focus]")?.focus();
+    return () => {
+      if (previous?.isConnected) previous.focus();
+    };
+  }, [open]);
+  const onDrawerKeyDown = useCallback((event: ReactKeyboardEvent<HTMLElement>) => {
+    const drawer = drawerRef.current;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeRef.current();
+      return;
+    }
+    if (event.key !== "Tab" || !drawer) return;
+    const focusable = dialogFocusables(drawer);
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (!first || !last) return;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }, []);
+  return { drawerRef, onDrawerKeyDown };
+}
+
 export default function App() {
   const forge = useTraceForge();
   const [showComposer, setShowComposer] = useState(false);
+  const [composerProjectId, setComposerProjectId] = useState<string | null>(null);
+  const [showProject, setShowProject] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showProof, setShowProof] = useState(false);
+  const [mobilePane, setMobilePane] = useState<"sidebar" | "inspector" | null>(null);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("timeline");
 
   useEffect(() => {
@@ -126,6 +168,42 @@ export default function App() {
   }, [forge.run?.state]);
 
   useEffect(() => setShowProof(false), [forge.run?.id]);
+  useEffect(() => {
+    const closeObsoleteDrawer = () => setMobilePane((current) => {
+      if (current === "sidebar" && window.innerWidth > 680) return null;
+      if (current === "inspector" && window.innerWidth > 980) return null;
+      return current;
+    });
+    window.addEventListener("resize", closeObsoleteDrawer);
+    return () => window.removeEventListener("resize", closeObsoleteDrawer);
+  }, []);
+
+  const openDirectComposer = () => {
+    setComposerProjectId(null);
+    setShowComposer(true);
+    setMobilePane(null);
+  };
+  const openProjectComposer = (projectId: string) => {
+    setComposerProjectId(projectId);
+    setShowComposer(true);
+    setMobilePane(null);
+  };
+  const selectRun = (runId: string) => {
+    forge.selectRun(runId);
+    setShowComposer(false);
+    setMobilePane(null);
+  };
+  const composerProject = forge.projects.find((project) => project.id === composerProjectId) ?? null;
+
+  const addProject = async () => {
+    const choice = await forge.chooseDirectory();
+    if (!choice.supported) {
+      setShowProject(true);
+      return;
+    }
+    if (!choice.path) return;
+    await forge.createProject(projectNameFromPath(choice.path), choice.path, false);
+  };
 
   return (
     <div className="app-shell">
@@ -134,6 +212,9 @@ export default function App() {
         connected={forge.connected}
         run={forge.run}
         providerReady={Boolean(forge.provider?.api_key_configured)}
+        mobilePane={mobilePane}
+        onHistory={() => setMobilePane((current) => current === "sidebar" ? null : "sidebar")}
+        onInspector={() => setMobilePane((current) => current === "inspector" ? null : "inspector")}
         onSettings={() => setShowSettings(true)}
       />
       {forge.error && (
@@ -148,20 +229,24 @@ export default function App() {
           runs={forge.runs}
           projects={forge.projects}
           selectedRunId={forge.selectedRunId}
-          onSelect={forge.selectRun}
-          onNew={() => setShowComposer(true)}
+          demoMode={forge.status?.mode === "demo"}
+          onSelect={selectRun}
+          onNewDirect={openDirectComposer}
+          onNewProject={openProjectComposer}
+          onAddProject={() => void addProject().catch(() => undefined)}
+          mobileOpen={mobilePane === "sidebar"}
+          onMobileClose={() => setMobilePane(null)}
         />
         <section className="main-stage">
           {!forge.run || showComposer ? (
             <TaskComposer
-              key={forge.status?.suggested_task ?? "standard"}
+              key={`${forge.status?.suggested_task ?? "standard"}-${composerProjectId ?? "direct"}`}
               suggestedTask={forge.status?.suggested_task ?? ""}
-              lastWorkspace={forge.status?.last_workspace ?? forge.status?.workspace ?? ""}
-              projects={forge.projects}
+              defaultWorkspace={forge.status?.workspace ?? ""}
+              project={composerProject}
+              demoMode={forge.status?.mode === "demo"}
               providerReady={Boolean(forge.provider?.api_key_configured)}
               onOpenSettings={() => setShowSettings(true)}
-              onListDirectories={forge.listDirectories}
-              onCreateProject={forge.createProject}
               onCancel={() => setShowComposer(false)}
               onSubmit={async (task, verifier, target) => {
                 await forge.createRun(task, verifier, target);
@@ -192,8 +277,18 @@ export default function App() {
           diff={forge.diff}
           tab={inspectorTab}
           onTab={setInspectorTab}
+          mobileOpen={mobilePane === "inspector"}
+          onMobileClose={() => setMobilePane(null)}
         />
       </main>
+      {mobilePane && (
+        <button
+          className="drawer-backdrop"
+          type="button"
+          aria-label="关闭侧边面板"
+          onClick={() => setMobilePane(null)}
+        />
+      )}
       {showSettings && forge.provider && (
         <ProviderDialog
           provider={forge.provider}
@@ -209,6 +304,17 @@ export default function App() {
           onClose={() => setShowProof(false)}
         />
       )}
+      {showProject && (
+        <ProjectDialog
+          initialDirectory={forge.status?.last_workspace ?? forge.status?.workspace ?? ""}
+          onClose={() => setShowProject(false)}
+          onListDirectories={forge.listDirectories}
+          onCreate={async (name, root, createDirectory) => {
+            await forge.createProject(name, root, createDirectory);
+            setShowProject(false);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -218,12 +324,18 @@ function Header({
   connected,
   run,
   providerReady,
+  mobilePane,
+  onHistory,
+  onInspector,
   onSettings,
 }: {
   status: ReturnType<typeof useTraceForge>["status"];
   connected: boolean;
   run: Run | null;
   providerReady: boolean;
+  mobilePane: "sidebar" | "inspector" | null;
+  onHistory: () => void;
+  onInspector: () => void;
   onSettings: () => void;
 }) {
   const localReady = Boolean(status);
@@ -240,6 +352,13 @@ function Header({
       : "正在连接本地 TraceForge 服务";
   return (
     <header className="topbar">
+      <button
+        className="icon-button mobile-nav-button history-toggle"
+        type="button"
+        onClick={onHistory}
+        aria-label="任务与项目"
+        aria-expanded={mobilePane === "sidebar"}
+      ><PanelLeft size={18} /></button>
       <div className="brand">
         <div className="brand-mark"><Hammer size={18} /></div>
         <div>
@@ -248,6 +367,13 @@ function Header({
         </div>
       </div>
       <div className="topbar-context">
+        <button
+          className="icon-button mobile-nav-button inspector-toggle"
+          type="button"
+          onClick={onInspector}
+          aria-label="运行证据"
+          aria-expanded={mobilePane === "inspector"}
+        ><PanelRight size={18} /></button>
         <div className="context-item workspace-path" title={run?.workspace ?? status?.last_workspace}>
           <GitBranch size={14} />
           <span>{run?.workspace ?? status?.last_workspace ?? "正在连接…"}</span>
@@ -296,43 +422,111 @@ function Sidebar({
   projects,
   selectedRunId,
   onSelect,
-  onNew,
+  demoMode,
+  onNewDirect,
+  onNewProject,
+  onAddProject,
+  mobileOpen,
+  onMobileClose,
 }: {
   runs: Run[];
   projects: Project[];
   selectedRunId: string | null;
   onSelect: (id: string) => void;
-  onNew: () => void;
+  demoMode: boolean;
+  onNewDirect: () => void;
+  onNewProject: (projectId: string) => void;
+  onAddProject: () => void;
+  mobileOpen: boolean;
+  onMobileClose: () => void;
 }) {
+  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
+  const directRuns = runs.filter((run) => run.project_id === null);
+  const { drawerRef, onDrawerKeyDown } = useDrawerFocus(mobileOpen, onMobileClose);
+
+  const toggleProject = (projectId: string) => {
+    setCollapsedProjects((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+  };
+
   return (
-    <aside className="sidebar panel-edge">
-      <div className="sidebar-heading">
-        <div><History size={15} /><span>运行记录</span></div>
-        <button className="icon-button" type="button" onClick={onNew} title="新建任务" aria-label="新建任务"><Plus size={17} /></button>
+    <aside
+      ref={drawerRef}
+      className={`sidebar panel-edge ${mobileOpen ? "mobile-open" : ""}`}
+      role={mobileOpen ? "dialog" : undefined}
+      aria-modal={mobileOpen || undefined}
+      aria-label={mobileOpen ? "任务与项目" : undefined}
+      onKeyDown={onDrawerKeyDown}
+    >
+      <div className="drawer-mobile-heading">
+        <strong>任务与项目</strong>
+        <button className="icon-button" type="button" onClick={onMobileClose} aria-label="关闭任务与项目" data-drawer-initial-focus><X size={17} /></button>
       </div>
-      <div className="run-list">
+      <div className="sidebar-actions">
+        <button className="sidebar-action primary" type="button" onClick={onNewDirect}>
+          <Plus size={16} /> 新建任务
+        </button>
+        <button
+          className="sidebar-action"
+          type="button"
+          onClick={onAddProject}
+          disabled={demoMode}
+          title={demoMode ? "固定演示不连接真实项目；请运行 traceforge serve" : "使用系统选择器添加项目"}
+        >
+          <FolderOpen size={16} /> 添加项目
+        </button>
+      </div>
+      {demoMode && (
+        <div className="demo-mode-note">
+          <Sparkles size={14} />
+          <span><strong>固定演示</strong><small>只运行预置案例，不会把其他输入套进脚本。</small></span>
+        </div>
+      )}
+      <div className="run-list" aria-label="任务与项目">
         {runs.length === 0 && <p className="muted empty-copy">还没有运行记录。</p>}
-        {runs.map((run) => {
-          const state = presentState(run.state);
-          const project = projects.find((item) => item.id === run.project_id);
+        {directRuns.length > 0 && <div className="sidebar-section-label"><History size={14} /> 直接任务</div>}
+        {directRuns.map((run) => (
+          <SidebarRun key={run.id} run={run} selected={selectedRunId === run.id} onSelect={onSelect} />
+        ))}
+        {projects.map((project) => {
+          const projectRuns = runs.filter((run) => run.project_id === project.id);
+          const collapsed = collapsedProjects.has(project.id);
           return (
-            <button
-              type="button"
-              className={`run-item ${selectedRunId === run.id ? "selected" : ""}`}
-              key={run.id}
-              onClick={() => onSelect(run.id)}
-            >
-              <div className="run-item-top">
-                <span className={`state-dot ${state.tone}`} />
-                <span className="run-state">{state.label}</span>
-                <span className="run-time">{relativeTime(run.updated_at)}</span>
+            <section className="project-group" key={project.id}>
+              <div className="project-heading">
+                <button
+                  className="project-toggle"
+                  type="button"
+                  onClick={() => toggleProject(project.id)}
+                  aria-expanded={!collapsed}
+                  title={project.root}
+                >
+                  <ChevronDown size={15} />
+                  {collapsed ? <Folder size={16} /> : <FolderOpen size={16} />}
+                  <span><strong>{project.name}</strong><small>{projectRuns.length} 个任务</small></span>
+                </button>
+                <button
+                  className="icon-button project-add"
+                  type="button"
+                  onClick={() => onNewProject(project.id)}
+                  aria-label={`在 ${project.name} 中新建任务`}
+                  title={`在 ${project.name} 中新建任务`}
+                  disabled={demoMode}
+                ><Plus size={15} /></button>
               </div>
-              <strong>{run.task}</strong>
-              <div className="run-item-foot">
-                <span className="run-id">{run.id.slice(0, 8)}</span>
-                <span className="run-scope">{project?.name ?? "直接任务"}</span>
-              </div>
-            </button>
+              {!collapsed && (
+                <div className="project-runs">
+                  {projectRuns.length === 0 && <p className="project-empty">项目中暂无任务</p>}
+                  {projectRuns.map((run) => (
+                    <SidebarRun key={run.id} run={run} selected={selectedRunId === run.id} onSelect={onSelect} nested />
+                  ))}
+                </div>
+              )}
+            </section>
           );
         })}
       </div>
@@ -344,58 +538,86 @@ function Sidebar({
   );
 }
 
+function SidebarRun({
+  run,
+  selected,
+  nested = false,
+  onSelect,
+}: {
+  run: Run;
+  selected: boolean;
+  nested?: boolean;
+  onSelect: (id: string) => void;
+}) {
+  const state = presentState(run.state);
+  return (
+    <button
+      type="button"
+      className={`run-item ${nested ? "nested" : ""} ${selected ? "selected" : ""}`}
+      onClick={() => onSelect(run.id)}
+    >
+      <div className="run-item-top">
+        <span className={`state-dot ${state.tone}`} />
+        <span className="run-state">{state.label}</span>
+        <span className="run-time">{relativeTime(run.updated_at)}</span>
+      </div>
+      <strong>{run.task}</strong>
+      <div className="run-item-foot">
+        <span className="run-id">{run.id.slice(0, 8)}</span>
+        <span className="run-scope">{nested ? "项目任务" : "独立目录"}</span>
+      </div>
+    </button>
+  );
+}
+
 function TaskComposer({
   suggestedTask,
-  lastWorkspace,
-  projects,
+  defaultWorkspace,
+  project,
+  demoMode,
   providerReady,
   onOpenSettings,
-  onListDirectories,
-  onCreateProject,
   onSubmit,
   onCancel,
   canCancel,
 }: {
   suggestedTask: string;
-  lastWorkspace: string;
-  projects: Project[];
+  defaultWorkspace: string;
+  project: Project | null;
+  demoMode: boolean;
   providerReady: boolean;
   onOpenSettings: () => void;
-  onListDirectories: (path?: string) => Promise<DirectoryListing>;
-  onCreateProject: (name: string, root: string, createDirectory: boolean) => Promise<Project>;
   onSubmit: (task: string, verifier: boolean, target: RunTarget) => Promise<void>;
   onCancel: () => void;
   canCancel: boolean;
 }) {
   const [task, setTask] = useState(suggestedTask);
   const [verifier, setVerifier] = useState(true);
-  const [targetMode, setTargetMode] = useState<"direct" | "project">("direct");
-  const [workspace, setWorkspace] = useState(lastWorkspace);
-  const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
-  const [showProject, setShowProject] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  useEffect(() => {
-    if (!workspace && lastWorkspace) setWorkspace(lastWorkspace);
-  }, [lastWorkspace, workspace]);
-  useEffect(() => {
-    if (!projectId && projects.length) setProjectId(projects[0].id);
-  }, [projectId, projects]);
+  const targetLabel = project ? project.name : demoMode ? "固定演示" : "直接任务";
   return (
     <div className="composer-wrap">
       <div className="hero-symbol"><Code2 size={30} /></div>
-      <p className="eyebrow">新建证据任务</p>
-      <h1>你希望 TraceForge 完成并证明什么？</h1>
+      <p className="eyebrow">{targetLabel} · 新建证据任务</p>
+      <h1>{project ? `你希望在 ${project.name} 中完成什么？` : "你希望 TraceForge 完成并证明什么？"}</h1>
       <p className="hero-copy">
-        描述你想要的结果。TraceForge 会检查工作区，只询问真正影响实现的问题，提出计划，
-        并在修改文件前按风险等待你的审批。
+        {project
+          ? `任务会在 ${project.root} 中执行，并归入这个项目。`
+          : demoMode
+            ? "这是可重复的固定导览，只接受下方预置案例；真实任务请使用 traceforge serve。"
+            : "只需描述结果。TraceForge 会在默认路径下自动创建独立目录，并用证据证明完成情况。"}
       </p>
       <form
         className="task-composer"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!task.trim() || (targetMode === "project" && !projectId)) return;
+          if (!task.trim()) return;
           setSubmitting(true);
-          const target = targetMode === "project" ? { project_id: projectId } : { workspace };
+          const target: RunTarget = project
+            ? { project_id: project.id }
+            : demoMode
+              ? {}
+              : { create_direct_workspace: true };
           void onSubmit(task.trim(), verifier, target)
             .catch(() => undefined)
             .finally(() => setSubmitting(false));
@@ -408,35 +630,16 @@ function TaskComposer({
             <ArrowRight size={15} />
           </button>
         )}
-        <div className="target-panel">
-          <div className="segmented" aria-label="任务目标">
-            <button type="button" className={targetMode === "direct" ? "active" : ""} onClick={() => setTargetMode("direct")}>直接任务</button>
-            <button type="button" className={targetMode === "project" ? "active" : ""} onClick={() => setTargetMode("project")}>项目</button>
-          </div>
-          {targetMode === "direct" ? (
-            <DirectoryField
-              label="工作区目录"
-              value={workspace}
-              onChange={setWorkspace}
-              onListDirectories={onListDirectories}
-            />
-          ) : (
-            <div className="project-target-row">
-              <label className="field-label">
-                <span>项目</span>
-                <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-                  <option value="" disabled>{projects.length ? "选择项目" : "还没有项目"}</option>
-                  {projects.map((project) => <option value={project.id} key={project.id}>{project.name} — {project.root}</option>)}
-                </select>
-              </label>
-              <button className="button" type="button" onClick={() => setShowProject(true)}><Plus size={14} /> 新建项目</button>
-            </div>
-          )}
+        <div className="composer-target" title={project?.root ?? defaultWorkspace}>
+          {project ? <FolderOpen size={16} /> : <Code2 size={16} />}
+          <span><strong>{targetLabel}</strong><small>{project?.root ?? (demoMode ? defaultWorkspace : "自动创建独立任务目录")}</small></span>
         </div>
         <textarea
           autoFocus
           value={task}
           onChange={(event) => setTask(event.target.value)}
+          readOnly={demoMode}
+          aria-readonly={demoMode}
           placeholder="例如：修复多租户缓存串读，保持 TTL 语义，补充回归测试并确保全部检查通过。"
           rows={6}
         />
@@ -451,7 +654,7 @@ function TaskComposer({
             <button
               className="button primary"
               type="submit"
-              disabled={!task.trim() || !providerReady || submitting || (targetMode === "project" && !projectId)}
+              disabled={!task.trim() || !providerReady || submitting}
             >
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={16} />}
               开始任务
@@ -459,19 +662,6 @@ function TaskComposer({
           </div>
         </div>
       </form>
-      {showProject && (
-        <ProjectDialog
-          initialDirectory={workspace || lastWorkspace}
-          onClose={() => setShowProject(false)}
-          onListDirectories={onListDirectories}
-          onCreate={async (name, root, createDirectory) => {
-            const project = await onCreateProject(name, root, createDirectory);
-            setProjectId(project.id);
-            setTargetMode("project");
-            setShowProject(false);
-          }}
-        />
-      )}
     </div>
   );
 }
@@ -1071,7 +1261,24 @@ function EvidenceBoard({ run, onProof }: { run: Run; onProof: () => void }) {
   );
 }
 
-function Inspector({ run, events, diff, tab, onTab }: { run: Run | null; events: RunEvent[]; diff: string; tab: InspectorTab; onTab: (tab: InspectorTab) => void }) {
+function Inspector({
+  run,
+  events,
+  diff,
+  tab,
+  onTab,
+  mobileOpen,
+  onMobileClose,
+}: {
+  run: Run | null;
+  events: RunEvent[];
+  diff: string;
+  tab: InspectorTab;
+  onTab: (tab: InspectorTab) => void;
+  mobileOpen: boolean;
+  onMobileClose: () => void;
+}) {
+  const { drawerRef, onDrawerKeyDown } = useDrawerFocus(mobileOpen, onMobileClose);
   const tabs: Array<{ id: InspectorTab; label: string; icon: typeof History }> = [
     { id: "timeline", label: "时间线", icon: History },
     { id: "diff", label: "差异", icon: FileDiff },
@@ -1079,7 +1286,18 @@ function Inspector({ run, events, diff, tab, onTab }: { run: Run | null; events:
     { id: "verifier", label: "验证", icon: ShieldCheck },
   ];
   return (
-    <aside className="inspector panel-edge">
+    <aside
+      ref={drawerRef}
+      className={`inspector panel-edge ${mobileOpen ? "mobile-open" : ""}`}
+      role={mobileOpen ? "dialog" : undefined}
+      aria-modal={mobileOpen || undefined}
+      aria-label={mobileOpen ? "运行证据" : undefined}
+      onKeyDown={onDrawerKeyDown}
+    >
+      <div className="drawer-mobile-heading inspector-drawer-heading">
+        <strong>运行证据</strong>
+        <button className="icon-button" type="button" onClick={onMobileClose} aria-label="关闭运行证据" data-drawer-initial-focus><X size={17} /></button>
+      </div>
       <nav className="inspector-tabs" aria-label="运行证据视图">{tabs.map(({ id, label, icon: Icon }) => <button type="button" className={tab === id ? "active" : ""} aria-label={label} title={label} onClick={() => onTab(id)} key={id}><Icon size={14} /><span>{label}</span></button>)}</nav>
       <div className="inspector-content">
         {!run && <div className="inspector-empty"><FileDiff size={26} /><p>请选择一条运行记录以查看证据。</p></div>}
@@ -1384,6 +1602,10 @@ function relativeTime(value: string): string {
   if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
   return `${Math.floor(seconds / 86400)} 天前`;
+}
+
+function projectNameFromPath(path: string): string {
+  return path.replace(/\/$/, "").split("/").filter(Boolean).at(-1) ?? "本地项目";
 }
 
 function formatTokens(value: number): string {

@@ -1,6 +1,7 @@
 import type {
   AppStatus,
   ClarificationAnswer,
+  DirectoryChoice,
   DirectoryListing,
   Project,
   ProofPack,
@@ -51,6 +52,8 @@ export const api = {
     request<DirectoryListing>(
       `/api/filesystem/directories${path ? `?path=${encodeURIComponent(path)}` : ""}`,
     ),
+  chooseDirectory: () =>
+    request<DirectoryChoice>("/api/filesystem/choose-directory", { method: "POST" }),
   getProvider: () => request<ProviderConfig>("/api/provider"),
   updateProvider: (config: Pick<ProviderConfig, "model" | "base_url" | "credential_file">) =>
     request<ProviderConfig>("/api/provider", {

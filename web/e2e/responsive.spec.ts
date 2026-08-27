@@ -25,13 +25,22 @@ test("new-task layout stays operable without horizontal overflow", async ({ page
       .toBe(true);
   }
 
-  const browse = page.getByRole("button", { name: "浏览" });
-  await browse.click();
-  const dialog = page.getByRole("dialog", { name: "选择目录" });
-  const bounds = await dialog.boundingBox();
-  expect(bounds).not.toBeNull();
-  expect(bounds!.x).toBeGreaterThanOrEqual(0);
-  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
+  const history = page.getByRole("button", { name: "任务与项目" });
+  await history.click();
+  const historyDrawer = page.getByRole("dialog", { name: "任务与项目" });
+  await expect(historyDrawer).toBeVisible();
+  await expect(page.getByRole("button", { name: "关闭任务与项目" })).toBeFocused();
   await page.keyboard.press("Escape");
-  await expect(browse).toBeFocused();
+  await expect(historyDrawer).toHaveCount(0);
+  await expect(history).toBeFocused();
+
+  await page.setViewportSize({ width: 980, height: 768 });
+  const evidence = page.getByRole("button", { name: "运行证据" });
+  await evidence.click();
+  const evidenceDrawer = page.getByRole("dialog", { name: "运行证据" });
+  await expect(evidenceDrawer).toBeVisible();
+  await expect(page.getByRole("button", { name: "关闭运行证据" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(evidenceDrawer).toHaveCount(0);
+  await expect(evidence).toBeFocused();
 });

@@ -10,6 +10,8 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await page.goto("/");
   await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
   await expect(page.locator("textarea")).toHaveValue(/多租户缓存隔离/);
+  await expect(page.locator("textarea")).toHaveAttribute("readonly", "");
+  await expect(page.getByText("固定演示", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("本地就绪", { exact: true })).toBeVisible();
   await expect(page.locator(".sandbox-status")).toContainText(/seatbelt|bubblewrap|仅策略限制/i);
 
@@ -27,16 +29,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(settingsError).toHaveCount(0);
   await page.getByRole("button", { name: "关闭模型设置" }).click();
 
-  await page.getByRole("button", { name: "浏览" }).click();
-  await expect(page.getByRole("heading", { name: "选择目录" })).toBeVisible();
-  await page.getByRole("button", { name: "选择当前目录" }).click();
-
-  await page.getByRole("button", { name: "项目", exact: true }).click();
-  await page.getByRole("button", { name: "新建项目" }).click();
-  await page.getByLabel("项目名称").fill("演示工作区");
-  await page.getByRole("button", { name: "添加项目" }).click();
-  await expect(page.getByRole("combobox", { name: "项目" })).toHaveValue(/.+/);
-  await page.getByRole("button", { name: "直接任务" }).click();
+  await expect(page.getByRole("button", { name: "添加项目" })).toBeDisabled();
 
   await page.getByRole("button", { name: "开始任务" }).click();
 
@@ -91,6 +84,10 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await page.getByRole("button", { name: "回滚文件" }).click();
   await expect(page.getByText("已回滚", { exact: true }).first()).toBeVisible();
 
+  await page.getByRole("button", { name: "新建任务" }).click();
+  await expect(page.getByRole("heading", { name: "你希望 TraceForge 完成并证明什么？" })).toBeVisible();
+  await page.locator(".run-item").first().click();
+  await expect(page.getByText("已回滚", { exact: true }).first()).toBeVisible();
   await page.getByRole("button", { name: "新建任务" }).click();
   await page.getByRole("button", { name: "开始任务" }).click();
   await expect(page.getByRole("heading", { name: /选择会影响具体实现/ })).toBeVisible();

@@ -238,6 +238,7 @@ def demo(
             base_url=None,
             model="scripted-demo",
             suggested_task=DEMO_TASK,
+            demo_mode=True,
         )
         typer.echo(f"Demo workspace: {workspace}")
         typer.echo(f"Open http://{host}:{port} — the task is prefilled for you.")

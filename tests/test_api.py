@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
-from traceforge.api import create_app
+from traceforge.api import _choose_macos_directory, create_app
 from traceforge.config import Settings
 from traceforge.models import ToolCall
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
@@ -171,6 +174,113 @@ def test_projects_direct_tasks_and_directory_browser(settings: Settings, tmp_pat
         assert client.get("/api/status").json()["last_workspace"] == str(
             direct_root.resolve()
         )
+
+
+def test_direct_task_allocates_an_isolated_workspace(settings: Settings) -> None:
+    app = create_app(settings, provider=ScriptedProvider([_plan_response()]))
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={"task": "Direct", "create_direct_workspace": True},
+        )
+
+        assert created.status_code == 201
+        run = _wait_for_state(client, created.json()["id"], "awaiting_plan_approval")
+        workspace = Path(str(run["workspace"]))
+        assert workspace.parent == settings.workspace.resolve()
+        assert workspace.name.startswith("traceforge-task-")
+        assert workspace.is_dir()
+        assert run["project_id"] is None
+
+        ambiguous = client.post(
+            "/api/runs",
+            json={
+                "task": "Ambiguous",
+                "workspace": str(settings.workspace),
+                "create_direct_workspace": True,
+            },
+        )
+        assert ambiguous.status_code == 422
+        assert "Choose a project" in ambiguous.text
+
+
+def test_fixed_demo_rejects_unrelated_tasks(settings: Settings) -> None:
+    suggested_task = "Build the deterministic demo"
+    app = create_app(
+        replace(settings, demo_mode=True, suggested_task=suggested_task),
+        provider=ScriptedProvider([]),
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/api/status").json()["mode"] == "demo"
+
+        rejected = client.post("/api/runs", json={"task": "你好"})
+        assert rejected.status_code == 422
+        assert "fixed demo" in rejected.json()["detail"]
+
+        retargeted = client.post(
+            "/api/runs",
+            json={"task": suggested_task, "workspace": str(settings.workspace.parent)},
+        )
+        assert retargeted.status_code == 422
+        assert "disposable demo workspace" in retargeted.json()["detail"]
+        assert client.get("/api/runs").json() == []
+
+
+def test_macos_directory_picker_reports_capability(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    app = create_app(settings, provider=ScriptedProvider([]))
+    monkeypatch.setattr("traceforge.api.platform.system", lambda: "Darwin")
+    monkeypatch.setattr(
+        "traceforge.api._choose_macos_directory", lambda _initial: str(selected)
+    )
+
+    with TestClient(app) as client:
+        picked = client.post("/api/filesystem/choose-directory")
+        assert picked.status_code == 200
+        assert picked.json() == {"supported": True, "path": str(selected)}
+
+        monkeypatch.setattr("traceforge.api.platform.system", lambda: "Linux")
+        fallback = client.post("/api/filesystem/choose-directory")
+        assert fallback.json() == {"supported": False, "path": None}
+
+
+def test_macos_directory_picker_normalizes_success_and_cancel(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    calls: list[list[str]] = []
+
+    def choose(argv, **_kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout=f"{selected}/\n", stderr="")
+
+    monkeypatch.setattr("traceforge.api.subprocess.run", choose)
+    assert _choose_macos_directory(settings.workspace) == str(selected.resolve())
+    assert calls[0][0] == "osascript"
+    assert calls[0][-1] == str(settings.workspace.resolve())
+
+    monkeypatch.setattr(
+        "traceforge.api.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="User canceled. (-128)"
+        ),
+    )
+    assert _choose_macos_directory(settings.workspace) is None
+
+    monkeypatch.setattr(
+        "traceforge.api.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="automation unavailable"
+        ),
+    )
+    with pytest.raises(ValueError, match="did not return"):
+        _choose_macos_directory(settings.workspace)
 
 
 def test_provider_config_uses_a_file_reference_without_returning_secret(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import platform
 import re
+import subprocess
 from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -57,11 +59,17 @@ class CreateRunRequest(BaseModel):
     verifier_enabled: bool = True
     project_id: str | None = None
     workspace: str | None = Field(default=None, max_length=4_096)
+    create_direct_workspace: bool = False
 
     @model_validator(mode="after")
     def validate_target(self) -> CreateRunRequest:
-        if self.project_id and self.workspace:
-            raise ValueError("Choose either a project or a direct-task workspace, not both")
+        selected_targets = sum(
+            (bool(self.project_id), bool(self.workspace), self.create_direct_workspace)
+        )
+        if selected_targets > 1:
+            raise ValueError(
+                "Choose a project, an existing direct workspace, or a new direct workspace"
+            )
         return self
 
 
@@ -205,6 +213,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             "base_url": config.base_url or "https://api.openai.com/v1",
             "api_key_configured": runtime.credential_configured(config),
             "suggested_task": settings.suggested_task,
+            "mode": "demo" if settings.demo_mode else "standard",
             "sandbox": sandbox_status(settings.workspace).as_dict(),
             "limits": {
                 "context": settings.context_limit,
@@ -275,6 +284,13 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         )
         return _directory_listing(selected)
 
+    @app.post("/api/filesystem/choose-directory")
+    async def choose_directory() -> dict[str, Any]:
+        if settings.demo_mode or platform.system() != "Darwin":
+            return {"supported": False, "path": None}
+        selected = await asyncio.to_thread(_choose_macos_directory, settings.workspace)
+        return {"supported": True, "path": selected}
+
     @app.get("/api/runs", response_model=list[RunView])
     async def list_runs(project_id: str | None = None, direct_only: bool = False) -> list[RunView]:
         if project_id and direct_only:
@@ -289,11 +305,25 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     @app.post("/api/runs", response_model=RunView, status_code=status.HTTP_201_CREATED)
     async def create_run(body: CreateRunRequest) -> RunView:
+        if settings.demo_mode:
+            if body.task.strip() != (settings.suggested_task or "").strip():
+                raise ValueError(
+                    "The fixed demo only supports its prefilled task; use traceforge serve "
+                    "for real tasks"
+                )
+            if body.project_id or body.workspace or body.create_direct_workspace:
+                raise ValueError(
+                    "The fixed demo only runs in its disposable demo workspace"
+                )
         project_id = body.project_id
+        created_workspace: Path | None = None
         if project_id:
             project = storage.get_project(project_id)
             workspace = project.root
             storage.touch_project(project_id)
+        elif body.create_direct_workspace:
+            created_workspace = _create_direct_workspace(settings.workspace)
+            workspace = str(created_workspace)
         else:
             workspace = (
                 body.workspace
@@ -302,12 +332,17 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             )
             workspace = str(resolve_workspace(workspace))
             storage.set_preference("last_workspace", workspace)
-        run = await runtime.start_run(
-            body.task,
-            workspace,
-            verifier_enabled=body.verifier_enabled,
-            project_id=project_id,
-        )
+        try:
+            run = await runtime.start_run(
+                body.task,
+                workspace,
+                verifier_enabled=body.verifier_enabled,
+                project_id=project_id,
+            )
+        except Exception:
+            if created_workspace is not None:
+                _remove_empty_directory(created_workspace)
+            raise
         return RunView.from_record(run, context_limit=settings.context_limit)
 
     @app.get("/api/runs/{run_id}", response_model=RunView)
@@ -484,6 +519,48 @@ def _prepare_project_root(raw: str, *, create: bool) -> tuple[Path, bool]:
     except OSError as exc:
         raise ValueError(f"Could not create project directory: {candidate}") from exc
     return resolve_workspace(candidate), True
+
+
+def _create_direct_workspace(default_root: Path) -> Path:
+    root = resolve_workspace(default_root)
+    for _attempt in range(10):
+        candidate = root / f"traceforge-task-{uuid4().hex[:8]}"
+        try:
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise ValueError(
+                f"Could not create a direct-task directory under: {root}"
+            ) from exc
+        return resolve_workspace(candidate)
+    raise ValueError(f"Could not allocate a unique direct-task directory under: {root}")
+
+
+def _choose_macos_directory(initial_path: Path) -> str | None:
+    script = (
+        'on run argv\n'
+        'set chosenFolder to choose folder with prompt "选择 TraceForge 项目文件夹" '
+        'default location POSIX file (item 1 of argv)\n'
+        'return POSIX path of chosenFolder\n'
+        'end run'
+    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script, str(resolve_workspace(initial_path))],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("The macOS folder picker could not be opened") from exc
+    if result.returncode != 0:
+        if "-128" in result.stderr or "User canceled" in result.stderr:
+            return None
+        raise ValueError("The macOS folder picker did not return a directory")
+    selected = result.stdout.strip().rstrip("/") or "/"
+    return str(resolve_workspace(selected))
 
 
 def _remove_empty_directory(path: Path) -> None:

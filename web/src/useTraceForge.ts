@@ -194,6 +194,16 @@ export function useTraceForge() {
     [],
   );
 
+  const chooseDirectory = useCallback(async () => {
+    setError(null);
+    try {
+      return await api.chooseDirectory();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      throw reason;
+    }
+  }, []);
+
   const saveProvider = useCallback(
     async (config: Pick<ProviderConfig, "model" | "base_url" | "credential_file">) => {
       setError(null);
@@ -252,6 +262,7 @@ export function useTraceForge() {
     testProvider,
     loadProofPack,
     listDirectories: api.listDirectories,
+    chooseDirectory,
     answerQuestions: (answers: ClarificationAnswer[]) =>
       run && perform(() => api.answerQuestions(run.id, answers)),
     decidePlan: (decision: "approve" | "revise", feedback = "") =>

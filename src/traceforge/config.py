@@ -26,6 +26,7 @@ class Settings:
     stored_output_limit: int = 1024 * 1024
     model_output_limit: int = 16 * 1024
     suggested_task: str | None = None
+    demo_mode: bool = False
 
     @classmethod
     def from_env(cls, workspace: Path, *, require_api_key: bool = True) -> Settings:

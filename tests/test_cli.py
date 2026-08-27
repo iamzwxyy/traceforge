@@ -40,6 +40,7 @@ def test_serve_and_demo_commands_build_runnable_apps(tmp_path, monkeypatch) -> N
     assert launched[0][1:] == ("127.0.0.1", 9001)
     assert launched[1][1:] == ("127.0.0.1", 9002)
     assert launched[1][0].state.settings.suggested_task == DEMO_TASK
+    assert launched[1][0].state.settings.demo_mode is True
     assert "task is prefilled" in demonstrated.output
 
 

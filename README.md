@@ -27,8 +27,9 @@ Its differentiator is a defensible engineering loop with useful human control.
   integrity fingerprints.
 - **Evidence-first UI.** Timeline, unified diff, check output, verdict, approvals, Stop, Resume,
   and Rollback are available in one local web workbench.
-- **Low-friction workspaces.** Start a direct task in the last-used directory, or register a
-  project when several runs should share a stable root. Neither mode copies or uploads files.
+- **Low-friction workspaces.** A direct task automatically receives an isolated folder under the
+  configured default root. Projects use macOS's native folder picker when available and keep
+  their runs nested under a collapsible folder. Neither mode uploads files.
 - **Layered, inspectable command isolation.** Routine and planned commands run under macOS
   Seatbelt or Linux Bubblewrap when available; the UI and Proof Pack distinguish enforced,
   user-approved bypass, and policy-only execution instead of presenting approval as a sandbox.
@@ -52,7 +53,8 @@ Open <http://127.0.0.1:8765>. The task is prefilled. Start it, choose the recomm
 compatibility option, approve the plan, and watch TraceForge repair a real cross-tenant cache
 isolation bug. The demo changes a disposable copy, executes four real Pytest tests, and produces
 a read-only verifier verdict. Open **Proof Pack** on the evidence board to inspect or download the
-complete delivery record.
+complete delivery record. This command is intentionally a fixed tour: the prefilled task is
+read-only and unrelated prompts are rejected instead of being silently mapped onto the demo.
 
 ## Run against your own workspaces
 
@@ -75,8 +77,9 @@ URL, and a local credential file. The file must contain exactly one line and hav
 permissions (`chmod 600`). TraceForge saves only its absolute path; the credential value is read
 when constructing the provider and is never returned by the API or UI.
 
-The composer defaults to a direct task and remembers its last directory. Select **Project** to
-open an existing directory or create a new empty one as a reusable project root.
+Click **新建任务** to enter only the request; TraceForge creates a unique task directory beneath
+the `--workspace` default root. Click **添加项目** to select a reusable project root, then use the
+plus button beside that folder for project-scoped tasks. Direct runs stay at the top level.
 
 Environment variables remain available as a non-persisted fallback:
 
@@ -146,9 +149,9 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
 ```
 
-The current suite has 112 backend tests at 86.48% coverage (with a hard 85% gate), seven frontend
+The current suite has 116 backend tests at 86.63% coverage (with a hard 85% gate), seven frontend
 unit tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
-keyboard-safe dialogs, responsive layouts, and reload recovery. Dependencies are locked; CI also
+keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 
 ## Repository map
