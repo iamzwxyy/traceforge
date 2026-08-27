@@ -102,7 +102,7 @@ not use an agent framework or provider-hosted file/code tools.
 
 See [Architecture](docs/architecture.md), [Security model](docs/security.md),
 [Sandbox evidence](docs/sandbox.md), [AIME UI benchmark](docs/ui-benchmark.md),
-[Fault-injection evidence](docs/fault-injection.md), and
+[Fault-injection evidence](docs/fault-injection.md), [Quality corpus](docs/quality-evaluation.md), and
 [Interview guide](docs/interview-guide.md) for the design rationale and failure semantics.
 
 ## Development
@@ -123,9 +123,15 @@ pnpm --filter traceforge-web typecheck
 pnpm --filter traceforge-web test --run
 pnpm --filter traceforge-web build
 pnpm --filter traceforge-web e2e
+
+# Five user-risk scenarios with a readable scorecard
+uv run python scripts/evaluate_quality.py
+
+# Stricter release-host check: fail when no OS sandbox is enforced
+uv run python scripts/evaluate_quality.py --require-os-sandbox
 ```
 
-The current suite has 92 backend tests at 86.19% coverage (with a hard 85% gate), frontend unit
+The current suite has 94 backend tests at 86.19% coverage (with a hard 85% gate), frontend unit
 tests, a full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
 
 ## Repository map
