@@ -46,6 +46,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByText("proven", { exact: true })).toBeVisible();
   await expect(page.getByText("STABLE EVIDENCE SHA-256")).toBeVisible();
   await expect(page.getByText("COMMAND SANDBOX")).toBeVisible();
+  await expect(page.getByText(/\d+ enforced · 0 blocked before run/)).toBeVisible();
   await expect(page.getByRole("link", { name: "Download Markdown" }))
     .toHaveAttribute("href", /proof-pack\.md$/);
   expect(consoleErrors).toEqual([]);

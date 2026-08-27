@@ -27,9 +27,10 @@ files. This reduces accidental disclosure to the model but is not a general secr
 ## Plan and mutation policy
 
 The model proposes a structured plan, but application code assigns the plan gate. The fast path is
-limited to an explicit single-file scope, at most two steps and checks, no clarification or stated
-risk, no sensitive-area keywords, and routine local verification commands. The plan and policy
-reasons remain visible even when no click is required. Unknown scope, multiple files, credentials,
+limited to an explicit single-file scope, at most four steps and checks, no clarification, no
+sensitive-area language in the task, plan, or risk notes, and routine local verification commands.
+Generic implementation caveats do not turn a normal inspect/fix/verify plan into high risk. The plan
+and policy reasons remain visible even when no click is required. Unknown scope, multiple files, credentials,
 permissions, migrations, dependencies, deployment, deletion, or other high-impact language forces
 human plan approval.
 
@@ -46,6 +47,7 @@ not occur.
 | Class | Decision | Examples |
 | --- | --- | --- |
 | Approved acceptance check | allow + sandbox | exact argv recorded in the approved plan |
+| Focused variant of an approved Pytest check | allow + sandbox, diagnostic only | same launcher family with a narrower selector or safe display/filter flags |
 | Known read-only | allow + sandbox | `git status`, `git diff`, `rg`, `ls`, `cat` |
 | Unknown / code execution | ask once; approval is a one-shot sandbox bypass | Python scripts, installers, network clients |
 | Destructive / privileged | deny | `sudo`, `git reset --hard`, recursive forced `rm` |
@@ -55,6 +57,12 @@ normal failed tool result so the builder can choose a safer path. Approval bypas
 for that invocation only; the resulting tool event, timeline badge, and Proof Pack record
 `bypassed`. Commands default to 120 seconds, are capped at 600 seconds, and run in a separate
 process group so Stop/timeout can terminate descendants.
+
+Routine variants are deliberately narrow: `python` and `python3` Pytest invocations are one family,
+while output-writing flags, interactive debugging, changing to `uv`, another check tool, an
+installer, a network client, or arbitrary `python -c` still require approval. A focused variant may
+help diagnose a failure, but it never marks a broader planned command as passed; `finish` still
+requires fresh evidence from every exact approved argv.
 
 ## OS command sandbox
 

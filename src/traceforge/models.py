@@ -270,6 +270,7 @@ class ProofCommandSandbox(BaseModel):
     sandboxed_commands: int = Field(ge=0)
     bypassed_commands: int = Field(ge=0)
     policy_only_commands: int = Field(ge=0)
+    not_executed_commands: int = Field(default=0, ge=0)
 
 
 class ProofPack(BaseModel):

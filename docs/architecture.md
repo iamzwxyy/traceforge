@@ -90,9 +90,14 @@ questions: at most three per round, two to four options per question, and at mos
 validated `TaskPlan` contains steps, an explicit relative file scope, acceptance checks, optional
 argv commands, and risks.
 
+Malformed structured clarification or plan calls are returned as failed tool results with
+field-level schema errors that omit invalid input values. They remain auditable and can be corrected
+within the same bounded planning phase instead of terminating the run.
+
 After validation, application code grades the plan. Automatic approval requires exactly one
-declared file, at most two steps and checks, no clarification or explicit risk, no sensitive-area
-keywords, and only recognized local verification commands. Every other plan enters the visible
+declared file, at most four steps and checks, no clarification, no sensitive-area language in task
+or risk notes, and only recognized local verification commands. Generic low-impact caveats do not
+disable the fast path. Every other plan enters the visible
 approval state. The decision and reasons are persisted as a `PlanGate`; a restart preserves an
 already-recorded fast-path decision. Any later file mutation outside `impacted_files` is a separate
 action approval, so automatic plan approval does not silently broaden the scope.
@@ -102,8 +107,11 @@ action approval, so automatic plan approval does not silently broaden the scope.
 The builder receives the original task and approved plan. It can call six local file/process tools
 plus the structured `update_plan` and `finish` controls. File mutations invalidate prior command
 evidence. Exact acceptance commands and known read-only commands enter the OS sandbox when its
-probe succeeds. An unknown executable action pauses; user approval grants one visibly recorded
-unsandboxed invocation rather than silently weakening later commands. `finish` is rejected until
+probe succeeds. Non-writing, non-interactive focused Pytest variants from the same launcher family
+also stay sandboxed without another prompt, but only the exact planned argv refreshes acceptance
+evidence. Other check-family changes pause for a decision.
+An unknown executable action pauses; user approval grants one visibly recorded unsandboxed
+invocation rather than silently weakening later commands. `finish` is rejected until
 every command-backed acceptance check has a fresh passing result.
 
 The loop has three independent brakes:
@@ -140,7 +148,9 @@ and sequenced events. For completed work it prefers the diff stored in the compl
 earlier terminal states it uses the last persisted diff event, falling back to the live workspace
 only when no persisted diff exists. Later user edits therefore do not rewrite a successful run's
 historical delivery evidence. It also counts commands by enforced, bypassed, and policy-only
-execution so the exported artifact cannot imply stronger isolation than the event ledger proves.
+execution, while rejected or denied commands are counted separately as not executed. The exported
+artifact therefore cannot imply stronger isolation—or more executed commands—than the event ledger
+proves.
 
 The projection includes the visible plan and gate, touched paths, final diff, fresh check results,
 independent verdict, rollback outcome, counts, and two SHA-256 values: one for the event sequence

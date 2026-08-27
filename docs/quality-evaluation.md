@@ -40,4 +40,6 @@ hard gate for a release machine.
 - OS-sandbox success is local to the tested backend and profile; it is not a remote attestation.
 
 Real-model representative tasks remain a separate, low-frequency acceptance layer so everyday CI
-does not depend on an external key, endpoint availability, or model drift.
+does not depend on an external key, endpoint availability, or model drift. See
+[Real-model representative evaluation](real-model-evaluation.md) for the pinned fixtures, guarded
+runner, hidden oracles, and latest evidence.

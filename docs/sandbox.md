@@ -13,7 +13,8 @@ execution facts:
 
 The application header reports current backend readiness. Each command row reports its own fact,
 which matters because a run can be mixed. The Proof Pack aggregates the persisted command events
-rather than trusting the current machine state.
+rather than trusting the current machine state. Commands rejected or denied before process launch
+are counted separately and do not appear as misleading `policy_only` executions.
 
 ## Profile construction
 

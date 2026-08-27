@@ -36,6 +36,55 @@ def test_permission_policy(settings: Settings, workspace: Workspace) -> None:
     assert registry.assess(denied_call, None).decision is PermissionDecision.DENY
 
 
+def test_permission_policy_allows_sandboxed_variants_of_an_approved_check(
+    settings: Settings, workspace: Workspace
+) -> None:
+    registry = ToolRegistry(workspace, settings)
+    plan = _plan(["python", "-m", "pytest", "-q"])
+    focused = ToolCall(
+        id="focused",
+        name="run_command",
+        arguments={
+            "argv": [
+                "python3",
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_duration_parser.py::test_booleans_are_not_durations",
+                "-v",
+            ]
+        },
+    )
+    different_launcher = ToolCall(
+        id="uv",
+        name="run_command",
+        arguments={"argv": ["uv", "run", "pytest", "-q"]},
+    )
+    arbitrary_python = ToolCall(
+        id="python-code",
+        name="run_command",
+        arguments={"argv": ["python", "-c", "print('custom')"]},
+    )
+    interactive_pytest = ToolCall(
+        id="pdb",
+        name="run_command",
+        arguments={"argv": ["python", "-m", "pytest", "--pdb"]},
+    )
+    writing_pytest = ToolCall(
+        id="junit",
+        name="run_command",
+        arguments={"argv": ["python", "-m", "pytest", "--junitxml=report.xml"]},
+    )
+
+    assessment = registry.assess(focused, plan)
+    assert assessment.decision is PermissionDecision.ALLOW
+    assert "variant" in assessment.reason
+    assert registry.assess(different_launcher, plan).decision is PermissionDecision.ASK
+    assert registry.assess(arbitrary_python, plan).decision is PermissionDecision.ASK
+    assert registry.assess(interactive_pytest, plan).decision is PermissionDecision.ASK
+    assert registry.assess(writing_pytest, plan).decision is PermissionDecision.ASK
+
+
 def test_permission_policy_enforces_visible_mutation_scope(
     settings: Settings, workspace: Workspace
 ) -> None:

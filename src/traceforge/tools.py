@@ -16,6 +16,7 @@ from typing import Any, Literal
 from traceforge.config import Settings
 from traceforge.models import TaskPlan, ToolCall, ToolResult
 from traceforge.patching import FilePatch, PatchError, apply_file_patch, parse_unified_diff
+from traceforge.planning import is_safe_routine_check_variant
 from traceforge.sandbox import CommandSandbox, SandboxStatus
 from traceforge.workspace import Workspace, WorkspaceViolation
 
@@ -178,9 +179,15 @@ class ToolRegistry:
                 f"Command path is outside the workspace: {outside_path}",
                 "dangerous",
             )
-        if _matches_accepted_check(argv, plan):
+        check_relation = _accepted_check_relation(argv, plan)
+        if check_relation == "exact":
             return PermissionAssessment(
                 PermissionDecision.ALLOW, "Command is an approved acceptance check"
+            )
+        if check_relation == "routine_variant":
+            return PermissionAssessment(
+                PermissionDecision.ALLOW,
+                "Command is a sandboxed variant of an approved routine check",
             )
         if _is_read_only(argv):
             return PermissionAssessment(PermissionDecision.ALLOW, "Known read-only command")
@@ -504,10 +511,17 @@ def _tool_schema(
     }
 
 
-def _matches_accepted_check(argv: list[str], plan: TaskPlan | None) -> bool:
+def _accepted_check_relation(
+    argv: list[str], plan: TaskPlan | None
+) -> Literal["exact", "routine_variant"] | None:
     if plan is None:
-        return False
-    return any(check.command == argv for check in plan.acceptance_checks if check.command)
+        return None
+    commands = [check.command for check in plan.acceptance_checks if check.command]
+    if argv in commands:
+        return "exact"
+    if any(is_safe_routine_check_variant(argv, command) for command in commands):
+        return "routine_variant"
+    return None
 
 
 def _mutation_paths(call: ToolCall) -> list[str]:

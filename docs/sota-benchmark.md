@@ -6,8 +6,9 @@ TraceForge 不应复刻 Codex 或 DeepSeek Harness 的完整产品面。课程�
 
 TraceForge 自己的主线应保持鲜明：**每次改动都能给出“计划 → 差异 → 新鲜检查 → 独立验证 → 可冲突回滚”的证据闭环**。这个能力比宠物、庞大插件市场或多智能体动画更能体现工程质量，也更适合作为答辩时可现场验证的亮点。产品上可将它命名为 **Proof Pack（交付证据包）**。
 
-截至 2026-08-27，Phase A、自适应计划门、Proof Pack、证据章节、故障恢复和 OS 沙箱
-适配均已落地。当前工作重点转为完整回归、交付材料与现场演示稳定性，而不是继续扩张功能面。
+截至 2026-08-27，Phase A、自适应计划门、Proof Pack、证据章节、故障恢复、OS 沙箱与
+固定质量语料均已落地；两条真实 DeepSeek 代表任务也已脚本化并通过。当前工作重点转为
+可用性细节、完整回归和现场演示稳定性，而不是继续扩张功能面。
 
 ## 对标范围
 
@@ -28,7 +29,7 @@ TraceForge 自己的主线应保持鲜明：**每次改动都能给出“计划 
 | 上下文管理 | Codex 规范化 call/output 配对、截断工具输出并做可恢复 compaction；DeepSeek 把 runtime context 和 compaction 作为可持久替换事件 | 固定保留头部/尾部并生成确定性中段摘要，简单但长期任务会丢失关键因果 | 先做两级压缩：裁剪旧工具大输出，再生成结构化摘要；计划、文件改动、检查证据和未解决风险进入不可丢的 evidence ledger |
 | 审批与隔离 | Codex 明确区分 sandbox 与 approval：一个是技术边界，一个是越界时的人类决策；DeepSeek 对审批失败关闭，并统一清理子进程环境中的凭据变量 | 路径/argv 策略、凭据清理、自适应计划门已落地；macOS Seatbelt / Linux Bubblewrap 独立适配，失败显式降级；每条命令保留 enforced/bypassed/policy-only 证据 | 保持三层边界和准确文案；不宣称抵御任意恶意本地代码，不把审批包装成技术隔离 |
 | 项目与任务 | Codex 的 Project 是独立实体，Thread 可选 `project_id`；DeepSeek Workspace 使用规范路径对应稳定 ID，同时允许未分组 session | 已支持可空 `project_id`、直接任务、最近目录和可复用项目根目录，多工作区运行时按规范路径隔离 | 保持 Project 只是分组与稳定根目录，不引入远程 host、工作树 handoff 等平台复杂度 |
-| 观测与测试 | DeepSeek 要求用户/模型可见变更同时有可无 key 回放快照，并用真实 API E2E 验证 provider；Codex 对 turn/item/tool/compaction 都有事件和历史投影 | 已有持久事件、断线续传、fake provider 全闭环、真实 DeepSeek E2E、独立 verifier 与可下载 Proof Pack；仍缺故障实验室和 transcript golden | 下一步补 fault injection 与 golden；真实 API 只做代表性冒烟，不让日常 CI 依赖外部 key |
+| 观测与测试 | DeepSeek 要求用户/模型可见变更同时有可无 key 回放快照，并用真实 API E2E 验证 provider；Codex 对 turn/item/tool/compaction 都有事件和历史投影 | 已有持久事件、断线续传、fake provider 全闭环、故障注入、固定质量语料、真实 DeepSeek 双场景、独立 verifier 与可下载 Proof Pack | 保留确定性 CI 与低频真实模型双层证据；真实 API 不进入日常 CI，避免密钥、成本和模型漂移造成不稳定 |
 
 ## 直接借鉴的源码机制
 
@@ -69,7 +70,9 @@ TraceForge 当前模型客户端与命令执行器同处一个服务进程，因
 
 DeepSeek Harness 的 [`AGENTS.md`](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/AGENTS.md) 要求非平凡的用户/模型可见改动具有可无 key 回放的 assembled snapshot；mock 单测与真实 API E2E 各自解决不同问题，不能相互替代。
 
-TraceForge 已具备 fake-provider 闭环和真实 DeepSeek 成功样本，下一步应固定少量黄金 transcript：验证 planner inspection 会传给 builder、工具结果有序、证据刷新、verifier repair 和 rollback conflict。这样日常回归稳定，发布前再跑真实模型代表场景。
+TraceForge 已具备 fake-provider 闭环、固定产品质量语料和两条真实 DeepSeek 代表场景。
+真实运行先后暴露了检查变体审批疲劳与结构化计划容错问题，两者都已形成回归测试；日常
+回归保持无 key、确定性，发布前再运行真实模型脚本。
 
 ## 明确不复制的部分
 

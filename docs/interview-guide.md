@@ -46,8 +46,9 @@ still reject the result and trigger a bounded repair cycle.
 ### Does automatic plan approval let the model bypass the user?
 
 No. The model supplies structured facts, but deterministic application code assigns the gate.
-Automatic approval requires one named file, small step/check counts, routine local checks, and no
-clarification, explicit risk, or sensitive-area language. The plan stays visible. If the builder
+Automatic approval requires one named file, at most four ordinary steps/checks, routine local
+checks, no clarification, and no sensitive-area language, including in risk notes. Generic caveats
+do not make an inspect/fix/verify plan high risk. The plan stays visible. If the builder
 later targets an undeclared path, execution pauses for a separate action approval before writing.
 
 ### What does the Proof Pack hash prove?
@@ -87,8 +88,9 @@ recoverable view of the same source of truth rather than a best-effort stream.
 
 ### What would you build next?
 
-First: evaluation across a fixed task corpus and a polished release/demo rehearsal. Second: richer
-language-aware patch validation. Third: optional stronger Linux profiles and signed evidence.
+The fixed quality corpus and two low-frequency real-model scenarios now cover the main claims.
+Next: richer language-aware patch validation and a polished demo rehearsal. After that: optional
+stronger Linux profiles and signed evidence.
 Parallel writers and plugins come later because they complicate attribution and recovery more than
 they improve this v0.1 demo.
 
@@ -102,3 +104,4 @@ they improve this v0.1 demo.
 - `src/traceforge/api.py`: public data boundary and sequenced WebSocket
 - `web/src/App.tsx`: evidence-oriented interaction surface
 - `tests/test_demo.py` and `web/e2e/demo.spec.ts`: deterministic proof of the full story
+- `scripts/evaluate_real_model.py`: opt-in provider acceptance with hidden semantic checks

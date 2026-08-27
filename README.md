@@ -102,8 +102,9 @@ not use an agent framework or provider-hosted file/code tools.
 
 See [Architecture](docs/architecture.md), [Security model](docs/security.md),
 [Sandbox evidence](docs/sandbox.md), [AIME UI benchmark](docs/ui-benchmark.md),
-[Fault-injection evidence](docs/fault-injection.md), [Quality corpus](docs/quality-evaluation.md), and
-[Interview guide](docs/interview-guide.md) for the design rationale and failure semantics.
+[Fault-injection evidence](docs/fault-injection.md), [Quality corpus](docs/quality-evaluation.md),
+[real-model evaluation](docs/real-model-evaluation.md), and [Interview guide](docs/interview-guide.md)
+for the design rationale and failure semantics.
 
 ## Development
 
@@ -129,9 +130,12 @@ uv run python scripts/evaluate_quality.py
 
 # Stricter release-host check: fail when no OS sandbox is enforced
 uv run python scripts/evaluate_quality.py --require-os-sandbox
+
+# Optional low-frequency provider acceptance; never runs in CI
+uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
 ```
 
-The current suite has 94 backend tests at 86.19% coverage (with a hard 85% gate), frontend unit
+The current suite has 102 backend tests at 86.20% coverage (with a hard 85% gate), frontend unit
 tests, a full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
 
 ## Repository map
@@ -143,6 +147,7 @@ demo/tenant-cache-api bundled real-task fixture
 tests/                unit, adversarial, integration, recovery, and API tests
 docs/                 architecture, security, and interview rationale
 scripts/              tracked-file credential scan
+evaluation/           pinned real-model repair fixtures
 ```
 
 ## Scope and limitations

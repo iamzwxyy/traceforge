@@ -150,12 +150,33 @@ def test_proof_pack_marks_mixed_sandbox_execution(storage: Storage, workspace: W
                 },
             },
         )
+    storage.append_event(
+        run.id,
+        EventType.TOOL_COMPLETED,
+        {
+            "call": {
+                "id": "rejected",
+                "name": "run_command",
+                "arguments": {"argv": ["curl", "https://example.invalid"]},
+            },
+            "result": {
+                "tool_call_id": "rejected",
+                "name": "run_command",
+                "ok": False,
+                "error": "User rejected this action.",
+                "metadata": {},
+            },
+        },
+    )
 
     pack = build_proof_pack(storage.get_run(run.id), storage)
 
     assert pack.command_sandbox.status == "mixed"
     assert pack.command_sandbox.sandboxed_commands == 1
     assert pack.command_sandbox.bypassed_commands == 1
+    assert pack.command_sandbox.policy_only_commands == 0
+    assert pack.command_sandbox.not_executed_commands == 1
+    assert "Rejected or denied before execution: 1" in proof_pack_markdown(pack)
 
 
 def test_proof_pack_records_conflict_aware_rollback(

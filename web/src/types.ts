@@ -214,6 +214,7 @@ export interface ProofPack {
     sandboxed_commands: number;
     bypassed_commands: number;
     policy_only_commands: number;
+    not_executed_commands: number;
   };
   event_count: number;
   event_chain_sha256: string;

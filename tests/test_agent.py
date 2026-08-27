@@ -211,6 +211,98 @@ async def test_low_risk_single_file_plan_is_auto_approved_but_stays_visible(
 
 
 @pytest.mark.asyncio
+async def test_planner_can_repair_invalid_structured_calls(
+    settings: Settings, storage: Storage
+) -> None:
+    invalid_questions = {
+        "questions": [
+            {
+                "id": "format",
+                "prompt": "Which format?",
+                "options": [{"id": "text", "label": "Text"}],
+            }
+        ]
+    }
+    invalid = {
+        "summary": "Create one note",
+        "steps": [{"id": "create", "title": "Create the note"}],
+        "acceptance_checks": [{"id": "review", "label": "The note is correct"}],
+        "impacted_files": ["note.txt"],
+        "risks": [{"risk": "The model used an object instead of a string"}],
+    }
+    valid = {**invalid, "risks": ["The note must remain inside the workspace"]}
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="invalid-questions",
+                        name="ask_questions",
+                        arguments=invalid_questions,
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="invalid-plan", name="submit_plan", arguments=invalid)
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[ToolCall(id="valid-plan", name="submit_plan", arguments=valid)]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="create",
+                        name="create_file",
+                        arguments={"path": "note.txt", "content": "ready\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Created note", "evidence": ["diff"]},
+                    )
+                ]
+            ),
+            _verification("pass", "The repaired plan and note satisfy the task."),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Create note.txt")
+
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    question_correction = provider.requests[1][0]
+    question_result = next(
+        message
+        for message in question_correction
+        if message.get("tool_call_id") == "invalid-questions"
+    )
+    plan_correction = provider.requests[2][0]
+    plan_result = next(
+        message
+        for message in plan_correction
+        if message.get("tool_call_id") == "invalid-plan"
+    )
+    assert "Invalid clarification request schema" in question_result["content"]
+    assert "Invalid plan schema" in plan_result["content"]
+    assert "Which format?" not in question_result["content"]
+    assert "The model used an object" not in plan_result["content"]
+    rejected_call_ids = {
+        event.payload["call"]["id"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TOOL_COMPLETED
+        and event.payload["result"]["ok"] is False
+    }
+    assert {"invalid-questions", "invalid-plan"} <= rejected_call_ids
+
+
+@pytest.mark.asyncio
 async def test_fast_path_scope_drift_requires_action_approval(
     settings: Settings, storage: Storage
 ) -> None:

@@ -158,6 +158,7 @@ def proof_pack_markdown(pack: ProofPack) -> str:
             f"- OS-sandboxed commands: {pack.command_sandbox.sandboxed_commands}",
             f"- User-approved bypasses: {pack.command_sandbox.bypassed_commands}",
             f"- Policy-only commands: {pack.command_sandbox.policy_only_commands}",
+            f"- Rejected or denied before execution: {pack.command_sandbox.not_executed_commands}",
             "",
         ]
     )
@@ -194,6 +195,7 @@ def _rollback_evidence(
 def _command_sandbox_evidence(events: list[RunEvent]) -> ProofCommandSandbox:
     statuses: list[str] = []
     backends: set[str] = set()
+    not_executed = 0
     for event in events:
         if event.type is not EventType.TOOL_COMPLETED:
             continue
@@ -206,7 +208,12 @@ def _command_sandbox_evidence(events: list[RunEvent]) -> ProofCommandSandbox:
         metadata = result.get("metadata")
         sandbox = metadata.get("sandbox") if isinstance(metadata, dict) else None
         if not isinstance(sandbox, dict):
-            statuses.append("policy_only")
+            if isinstance(metadata, dict) and (
+                "exit_code" in metadata or metadata.get("timeout") is True
+            ):
+                statuses.append("policy_only")
+            else:
+                not_executed += 1
             continue
         status = str(sandbox.get("status", "policy_only"))
         if status not in {"enforced", "bypassed", "policy_only"}:
@@ -238,6 +245,7 @@ def _command_sandbox_evidence(events: list[RunEvent]) -> ProofCommandSandbox:
         sandboxed_commands=counts["enforced"],
         bypassed_commands=counts["bypassed"],
         policy_only_commands=counts["policy_only"],
+        not_executed_commands=not_executed,
     )
 
 

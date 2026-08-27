@@ -471,9 +471,19 @@ class AgentManager:
                             "At most two clarification rounds are allowed. Submit a plan.",
                         )
                         continue
-                    request = ClarificationRequest(
-                        questions=call.arguments.get("questions", []), round=round_number
-                    )
+                    try:
+                        request = ClarificationRequest(
+                            questions=call.arguments.get("questions", []),
+                            round=round_number,
+                        )
+                    except ValidationError as exc:
+                        await self._reject_invalid_planning_call(
+                            run,
+                            call,
+                            label="clarification request",
+                            error=exc,
+                        )
+                        continue
                     run.clarification = request
                     self.storage.save_run(run)
                     await self._transition(run, RunState.AWAITING_CLARIFICATION)
@@ -483,7 +493,16 @@ class AgentManager:
                     await self._transition(run, RunState.PLANNING)
                     continue
                 if call.name == "submit_plan":
-                    plan = TaskPlan.model_validate(call.arguments)
+                    try:
+                        plan = TaskPlan.model_validate(call.arguments)
+                    except ValidationError as exc:
+                        await self._reject_invalid_planning_call(
+                            run,
+                            call,
+                            label="plan",
+                            error=exc,
+                        )
+                        continue
                     run.plan = plan
                     run.plan_gate = assess_plan_gate(
                         run.task,
@@ -1012,6 +1031,36 @@ class AgentManager:
             run,
             ToolResult(tool_call_id=call.id, name=call.name, ok=False, error=error),
         )
+
+    async def _reject_invalid_planning_call(
+        self,
+        run: RunRecord,
+        call: ToolCall,
+        *,
+        label: str,
+        error: ValidationError,
+    ) -> None:
+        details = json.dumps(
+            error.errors(include_url=False, include_input=False), ensure_ascii=False
+        )
+        result = ToolResult(
+            tool_call_id=call.id,
+            name=call.name,
+            ok=False,
+            error=f"Invalid {label} schema: {details}",
+        )
+        self._append_tool_result(run, result)
+        run.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Correct the {label} to match the supplied tool schema, then call "
+                    f"{call.name} again. Do not continue in prose."
+                ),
+            }
+        )
+        self.storage.save_run(run)
+        await self._emit_tool_result(run, call, result)
 
     async def _emit_tool_result(
         self, run: RunRecord, call: ToolCall, result: ToolResult
