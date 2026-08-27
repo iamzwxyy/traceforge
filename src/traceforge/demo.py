@@ -150,7 +150,14 @@ def scripted_demo_provider() -> ScriptedProvider:
                         id="demo-read-cache",
                         name="read_file",
                         arguments={"path": "src/tenant_cache_api/cache.py"},
-                    )
+                    ),
+                    ToolCall(
+                        id="demo-progress-inspect",
+                        name="update_plan",
+                        arguments={
+                            "updates": [{"id": "inspect", "status": "completed"}]
+                        },
+                    ),
                 ],
             ),
             ModelResponse(
@@ -159,7 +166,12 @@ def scripted_demo_provider() -> ScriptedProvider:
                         id="demo-fix",
                         name="apply_patch",
                         arguments={"patch": _FIX_PATCH},
-                    )
+                    ),
+                    ToolCall(
+                        id="demo-progress-fix",
+                        name="update_plan",
+                        arguments={"updates": [{"id": "fix", "status": "completed"}]},
+                    ),
                 ]
             ),
             ModelResponse(
@@ -171,7 +183,14 @@ def scripted_demo_provider() -> ScriptedProvider:
                             "path": "tests/test_tenant_isolation.py",
                             "content": _REGRESSION_TEST,
                         },
-                    )
+                    ),
+                    ToolCall(
+                        id="demo-progress-regression",
+                        name="update_plan",
+                        arguments={
+                            "updates": [{"id": "regression", "status": "completed"}]
+                        },
+                    ),
                 ]
             ),
             ModelResponse(

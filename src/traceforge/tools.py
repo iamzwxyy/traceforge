@@ -368,22 +368,28 @@ class ToolRegistry:
         except TimeoutError:
             await self.cancel(run_id)
             output = b"".join(chunks).decode(errors="replace")
+            if truncated:
+                output += (
+                    f"\n... output truncated at {self.settings.stored_output_limit} bytes ...\n"
+                )
             return ToolResult(
                 tool_call_id=call.id,
                 name=call.name,
                 ok=False,
-                output=_for_model(output, self.settings.model_output_limit),
+                output=output,
                 error=f"Command timed out after {timeout} seconds",
                 metadata={"timeout": True, "truncated": truncated, "argv": argv},
             )
         finally:
             self._processes.pop(run_id, None)
         output = b"".join(chunks).decode(errors="replace")
+        if truncated:
+            output += f"\n... output truncated at {self.settings.stored_output_limit} bytes ...\n"
         return ToolResult(
             tool_call_id=call.id,
             name=call.name,
             ok=process.returncode == 0,
-            output=_for_model(output, self.settings.model_output_limit),
+            output=output,
             error=None if process.returncode == 0 else f"Command exited with {process.returncode}",
             metadata={
                 "exit_code": process.returncode,
@@ -443,13 +449,6 @@ def _is_dangerous_remove(argv: list[str]) -> bool:
         return False
     flags = "".join(item for item in argv[1:] if item.startswith("-"))
     return "r" in flags and "f" in flags
-
-
-def _for_model(output: str, limit: int) -> str:
-    if len(output.encode()) <= limit:
-        return output
-    half = limit // 2
-    return f"{output[:half]}\n... output truncated ...\n{output[-half:]}"
 
 
 def _is_secret_file(name: str) -> bool:

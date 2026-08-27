@@ -18,6 +18,7 @@ from traceforge.models import (
     ClarificationAnswer,
     ClarificationRequest,
     EventType,
+    RunEvent,
     RunRecord,
     RunState,
     TaskPlan,
@@ -46,6 +47,19 @@ class PlanDecision(BaseModel):
 
     decision: Literal["approve", "revise"]
     feedback: str = Field(default="", max_length=2_000)
+
+
+class PlanStepUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=80)
+    status: Literal["pending", "in_progress", "completed"]
+
+
+class PlanUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    updates: list[PlanStepUpdate] = Field(min_length=1, max_length=12)
 
 
 @dataclass(slots=True)
@@ -453,8 +467,16 @@ class AgentManager:
     async def _builder_phase(self, run: RunRecord) -> None:
         repeated_failures: dict[str, int] = {}
         no_tool_responses = 0
+        builder_tools = [
+            *self.tools.schemas,
+            _model_tool(
+                "update_plan",
+                "Update the status of one or more approved plan steps.",
+                PlanUpdateRequest.model_json_schema(),
+            ),
+        ]
         while run.step_count < self.settings.max_steps:
-            response = await self._complete_model(run, self.tools.schemas)
+            response = await self._complete_model(run, builder_tools)
             run.messages.append(response.as_assistant_message())
             if response.content:
                 await self._emit_message(run, response.content, phase="building")
@@ -498,32 +520,39 @@ class AgentManager:
                 await self.broker.emit(
                     run.id, EventType.TOOL_REQUESTED, call.model_dump(mode="json")
                 )
-                assessment = self.tools.assess(call, run.plan)
-                if assessment.decision is PermissionDecision.DENY:
-                    result = ToolResult(
-                        tool_call_id=call.id,
-                        name=call.name,
-                        ok=False,
-                        error=assessment.reason,
-                    )
-                else:
-                    if assessment.decision is PermissionDecision.ASK:
-                        approved = await self._await_action_approval(run, call, assessment)
-                        if not approved:
-                            result = ToolResult(
-                                tool_call_id=call.id,
-                                name=call.name,
-                                ok=False,
-                                error="User rejected this action.",
-                            )
-                            self._append_tool_result(run, result)
-                            await self._emit_tool_result(run, call, result)
-                            continue
+                if call.name == "update_plan":
                     await self._transition(run, RunState.EXECUTING)
                     await self.broker.emit(
                         run.id, EventType.TOOL_STARTED, call.model_dump(mode="json")
                     )
-                    result = await self.tools.execute(run.id, call)
+                    result = self._apply_plan_update(run, call)
+                else:
+                    assessment = self.tools.assess(call, run.plan)
+                    if assessment.decision is PermissionDecision.DENY:
+                        result = ToolResult(
+                            tool_call_id=call.id,
+                            name=call.name,
+                            ok=False,
+                            error=assessment.reason,
+                        )
+                    else:
+                        if assessment.decision is PermissionDecision.ASK:
+                            approved = await self._await_action_approval(run, call, assessment)
+                            if not approved:
+                                result = ToolResult(
+                                    tool_call_id=call.id,
+                                    name=call.name,
+                                    ok=False,
+                                    error="User rejected this action.",
+                                )
+                                self._append_tool_result(run, result)
+                                await self._emit_tool_result(run, call, result)
+                                continue
+                        await self._transition(run, RunState.EXECUTING)
+                        await self.broker.emit(
+                            run.id, EventType.TOOL_STARTED, call.model_dump(mode="json")
+                        )
+                        result = await self.tools.execute(run.id, call)
                 result = self._redact_result(result)
                 self._append_tool_result(run, result)
                 await self._update_checks_and_diff(run, call, result)
@@ -561,7 +590,7 @@ class AgentManager:
             "plan": run.plan.model_dump(mode="json"),
             "diff": self.workspace.diff(run.id)[:60_000],
             "tool_events": [
-                event.model_dump(mode="json")
+                self._event_for_model(event)
                 for event in self.storage.get_events(run.id)
                 if event.type is EventType.TOOL_COMPLETED
             ][-20:],
@@ -834,14 +863,34 @@ class AgentManager:
         self.storage.save_run(run)
 
     def _append_tool_result(self, run: RunRecord, result: ToolResult) -> None:
+        model_result = result.model_copy(deep=True)
+        model_result.output = _limit_for_model(
+            model_result.output, self.settings.model_output_limit
+        )
+        if model_result.error:
+            model_result.error = _limit_for_model(
+                model_result.error, self.settings.model_output_limit
+            )
         run.messages.append(
             {
                 "role": "tool",
-                "tool_call_id": result.tool_call_id,
-                "name": result.name,
-                "content": result.model_dump_json(),
+                "tool_call_id": model_result.tool_call_id,
+                "name": model_result.name,
+                "content": model_result.model_dump_json(),
             }
         )
+
+    def _event_for_model(self, event: RunEvent) -> dict[str, Any]:
+        payload = event.model_dump(mode="json")
+        result = payload.get("payload", {}).get("result")
+        if isinstance(result, dict):
+            for field in ("output", "error"):
+                value = result.get(field)
+                if isinstance(value, str):
+                    result[field] = _limit_for_model(
+                        value, self.settings.model_output_limit
+                    )
+        return payload
 
     def _append_tool_error(self, run: RunRecord, call: ToolCall, error: str) -> None:
         self._append_tool_result(
@@ -888,6 +937,38 @@ class AgentManager:
                     check.evidence = (result.output or result.error or "")[-1_000:]
         await self.broker.emit(
             run.id, EventType.PLAN_UPDATED, run.plan.model_dump(mode="json")
+        )
+
+    @staticmethod
+    def _apply_plan_update(run: RunRecord, call: ToolCall) -> ToolResult:
+        if run.plan is None:
+            return ToolResult(
+                tool_call_id=call.id,
+                name=call.name,
+                ok=False,
+                error="No approved plan is available.",
+            )
+        try:
+            request = PlanUpdateRequest.model_validate(call.arguments)
+            by_id = {step.id: step for step in run.plan.steps}
+            unknown = [update.id for update in request.updates if update.id not in by_id]
+            if unknown:
+                raise ValueError("Unknown plan step ids: " + ", ".join(unknown))
+            for update in request.updates:
+                by_id[update.id].status = update.status
+        except (ValidationError, ValueError) as exc:
+            return ToolResult(
+                tool_call_id=call.id,
+                name=call.name,
+                ok=False,
+                error=str(exc),
+            )
+        return ToolResult(
+            tool_call_id=call.id,
+            name=call.name,
+            ok=True,
+            output="Updated: "
+            + ", ".join(f"{update.id}={update.status}" for update in request.updates),
         )
 
     def _redact_result(self, result: ToolResult) -> ToolResult:
@@ -974,3 +1055,10 @@ def _rollback_payload(result: RollbackResult) -> dict[str, Any]:
         "removed": result.removed,
         "conflicts": result.conflicts,
     }
+
+
+def _limit_for_model(output: str, limit: int) -> str:
+    if len(output.encode()) <= limit:
+        return output
+    half = limit // 2
+    return f"{output[:half]}\n... output truncated for model ...\n{output[-half:]}"
