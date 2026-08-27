@@ -7,6 +7,7 @@ import {
   ClipboardCheck,
   Code2,
   FileDiff,
+  Gauge,
   GitBranch,
   Hammer,
   History,
@@ -134,6 +135,15 @@ function Header({
         </div>
         <div className="context-item"><Sparkles size={14} /><span>{status?.model ?? "—"}</span></div>
         {run && <div className="context-item"><Wrench size={14} /><span>{run.step_count} steps</span></div>}
+        {run && (
+          <div
+            className="context-item"
+            title={`${run.context_tokens.toLocaleString()} of ${run.context_limit.toLocaleString()} estimated tokens`}
+          >
+            <Gauge size={14} />
+            <span>{formatTokens(run.context_tokens)} / {formatTokens(run.context_limit)} ctx</span>
+          </div>
+        )}
         <div className={`connection ${!run || connected ? "online" : "offline"}`}>
           {!run || connected ? <Wifi size={14} /> : <WifiOff size={14} />}
           {!run ? "Ready" : connected ? "Live" : "Reconnecting"}
@@ -539,6 +549,12 @@ function relativeTime(value: string): string {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
   return `${Math.floor(seconds / 86400)}d`;
+}
+
+function formatTokens(value: number): string {
+  if (value < 1_000) return String(value);
+  const compact = value / 1_000;
+  return `${compact >= 10 ? Math.round(compact) : compact.toFixed(1).replace(/\.0$/, "")}k`;
 }
 
 function clockTime(value: string): string {

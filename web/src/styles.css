@@ -252,7 +252,6 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 11px; font-weight: 600; 
 @media (max-width: 1280px) {
   .workspace-grid { grid-template-columns: 210px minmax(450px, 1fr) 340px; }
   .workspace-path { max-width: 210px; }
-  .context-item:nth-of-type(3) { display: none; }
   .inspector-tabs button span { display: none; }
 }
 
@@ -260,6 +259,7 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 11px; font-weight: 600; 
   .workspace-grid { grid-template-columns: 190px minmax(0, 1fr); }
   .inspector { display: none; }
   .workspace-path { max-width: 170px; }
+  .context-item:nth-of-type(3), .context-item:nth-of-type(4) { display: none; }
   .composer-wrap { padding-right: 30px; padding-left: 30px; }
 }
 

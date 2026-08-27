@@ -62,6 +62,9 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
         run_id = response.json()["id"]
         waiting = _wait_for_state(client, run_id, "awaiting_plan_approval")
         assert "messages" not in waiting
+        assert waiting["context_tokens"] > 0
+        assert waiting["context_tokens"] < waiting["context_limit"]
+        assert waiting["context_limit"] == settings.context_limit
 
         decision = client.post(
             f"/api/runs/{run_id}/plan-decision", json={"decision": "approve"}
@@ -98,4 +101,3 @@ def test_websocket_replays_persisted_events(settings: Settings) -> None:
             first = websocket.receive_json()
             assert first["seq"] == 1
             assert first["type"] == "state.changed"
-

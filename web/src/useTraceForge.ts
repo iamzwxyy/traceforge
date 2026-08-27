@@ -4,6 +4,8 @@ import { mergeEvents } from "./lib";
 import type { AppStatus, ClarificationAnswer, Run, RunEvent } from "./types";
 
 const refreshEventTypes = new Set([
+  "message",
+  "tool.completed",
   "state.changed",
   "clarification.requested",
   "clarification.answered",
@@ -32,12 +34,21 @@ export function useTraceForge() {
     return next;
   }, []);
 
-  const refreshRun = useCallback(async (runId: string) => {
-    const [nextRun, nextDiff] = await Promise.all([api.getRun(runId), api.getDiff(runId)]);
+  const storeRun = useCallback((nextRun: Run) => {
     setRun(nextRun);
-    setDiff(nextDiff.diff);
     setRuns((current) => [nextRun, ...current.filter((item) => item.id !== nextRun.id)]);
   }, []);
+
+  const refreshRunMetadata = useCallback(async (runId: string) => {
+    const nextRun = await api.getRun(runId);
+    storeRun(nextRun);
+  }, [storeRun]);
+
+  const refreshRun = useCallback(async (runId: string) => {
+    const [nextRun, nextDiff] = await Promise.all([api.getRun(runId), api.getDiff(runId)]);
+    storeRun(nextRun);
+    setDiff(nextDiff.diff);
+  }, [storeRun]);
 
   useEffect(() => {
     void Promise.all([api.status(), refreshRuns()])
@@ -70,7 +81,7 @@ export function useTraceForge() {
         const event = JSON.parse(message.data as string) as RunEvent;
         lastSeq.current = Math.max(lastSeq.current, event.seq);
         setEvents((current) => mergeEvents(current, [event]));
-        if (refreshEventTypes.has(event.type)) void refreshRun(selectedRunId);
+        if (refreshEventTypes.has(event.type)) void refreshRunMetadata(selectedRunId);
         if (event.type === "diff.updated") {
           const payloadDiff = event.payload.diff;
           if (typeof payloadDiff === "string") setDiff(payloadDiff);
@@ -100,7 +111,7 @@ export function useTraceForge() {
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [refreshRun, selectedRunId]);
+  }, [refreshRun, refreshRunMetadata, selectedRunId]);
 
   const perform = useCallback(
     async (operation: () => Promise<unknown>) => {

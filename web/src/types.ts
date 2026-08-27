@@ -95,6 +95,8 @@ export interface Run {
   verification: VerificationReport | null;
   step_count: number;
   repair_cycles: number;
+  context_tokens: number;
+  context_limit: number;
   error: string | null;
   created_at: string;
   updated_at: string;

@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from traceforge import __version__
 from traceforge.agent import AgentManager, InvalidRunAction, PlanDecision, RunConflictError
 from traceforge.config import Settings
+from traceforge.context import ContextManager
 from traceforge.events import EventBroker
 from traceforge.models import (
     ApprovalRequest,
@@ -73,13 +74,17 @@ class RunView(BaseModel):
     verification: VerificationReport | None
     step_count: int
     repair_cycles: int
+    context_tokens: int
+    context_limit: int
     error: str | None
     created_at: datetime
     updated_at: datetime
 
     @classmethod
-    def from_record(cls, run: RunRecord) -> RunView:
+    def from_record(cls, run: RunRecord, *, context_limit: int) -> RunView:
         public = run.model_dump(exclude={"messages", "plan_approved", "interrupted_from"})
+        public["context_tokens"] = ContextManager(context_limit).estimated_tokens(run.messages)
+        public["context_limit"] = context_limit
         return cls.model_validate(public)
 
 
@@ -157,16 +162,21 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     @app.get("/api/runs", response_model=list[RunView])
     async def list_runs() -> list[RunView]:
-        return [RunView.from_record(run) for run in storage.list_runs(settings.workspace)]
+        return [
+            RunView.from_record(run, context_limit=settings.context_limit)
+            for run in storage.list_runs(settings.workspace)
+        ]
 
     @app.post("/api/runs", response_model=RunView, status_code=status.HTTP_201_CREATED)
     async def create_run(body: CreateRunRequest) -> RunView:
         run = await manager.start_run(body.task, verifier_enabled=body.verifier_enabled)
-        return RunView.from_record(run)
+        return RunView.from_record(run, context_limit=settings.context_limit)
 
     @app.get("/api/runs/{run_id}", response_model=RunView)
     async def get_run(run_id: str) -> RunView:
-        return RunView.from_record(storage.get_run(run_id))
+        return RunView.from_record(
+            storage.get_run(run_id), context_limit=settings.context_limit
+        )
 
     @app.get("/api/runs/{run_id}/events", response_model=list[RunEvent])
     async def get_events(
@@ -208,11 +218,15 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     @app.post("/api/runs/{run_id}/cancel", response_model=RunView)
     async def cancel_run(run_id: str) -> RunView:
-        return RunView.from_record(await manager.cancel(run_id))
+        return RunView.from_record(
+            await manager.cancel(run_id), context_limit=settings.context_limit
+        )
 
     @app.post("/api/runs/{run_id}/resume", response_model=RunView)
     async def resume_run(run_id: str) -> RunView:
-        return RunView.from_record(await manager.resume(run_id))
+        return RunView.from_record(
+            await manager.resume(run_id), context_limit=settings.context_limit
+        )
 
     @app.post("/api/runs/{run_id}/rollback")
     async def rollback_run(run_id: str) -> dict[str, list[str]]:
