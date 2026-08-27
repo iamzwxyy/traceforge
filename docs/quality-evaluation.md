@@ -23,7 +23,7 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 | Complete evidence loop | real diff, fresh checks, independent pass, stable completion diff and Proof Pack digest | deterministic tenant-isolation demo plus Proof Pack projection test |
 | Risk-adaptive human control | low-risk plan stays visible; scope drift and unknown execution pause before action | plan-gate and approval state-machine tests |
 | Truthful repair and termination | edits invalidate old checks; repair-budget exhaustion ends failed | stale-check repair and repair-limit tests |
-| Recovery and rollback | incomplete tool call receives a synthetic failure and is never replayed; one conflict does not block safe rollback of other files | restart protocol and partial rollback tests |
+| Recovery and rollback | transient model failure pauses with bounded retry evidence and can resume after settings change; incomplete tool calls are never replayed; one conflict does not block safe rollback of other files | provider-outage recovery, restart protocol, and partial rollback tests |
 | Command isolation | enforced backend blocks workspace escape and credential reads; an explicit escape is one-shot and labeled | real Seatbelt/Bubblewrap adversarial tests plus bypass evidence test |
 
 `passed` means every selected invariant executed and passed. `degraded` means Pytest skipped an

@@ -66,6 +66,7 @@ class EventType(StrEnum):
     DIFF_UPDATED = "diff.updated"
     VERIFICATION_COMPLETED = "verification.completed"
     REPAIR_STARTED = "repair.started"
+    MODEL_RETRY = "model.retry"
     RUN_RESUMED = "run.resumed"
     ERROR = "error"
     RUN_COMPLETED = "run.completed"

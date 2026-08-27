@@ -25,12 +25,14 @@ def test_settings_from_env_and_validation(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", "https://model.example/v1")
     monkeypatch.setenv("OPENAI_MODEL", "quality-model")
     monkeypatch.setenv("TRACEFORGE_CONTEXT_LIMIT", "1234")
+    monkeypatch.setenv("TRACEFORGE_MODEL_TIMEOUT", "90")
 
     settings = Settings.from_env(workspace)
 
     assert settings.workspace == workspace.resolve()
     assert settings.data_dir == data_dir
     assert settings.context_limit == 1234
+    assert settings.model_request_timeout == 90
     assert settings.masked_base_url == "https://model.example/v1"
 
     monkeypatch.delenv("OPENAI_API_KEY")
@@ -39,6 +41,10 @@ def test_settings_from_env_and_validation(tmp_path, monkeypatch) -> None:
     assert Settings.from_env(workspace, require_api_key=False).api_key == ""
 
     monkeypatch.setenv("TRACEFORGE_CONTEXT_LIMIT", "0")
+    with pytest.raises(ValueError, match="must be positive"):
+        Settings.from_env(workspace, require_api_key=False)
+    monkeypatch.setenv("TRACEFORGE_CONTEXT_LIMIT", "1234")
+    monkeypatch.setenv("TRACEFORGE_MODEL_TIMEOUT", "0")
     with pytest.raises(ValueError, match="must be positive"):
         Settings.from_env(workspace, require_api_key=False)
     with pytest.raises(ValueError, match="not a directory"):
@@ -80,28 +86,27 @@ def _response(*, arguments: str = '{"path":"a.py"}'):
 
 
 @pytest.mark.asyncio
-async def test_openai_compatible_provider_parses_and_retries(settings, monkeypatch) -> None:
-    class TransientError(Exception):
-        pass
-
-    completions = _FakeCompletions([TransientError("temporary"), _response()])
+async def test_openai_compatible_provider_parses_with_explicit_transport_policy(
+    settings, monkeypatch
+) -> None:
+    completions = _FakeCompletions([_response()])
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
-    monkeypatch.setattr(provider_module, "AsyncOpenAI", lambda **kwargs: client)
-    monkeypatch.setattr(provider_module, "APIConnectionError", TransientError)
-    monkeypatch.setattr(provider_module, "APITimeoutError", TransientError)
-    monkeypatch.setattr(provider_module, "RateLimitError", TransientError)
+    client_kwargs = {}
 
-    async def no_sleep(_delay: float) -> None:
-        return None
+    def make_client(**kwargs):
+        client_kwargs.update(kwargs)
+        return client
 
-    monkeypatch.setattr(provider_module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(provider_module, "AsyncOpenAI", make_client)
     provider = OpenAICompatibleProvider(settings)
     result = await provider.complete([{"role": "user", "content": "inspect"}], [])
 
     assert result.content == "inspected"
     assert result.tool_calls[0].arguments == {"path": "a.py"}
-    assert len(completions.kwargs) == 2
+    assert len(completions.kwargs) == 1
     assert "tools" not in completions.kwargs[-1]
+    assert client_kwargs["max_retries"] == 0
+    assert client_kwargs["timeout"] == settings.model_request_timeout
 
 
 @pytest.mark.asyncio
@@ -129,24 +134,22 @@ async def test_provider_rejects_bad_tool_json_and_exhaustion(settings, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_provider_stops_after_three_transient_failures(settings, monkeypatch) -> None:
+async def test_provider_classifies_transient_failures_as_retryable(settings, monkeypatch) -> None:
     class TransientError(Exception):
         pass
 
-    completions = _FakeCompletions([TransientError("down")] * 3)
+    completions = _FakeCompletions([TransientError("down")])
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     monkeypatch.setattr(provider_module, "AsyncOpenAI", lambda **kwargs: client)
     monkeypatch.setattr(provider_module, "APIConnectionError", TransientError)
     monkeypatch.setattr(provider_module, "APITimeoutError", TransientError)
     monkeypatch.setattr(provider_module, "RateLimitError", TransientError)
 
-    async def no_sleep(_delay: float) -> None:
-        return None
-
-    monkeypatch.setattr(provider_module.asyncio, "sleep", no_sleep)
     provider = OpenAICompatibleProvider(settings)
-    with pytest.raises(ProviderError, match="after three attempts"):
+    with pytest.raises(ProviderError, match="rate limit") as raised:
         await provider.complete([])
+    assert raised.value.retryable is True
+    assert len(completions.kwargs) == 1
 
 
 @pytest.mark.asyncio
@@ -160,7 +163,8 @@ async def test_provider_wraps_non_retryable_api_errors(settings, monkeypatch) ->
     monkeypatch.setattr(provider_module, "APIError", RejectedError)
     provider = OpenAICompatibleProvider(settings)
 
-    with pytest.raises(ProviderError, match="request was rejected"):
+    with pytest.raises(ProviderError, match="request was rejected") as raised:
         await provider.complete([])
 
+    assert raised.value.retryable is False
     assert len(completions.kwargs) == 1

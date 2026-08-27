@@ -160,8 +160,10 @@ class AgentRuntime:
         return manager
 
     async def save_provider_config(self, config: ProviderConfig) -> ProviderConfig:
-        if self.storage.has_any_active_run():
-            raise RunConflictError("Stop or finish active runs before changing model settings")
+        if self.storage.has_live_run():
+            raise RunConflictError(
+                "Pause, stop, or finish running work before changing model settings"
+            )
         if config.credential_file is not None:
             config.credential_file = config.credential_file.strip() or None
         if config.credential_file:

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import { mergeEvents } from "./lib";
+import { mergeEvents, preferNewerRun } from "./lib";
 import type {
   AppStatus,
   ClarificationAnswer,
@@ -43,6 +43,12 @@ export function useTraceForge() {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const lastSeq = useRef(0);
+  const selectedRunIdRef = useRef<string | null>(null);
+
+  const selectRun = useCallback((runId: string | null) => {
+    selectedRunIdRef.current = runId;
+    setSelectedRunId(runId);
+  }, []);
 
   const refreshRuns = useCallback(async () => {
     const next = await api.listRuns();
@@ -51,8 +57,16 @@ export function useTraceForge() {
   }, []);
 
   const storeRun = useCallback((nextRun: Run) => {
-    setRun(nextRun);
-    setRuns((current) => [nextRun, ...current.filter((item) => item.id !== nextRun.id)]);
+    setRun((current) =>
+      selectedRunIdRef.current === nextRun.id ? preferNewerRun(current, nextRun) : current,
+    );
+    setRuns((current) => {
+      const previous = current.find((item) => item.id === nextRun.id) ?? null;
+      const selected = preferNewerRun(previous, nextRun);
+      return [selected, ...current.filter((item) => item.id !== nextRun.id)].sort(
+        (left, right) => right.updated_at.localeCompare(left.updated_at),
+      );
+    });
   }, []);
 
   const refreshRunMetadata = useCallback(async (runId: string) => {
@@ -72,10 +86,10 @@ export function useTraceForge() {
         setStatus(nextStatus);
         setProjects(nextProjects);
         setProvider(nextProvider);
-        if (!selectedRunId && nextRuns.length) setSelectedRunId(nextRuns[0].id);
+        if (!selectedRunId && nextRuns.length) selectRun(nextRuns[0].id);
       })
       .catch((reason: unknown) => setError(String(reason)));
-  }, [refreshRuns, selectedRunId]);
+  }, [refreshRuns, selectRun, selectedRunId]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -155,14 +169,14 @@ export function useTraceForge() {
       try {
         const created = await api.createRun(task, verifierEnabled, target);
         setRuns((current) => [created, ...current]);
-        setSelectedRunId(created.id);
+        selectRun(created.id);
         setStatus(await api.status());
       } catch (reason) {
         setError(reason instanceof Error ? reason.message : String(reason));
         throw reason;
       }
     },
-    [],
+    [selectRun],
   );
 
   const createProject = useCallback(
@@ -231,7 +245,7 @@ export function useTraceForge() {
     error,
     clearError: () => setError(null),
     selectedRunId,
-    selectRun: setSelectedRunId,
+    selectRun,
     createRun,
     createProject,
     saveProvider,

@@ -703,7 +703,7 @@ function ProviderDialog({
           </div>
         )}
         <div className="modal-actions">
-          <span className="muted">Settings can only change when no run is active or interrupted.</span>
+          <span className="muted">Settings can change while work is stopped or safely paused. Resume uses the new connection.</span>
           <div className="button-row">
             <button
               className="button"
@@ -809,8 +809,9 @@ function RunStage({
           <ApprovalPanel approval={run.pending_approval} onDecision={onAction} />
         )}
         {run.state === "interrupted" && (
-          <Notice icon={<Pause size={18} />} title="Run interrupted">
-            No command will be replayed automatically. Resume to inspect the current workspace first.
+          <Notice icon={<Pause size={18} />} title="Run paused safely">
+            The workspace and run history are preserved. Fix the connection if needed, then Resume;
+            no unfinished command will be replayed automatically.
           </Notice>
         )}
         {run.state === "cancelled" && (
@@ -819,7 +820,7 @@ function RunStage({
             Rollback to restore this run&apos;s recorded snapshots.
           </Notice>
         )}
-        {run.error && <Notice icon={<OctagonX size={18} />} title="Run stopped" danger>{run.error}</Notice>}
+        {run.error && <Notice icon={<OctagonX size={18} />} title={run.state === "interrupted" ? "Why it paused" : "Run stopped"} danger={run.state !== "interrupted"}>{run.error}</Notice>}
         {run.state === "succeeded" && <EvidenceBoard run={run} onProof={onProof} />}
       </div>
       {confirmRollback && (
@@ -951,8 +952,17 @@ function ActivityItem({ event }: { event: RunEvent }) {
       </article>
     );
   }
+  if (event.type === "model.retry") {
+    return (
+      <article className="activity evidence-activity recovery-activity">
+        <div className="activity-icon"><Wifi size={15} /></div>
+        <div><span className="activity-label">MODEL CONNECTION RECOVERY</span><strong>retry {String(event.payload.next_attempt ?? "?")} of {String(event.payload.max_attempts ?? "?")}</strong><p>{String(event.payload.category ?? "temporary provider error").replaceAll("_", " ")} · retrying after {String(event.payload.delay_seconds ?? "?")}s</p></div>
+      </article>
+    );
+  }
   if (event.type === "error") {
-    return <Notice icon={<OctagonX size={17} />} title="Error" danger>{String(event.payload.message ?? "Unknown error")}</Notice>;
+    const recoverable = event.payload.recoverable === true;
+    return <Notice icon={<OctagonX size={17} />} title={recoverable ? "Recoverable pause" : "Error"} danger={!recoverable}>{String(event.payload.message ?? "Unknown error")}</Notice>;
   }
   return null;
 }
@@ -1172,6 +1182,14 @@ function eventSummary(event: RunEvent): string {
   }
   if (event.type === "repair.started") {
     return `Repair cycle ${String(event.payload.cycle ?? "?")} started`;
+  }
+  if (event.type === "model.retry") {
+    return `Model retry ${String(event.payload.next_attempt ?? "?")} of ${String(event.payload.max_attempts ?? "?")}`;
+  }
+  if (event.type === "error") {
+    return event.payload.recoverable === true
+      ? "Recoverable model pause"
+      : String(event.payload.message ?? "Error").slice(0, 100);
   }
   return "Evidence recorded";
 }

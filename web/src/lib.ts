@@ -1,4 +1,4 @@
-import type { RunEvent, RunState } from "./types";
+import type { Run, RunEvent, RunState } from "./types";
 
 export interface StatePresentation {
   label: string;
@@ -28,6 +28,11 @@ export function mergeEvents(current: RunEvent[], incoming: RunEvent[]): RunEvent
   const bySequence = new Map(current.map((event) => [event.seq, event]));
   for (const event of incoming) bySequence.set(event.seq, event);
   return [...bySequence.values()].sort((left, right) => left.seq - right.seq);
+}
+
+export function preferNewerRun(current: Run | null, incoming: Run): Run {
+  if (!current || current.id !== incoming.id) return incoming;
+  return incoming.updated_at >= current.updated_at ? incoming : current;
 }
 
 export interface DiffLine {
@@ -64,6 +69,7 @@ const activityEventTypes = new Set([
   "plan.gated",
   "verification.completed",
   "repair.started",
+  "model.retry",
   "run.resumed",
   "error",
 ]);

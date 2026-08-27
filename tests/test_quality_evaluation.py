@@ -43,4 +43,4 @@ def test_quality_evaluator_runs_selected_scenario_as_json() -> None:
     assert report["overall"] == "passed"
     assert report["counts"] == {"degraded": 0, "failed": 0, "passed": 1}
     assert report["scenarios"][0]["id"] == "recovery-rollback"
-    assert "2 passed" in report["scenarios"][0]["pytest_summary"]
+    assert "3 passed" in report["scenarios"][0]["pytest_summary"]

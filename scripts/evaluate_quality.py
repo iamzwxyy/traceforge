@@ -81,10 +81,14 @@ SCENARIOS = (
         id="recovery-rollback",
         title="Recovery without duplicated side effects",
         claim=(
-            "Interrupted tools are never guessed or replayed, and rollback preserves later user "
-            "edits."
+            "Transient model outages pause with retry evidence, interrupted tools are never "
+            "replayed, and rollback preserves later user edits."
         ),
         tests=(
+            (
+                "tests/test_agent.py::"
+                "test_transient_model_outage_pauses_and_resumes_without_losing_run"
+            ),
             "tests/test_agent.py::test_resume_closes_an_incomplete_tool_call_without_replaying_it",
             (
                 "tests/test_workspace.py::"

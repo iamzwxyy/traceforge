@@ -293,6 +293,23 @@ class Storage:
             ).fetchone()
         return row is not None
 
+    def has_live_run(self) -> bool:
+        """Return whether a run is executing or waiting on an in-process decision.
+
+        Interrupted runs have no active task and may safely survive a provider-config change.
+        """
+        active = tuple(
+            state.value
+            for state in RunState
+            if not state.terminal and state is not RunState.INTERRUPTED
+        )
+        placeholders = ",".join("?" for _ in active)
+        with self._lock:
+            row = self._connection.execute(
+                f"SELECT 1 FROM runs WHERE state IN ({placeholders}) LIMIT 1", active
+            ).fetchone()
+        return row is not None
+
     def create_project(self, project: ProjectRecord) -> None:
         try:
             with self._lock, self._connection:

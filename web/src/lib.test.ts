@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildActivityChapters, mergeEvents, parseDiff, presentState } from "./lib";
-import type { RunEvent } from "./types";
+import { buildActivityChapters, mergeEvents, parseDiff, preferNewerRun, presentState } from "./lib";
+import type { Run, RunEvent } from "./types";
 
 function event(seq: number): RunEvent {
   return { run_id: "run", seq, type: "message", payload: {}, created_at: "now" };
@@ -11,6 +11,14 @@ describe("mission control helpers", () => {
     expect(mergeEvents([event(2)], [event(1), event(2)]).map((item) => item.seq)).toEqual([
       1, 2,
     ]);
+  });
+
+  it("does not let a delayed metadata response regress the selected run", () => {
+    const newer = { id: "run", state: "succeeded", updated_at: "2026-08-27T12:00:00.200Z" } as Run;
+    const stale = { id: "run", state: "executing", updated_at: "2026-08-27T12:00:00.100Z" } as Run;
+
+    expect(preferNewerRun(newer, stale)).toBe(newer);
+    expect(preferNewerRun(stale, newer)).toBe(newer);
   });
 
   it("classifies unified diff lines", () => {

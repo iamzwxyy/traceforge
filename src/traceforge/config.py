@@ -16,6 +16,9 @@ class Settings:
     model: str
     credential_file: Path | None = None
     context_limit: int = 64_000
+    model_request_timeout: int = 180
+    model_retry_attempts: int = 3
+    model_retry_delay: float = 1.0
     command_timeout: int = 120
     max_command_timeout: int = 600
     max_steps: int = 30
@@ -36,6 +39,7 @@ class Settings:
         if require_api_key and not api_key:
             raise ValueError("OPENAI_API_KEY is required")
         context_limit = _positive_int("TRACEFORGE_CONTEXT_LIMIT", 64_000)
+        model_request_timeout = _positive_int("TRACEFORGE_MODEL_TIMEOUT", 180)
         return cls(
             workspace=resolved,
             data_dir=user_data_path("TraceForge", "TraceForge", ensure_exists=True),
@@ -43,6 +47,7 @@ class Settings:
             base_url=os.getenv("OPENAI_BASE_URL") or None,
             model=os.getenv("OPENAI_MODEL", "gpt-5.6-sol"),
             context_limit=context_limit,
+            model_request_timeout=model_request_timeout,
         )
 
     @property

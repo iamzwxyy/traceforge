@@ -30,8 +30,9 @@ Its differentiator is a defensible engineering loop with useful human control.
 - **Layered, inspectable command isolation.** Routine and planned commands run under macOS
   Seatbelt or Linux Bubblewrap when available; the UI and Proof Pack distinguish enforced,
   user-approved bypass, and policy-only execution instead of presenting approval as a sandbox.
-- **Recoverable execution.** Runs and events survive in SQLite. File snapshots support
-  conflict-aware whole-run rollback without overwriting later user edits.
+- **Recoverable execution.** Runs and events survive in SQLite. Bounded, visible model retries
+  pause safely on a persistent transient outage; connection settings can be repaired before
+  resuming. File snapshots support conflict-aware rollback without overwriting later user edits.
 
 ## Try the complete demo
 
@@ -83,6 +84,7 @@ Environment variables remain available as a non-persisted fallback:
 | `OPENAI_MODEL` | no | Defaults to `gpt-5.6-sol` |
 | `OPENAI_BASE_URL` | no | OpenAI-compatible endpoint |
 | `TRACEFORGE_CONTEXT_LIMIT` | no | Token-window estimate; defaults to 64,000 |
+| `TRACEFORGE_MODEL_TIMEOUT` | no | Per-attempt model timeout in seconds; defaults to 180 |
 
 Before the first real run, use **Test connection**. The probe requires the selected model to
 complete a native function call, so a successful HTTP response alone is not treated as readiness.
@@ -142,8 +144,8 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
 ```
 
-The current suite has 106 backend tests at 86.36% coverage (with a hard 85% gate), frontend unit
-tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 112 backend tests at 86.48% coverage (with a hard 85% gate), seven frontend
+unit tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 

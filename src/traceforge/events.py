@@ -20,7 +20,17 @@ class EventBroker:
     ) -> RunEvent:
         event = self.storage.append_event(run_id, event_type, payload)
         for queue in self._subscribers.get(run_id, set()).copy():
-            queue.put_nowait(event)
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                # Persisted events are authoritative. Never let a background tab or slow
+                # client backpressure the agent itself; evict one queued item and let the
+                # WebSocket sequence-gap recovery replay it from SQLite.
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                queue.put_nowait(event)
         return event
 
     def subscribe(self, run_id: str) -> asyncio.Queue[RunEvent]:
@@ -35,4 +45,3 @@ class EventBroker:
         subscribers.discard(queue)
         if not subscribers:
             self._subscribers.pop(run_id, None)
-

@@ -6,7 +6,7 @@ import pytest
 
 import traceforge.runtime as runtime_module
 from traceforge.events import EventBroker
-from traceforge.models import ProviderConfig, ToolCall
+from traceforge.models import ProviderConfig, RunRecord, RunState, ToolCall
 from traceforge.provider import ModelResponse
 from traceforge.runtime import AgentRuntime, validate_credential_file
 from traceforge.storage import Storage
@@ -101,3 +101,26 @@ def test_workspace_manager_resolves_credential_file_without_persisting_value(
     saved = storage.get_provider_config(ProviderConfig(model="fallback"))
     assert saved.credential_file == str(credential)
     assert "file-only-test-value" not in saved.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_provider_config_can_change_while_runs_are_interrupted(
+    settings, storage: Storage
+) -> None:
+    storage.create_run(
+        RunRecord(
+            id="paused",
+            task="Resume with a repaired provider",
+            workspace=str(settings.workspace),
+            state=RunState.INTERRUPTED,
+            interrupted_from=RunState.EXECUTING,
+        )
+    )
+    runtime = AgentRuntime(settings, storage, EventBroker(storage))
+
+    saved = await runtime.save_provider_config(
+        ProviderConfig(model="repaired-model", base_url="https://provider.example/v1")
+    )
+
+    assert saved.model == "repaired-model"
+    assert storage.get_run("paused").state is RunState.INTERRUPTED

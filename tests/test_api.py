@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 from fastapi.testclient import TestClient
 
 from traceforge.api import create_app
 from traceforge.config import Settings
 from traceforge.models import ToolCall
-from traceforge.provider import ModelResponse, ScriptedProvider
+from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
 
 
 def _wait_for_state(client: TestClient, run_id: str, state: str) -> dict[str, object]:
@@ -221,3 +222,69 @@ def test_provider_config_rejects_loose_credential_permissions(
 
         assert response.status_code == 422
         assert "chmod 600" in response.json()["detail"]
+
+
+def test_api_allows_provider_repair_then_resume_after_transient_outage(
+    settings: Settings,
+) -> None:
+    class RecoveringProvider:
+        def __init__(self) -> None:
+            self.outcomes = [
+                ProviderError("offline", retryable=True, category="connection"),
+                ProviderError("offline", retryable=True, category="connection"),
+                ProviderError("offline", retryable=True, category="connection"),
+                _plan_response(),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish",
+                            name="finish",
+                            arguments={"summary": "Recovered", "evidence": ["plan"]},
+                        )
+                    ]
+                ),
+            ]
+
+        async def complete(self, messages, tools=None) -> ModelResponse:
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, ProviderError):
+                raise outcome
+            return outcome
+
+    app = create_app(
+        replace(settings, model_retry_delay=0),
+        provider=RecoveringProvider(),
+    )
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={"task": "Recover this run", "verifier_enabled": False},
+        )
+        run_id = created.json()["id"]
+        interrupted = _wait_for_state(client, run_id, "interrupted")
+        assert "preserved" in interrupted["error"]
+
+        updated = client.put(
+            "/api/provider",
+            json={
+                "model": "repaired-model",
+                "base_url": "https://provider.example/v1",
+                "credential_file": None,
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["model"] == "repaired-model"
+
+        resumed = client.post(f"/api/runs/{run_id}/resume")
+        assert resumed.status_code == 200
+        _wait_for_state(client, run_id, "awaiting_plan_approval")
+        approved = client.post(
+            f"/api/runs/{run_id}/plan-decision", json={"decision": "approve"}
+        )
+        assert approved.status_code == 202
+        completed = _wait_for_state(client, run_id, "succeeded")
+        assert completed["error"] is None
+
+        events = client.get(f"/api/runs/{run_id}/events").json()
+        assert [event["type"] for event in events].count("model.retry") == 2
+        assert any(event["type"] == "run.resumed" for event in events)

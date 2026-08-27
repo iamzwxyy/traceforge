@@ -347,10 +347,28 @@ class AgentManager:
                         run_id, EventType.RUN_COMPLETED, {"state": RunState.CANCELLED.value}
                     )
             raise
-        except (ProviderError, ValidationError, ValueError, RuntimeError) as exc:
+        except ProviderError as exc:
+            current = self.storage.get_run(run_id)
+            if not current.state.terminal:
+                message = self._redact(str(exc))
+                if exc.retryable:
+                    await self._interrupt_for_provider(current, message, exc.category)
+                else:
+                    await self._fail(current, message)
+        except (ValidationError, ValueError, RuntimeError) as exc:
             current = self.storage.get_run(run_id)
             if not current.state.terminal:
                 await self._fail(current, self._redact(str(exc)))
+        except Exception as exc:
+            current = self.storage.get_run(run_id)
+            if not current.state.terminal:
+                await self._fail(
+                    current,
+                    (
+                        "TraceForge encountered an unexpected internal error "
+                        f"({type(exc).__name__}). The run was stopped instead of being left active."
+                    ),
+                )
         finally:
             self._controls.pop(run_id, None)
 
@@ -747,7 +765,7 @@ class AgentManager:
         ]
         for _ in range(8):
             prepared, _ = self.context.prepare(messages)
-            response = await self.provider.complete(prepared, verifier_tools)
+            response = await self._request_model(run, prepared, verifier_tools)
             messages.append(response.as_assistant_message())
             if response.content:
                 await self._emit_message(run, response.content, phase="verifying")
@@ -856,6 +874,68 @@ class AgentManager:
             {"state": RunState.FAILED.value, "error": error},
         )
 
+    async def _interrupt_for_provider(
+        self, run: RunRecord, error: str, category: str
+    ) -> None:
+        previous = run.state
+        run.interrupted_from = previous
+        run.error = (
+            f"{error} The workspace and run history were preserved. "
+            "Check the connection or model settings, then resume."
+        )
+        self.storage.save_run(run)
+        await self.broker.emit(
+            run.id,
+            EventType.ERROR,
+            {
+                "message": run.error,
+                "cause": "model_unavailable",
+                "category": category,
+                "recoverable": True,
+            },
+        )
+        await self._transition(run, RunState.INTERRUPTED)
+
+    async def _request_model(
+        self,
+        run: RunRecord,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> ModelResponse:
+        attempts = self.settings.model_retry_attempts
+        delay = self.settings.model_retry_delay
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await self.provider.complete(messages, tools)
+                if not isinstance(response, ModelResponse):
+                    raise ProviderError(
+                        "Model provider returned an invalid response object",
+                        category="provider_contract",
+                    )
+                return response
+            except ProviderError as exc:
+                if not exc.retryable or attempt >= attempts:
+                    raise
+                await self.broker.emit(
+                    run.id,
+                    EventType.MODEL_RETRY,
+                    {
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "max_attempts": attempts,
+                        "category": exc.category,
+                        "delay_seconds": delay,
+                    },
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+            except Exception as exc:
+                raise ProviderError(
+                    f"Model provider failed unexpectedly ({type(exc).__name__})",
+                    category="provider_contract",
+                ) from exc
+        raise AssertionError("Model retry loop ended unexpectedly")
+
     async def _complete_model(
         self, run: RunRecord, tools: list[dict[str, Any]]
     ) -> ModelResponse:
@@ -871,7 +951,7 @@ class AgentManager:
                     "content": "Older execution history was compacted to protect context quality.",
                 },
             )
-        return await self.provider.complete(prepared, tools)
+        return await self._request_model(run, prepared, tools)
 
     async def _await_clarification(self, run: RunRecord) -> list[ClarificationAnswer]:
         future: asyncio.Future[list[ClarificationAnswer]] = (

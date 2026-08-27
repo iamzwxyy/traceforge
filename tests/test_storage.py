@@ -137,6 +137,30 @@ def test_mark_all_active_runs_interrupted(storage: Storage, settings: Settings) 
     )
 
 
+def test_live_run_check_excludes_safely_interrupted_work(
+    storage: Storage, settings: Settings
+) -> None:
+    paused = RunRecord(
+        id="paused",
+        task="Paused",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.EXECUTING,
+    )
+    storage.create_run(paused)
+    assert storage.has_any_active_run() is True
+    assert storage.has_live_run() is False
+
+    active = RunRecord(
+        id="active",
+        task="Active",
+        workspace=str(settings.workspace.parent),
+        state=RunState.PLANNING,
+    )
+    storage.create_run(active)
+    assert storage.has_live_run() is True
+
+
 def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:
     database = tmp_path / "legacy.db"
     connection = sqlite3.connect(database)

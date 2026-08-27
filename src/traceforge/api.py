@@ -435,8 +435,15 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 event = event_task.result()
                 if event.seq <= last_seq:
                     continue
-                await websocket.send_json(event.model_dump(mode="json"))
-                last_seq = event.seq
+                if event.seq > last_seq + 1:
+                    # A bounded subscriber queue may evict old items for a slow client.
+                    # SQLite is authoritative, so repair the gap before continuing live.
+                    for persisted in storage.get_events(run_id, after_seq=last_seq):
+                        await websocket.send_json(persisted.model_dump(mode="json"))
+                        last_seq = persisted.seq
+                else:
+                    await websocket.send_json(event.model_dump(mode="json"))
+                    last_seq = event.seq
         except (WebSocketDisconnect, asyncio.CancelledError):
             pass
         finally:

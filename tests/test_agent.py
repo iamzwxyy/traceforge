@@ -17,7 +17,7 @@ from traceforge.models import (
     ToolCall,
     Verdict,
 )
-from traceforge.provider import ModelResponse, ScriptedProvider
+from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
 from traceforge.storage import Storage
 
 
@@ -857,6 +857,94 @@ async def test_shutdown_resume_plan_then_rollback(
         if event.type is EventType.RUN_RESUMED
     )
     assert resumed.payload["strategy"] == "await_plan_approval"
+
+
+@pytest.mark.asyncio
+async def test_transient_model_outage_pauses_and_resumes_without_losing_run(
+    settings: Settings, storage: Storage
+) -> None:
+    low_risk_plan = {
+        "summary": "Review one local note",
+        "steps": [{"id": "review", "title": "Review the note"}],
+        "acceptance_checks": [{"id": "reviewed", "label": "The note is reviewed"}],
+        "impacted_files": ["note.txt"],
+    }
+
+    class RecoveringProvider:
+        def __init__(self) -> None:
+            self.outcomes = [
+                ProviderError("network unavailable", retryable=True, category="connection"),
+                ProviderError("network unavailable", retryable=True, category="connection"),
+                ProviderError("network unavailable", retryable=True, category="connection"),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=low_risk_plan)
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish",
+                            name="finish",
+                            arguments={"summary": "Reviewed", "evidence": ["workspace"]},
+                        )
+                    ]
+                ),
+            ]
+
+        async def complete(self, messages, tools=None) -> ModelResponse:
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, ProviderError):
+                raise outcome
+            return outcome
+
+    resilient = replace(settings, model_retry_delay=0)
+    manager = AgentManager(resilient, storage, RecoveringProvider())
+    run = await manager.start_run("Review note.txt", verifier_enabled=False)
+
+    interrupted = await manager.wait(run.id)
+
+    assert interrupted.state is RunState.INTERRUPTED
+    assert interrupted.interrupted_from is RunState.PLANNING
+    assert "preserved" in (interrupted.error or "")
+    retries = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.MODEL_RETRY
+    ]
+    assert [event.payload["next_attempt"] for event in retries] == [2, 3]
+    failure = next(
+        event for event in storage.get_events(run.id) if event.type is EventType.ERROR
+    )
+    assert failure.payload["recoverable"] is True
+    assert failure.payload["cause"] == "model_unavailable"
+
+    await manager.resume(run.id)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert completed.error is None
+    assert completed.plan_gate is not None
+    assert completed.plan_gate.decision == "auto_approved"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_provider_exception_never_leaves_a_ghost_run(
+    settings: Settings, storage: Storage
+) -> None:
+    class BrokenProvider:
+        async def complete(self, messages, tools=None) -> ModelResponse:
+            raise IndexError("malformed provider response")
+
+    manager = AgentManager(settings, storage, BrokenProvider())
+    run = await manager.start_run("Do not stay active after a provider crash")
+
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.FAILED
+    assert "provider failed unexpectedly (IndexError)" in (completed.error or "")
+    assert storage.has_live_run() is False
+    assert storage.get_events(run.id)[-1].type is EventType.RUN_COMPLETED
 
 
 @pytest.mark.asyncio
