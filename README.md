@@ -135,7 +135,7 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
 ```
 
-The current suite has 102 backend tests at 86.20% coverage (with a hard 85% gate), frontend unit
+The current suite has 102 backend tests at 86.22% coverage (with a hard 85% gate), frontend unit
 tests, a full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
 
 ## Repository map

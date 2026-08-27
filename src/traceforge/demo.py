@@ -41,7 +41,7 @@ def test_same_profile_id_is_isolated_between_tenants() -> None:
 
 
 def scripted_demo_provider() -> ScriptedProvider:
-    """Return the one-run provider used by the zero-credential product demo."""
+    """Return the repeatable provider used by the zero-credential product demo."""
     check = ["python", "-m", "pytest", "-q"]
     return ScriptedProvider(
         [
@@ -247,4 +247,5 @@ def scripted_demo_provider() -> ScriptedProvider:
             ),
         ],
         delay_seconds=0.45,
+        repeat=True,
     )

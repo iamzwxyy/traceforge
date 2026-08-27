@@ -169,6 +169,18 @@ function Header({
   providerReady: boolean;
   onSettings: () => void;
 }) {
+  const localReady = Boolean(status);
+  const connectionOnline = run ? connected : localReady;
+  const connectionLabel = run
+    ? connected ? "Live" : "Reconnecting"
+    : localReady ? "Local ready" : "Connecting";
+  const connectionTitle = run
+    ? connected ? "Live run events connected" : "Reconnecting to persisted run events"
+    : localReady
+      ? providerReady
+        ? "Local service ready; model credentials configured"
+        : "Local service ready; model setup still required"
+      : "Connecting to the local TraceForge service";
   return (
     <header className="topbar">
       <div className="brand">
@@ -201,9 +213,12 @@ function Header({
             <span>{formatTokens(run.context_tokens)} / {formatTokens(run.context_limit)} ctx</span>
           </div>
         )}
-        <div className={`connection ${!run || connected ? "online" : "offline"}`}>
-          {!run || connected ? <Wifi size={14} /> : <WifiOff size={14} />}
-          {!run ? "Ready" : connected ? "Live" : "Reconnecting"}
+        <div
+          className={`connection ${connectionOnline ? "online" : "offline"}`}
+          title={connectionTitle}
+        >
+          {connectionOnline ? <Wifi size={14} /> : <WifiOff size={14} />}
+          {connectionLabel}
         </div>
         <button
           className={`icon-button settings-button ${providerReady ? "" : "needs-attention"}`}
@@ -688,6 +703,7 @@ function RunStage({
   onRollback: () => void;
   onProof: () => void;
 }) {
+  const [confirmRollback, setConfirmRollback] = useState(false);
   return (
     <div className="run-stage">
       <div className="run-header">
@@ -707,7 +723,7 @@ function RunStage({
             <button className="button" type="button" onClick={onResume}><Play size={14} /> Resume</button>
           )}
           {["succeeded", "failed", "cancelled", "interrupted"].includes(run.state) && (
-            <button className="button ghost" type="button" onClick={onRollback}><RotateCcw size={14} /> Rollback</button>
+            <button className="button ghost" type="button" onClick={() => setConfirmRollback(true)}><RotateCcw size={14} /> Rollback</button>
           )}
         </div>
       </div>
@@ -737,9 +753,45 @@ function RunStage({
             No command will be replayed automatically. Resume to inspect the current workspace first.
           </Notice>
         )}
+        {run.state === "cancelled" && (
+          <Notice icon={<Square size={18} />} title="Run stopped">
+            No further actions will run. Any file changes already made remain in the workspace; use
+            Rollback to restore this run&apos;s recorded snapshots.
+          </Notice>
+        )}
         {run.error && <Notice icon={<OctagonX size={18} />} title="Run stopped" danger>{run.error}</Notice>}
         {run.state === "succeeded" && <EvidenceBoard run={run} onProof={onProof} />}
       </div>
+      {confirmRollback && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="modal" role="dialog" aria-modal="true" aria-labelledby="rollback-title">
+            <div className="modal-heading">
+              <div><p className="eyebrow">CONFLICT-AWARE ROLLBACK</p><h2 id="rollback-title">Rollback this run?</h2></div>
+              <button className="icon-button" type="button" onClick={() => setConfirmRollback(false)} aria-label="Close rollback confirmation"><X size={17} /></button>
+            </div>
+            <p className="modal-copy">
+              TraceForge will restore files changed by this run. Later user edits are preserved as
+              conflicts, but a completed rollback cannot be automatically redone.
+            </p>
+            <div className="modal-actions">
+              <span>Only this run&apos;s recorded snapshots are considered.</span>
+              <div className="button-row">
+                <button className="button ghost" type="button" onClick={() => setConfirmRollback(false)}>Cancel</button>
+                <button
+                  className="button warning"
+                  type="button"
+                  onClick={() => {
+                    setConfirmRollback(false);
+                    onRollback();
+                  }}
+                >
+                  <RotateCcw size={14} /> Rollback files
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

@@ -8,7 +8,22 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
 
   await page.goto("/");
   await expect(page.locator("textarea")).toHaveValue(/multi-tenant cache isolation/);
+  await expect(page.getByText("Local ready", { exact: true })).toBeVisible();
   await expect(page.locator(".sandbox-status")).toContainText(/seatbelt|bubblewrap|Policy only/i);
+
+  await page.getByRole("button", { name: "Model settings" }).click();
+  await page.getByLabel(/Credential file path/).fill("/does/not/exist");
+  await page.getByRole("button", { name: "Save settings" }).click();
+  const settingsError = page.getByRole("alert");
+  await expect(settingsError).toBeVisible();
+  await expect(settingsError).toHaveCSS("z-index", "100");
+  await expect(settingsError).toContainText("Credential file is not readable");
+  expect(consoleErrors).toHaveLength(1);
+  expect(consoleErrors[0]).toContain("422 (Unprocessable Entity)");
+  consoleErrors.length = 0;
+  await page.getByRole("button", { name: "Dismiss error" }).click();
+  await expect(settingsError).toHaveCount(0);
+  await page.getByRole("button", { name: "Close model settings" }).click();
 
   await page.getByRole("button", { name: "Browse" }).click();
   await expect(page.getByRole("heading", { name: "Choose a directory" })).toBeVisible();
@@ -49,5 +64,23 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByText(/\d+ enforced · 0 blocked before run/)).toBeVisible();
   await expect(page.getByRole("link", { name: "Download Markdown" }))
     .toHaveAttribute("href", /proof-pack\.md$/);
+  await page.getByRole("button", { name: "Close", exact: true }).click();
+  await page.getByRole("button", { name: "Rollback", exact: true }).click();
+  const rollbackDialog = page.getByRole("dialog", { name: "Rollback this run?" });
+  await expect(rollbackDialog).toBeVisible();
+  await expect(rollbackDialog).toContainText("Later user edits are preserved as conflicts");
+  await rollbackDialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(rollbackDialog).toHaveCount(0);
+  await page.getByRole("button", { name: "Rollback", exact: true }).click();
+  await page.getByRole("button", { name: "Rollback files" }).click();
+  await expect(page.getByText("Rolled back", { exact: true }).first()).toBeVisible();
+
+  await page.getByRole("button", { name: "New run" }).click();
+  await page.getByRole("button", { name: "Start run" }).click();
+  await expect(page.getByRole("heading", { name: /decisions change/ })).toBeVisible();
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await expect(page.getByText("Run stopped", { exact: true }).last()).toBeVisible();
+  await expect(page.getByText(/Any file changes already made remain in the workspace/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Rollback", exact: true })).toBeVisible();
   expect(consoleErrors).toEqual([]);
 });

@@ -123,6 +123,10 @@ async def test_provider_rejects_bad_tool_json_and_exhaustion(settings, monkeypat
     with pytest.raises(ProviderError, match="no remaining"):
         await scripted.complete([])
 
+    repeating = ScriptedProvider([ModelResponse(content="again")], repeat=True)
+    assert (await repeating.complete([])).content == "again"
+    assert (await repeating.complete([])).content == "again"
+
 
 @pytest.mark.asyncio
 async def test_provider_stops_after_three_transient_failures(settings, monkeypatch) -> None:

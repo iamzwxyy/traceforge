@@ -100,10 +100,16 @@ class ScriptedProvider:
     """Deterministic provider used by integration tests and local product demos."""
 
     def __init__(
-        self, responses: list[ModelResponse], *, delay_seconds: float = 0
+        self,
+        responses: list[ModelResponse],
+        *,
+        delay_seconds: float = 0,
+        repeat: bool = False,
     ) -> None:
-        self._responses = responses.copy()
+        self._script = responses.copy()
+        self._responses = self._script.copy()
         self._delay_seconds = delay_seconds
+        self._repeat = repeat
         self.requests: list[tuple[list[dict[str, Any]], list[dict[str, Any]] | None]] = []
 
     async def complete(
@@ -114,6 +120,8 @@ class ScriptedProvider:
         self.requests.append((messages, tools))
         if self._delay_seconds:
             await asyncio.sleep(self._delay_seconds)
+        if not self._responses and self._repeat:
+            self._responses = self._script.copy()
         if not self._responses:
             raise ProviderError("Scripted provider has no remaining responses")
         return self._responses.pop(0)
