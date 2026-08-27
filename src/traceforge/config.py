@@ -21,10 +21,14 @@ class Settings:
     max_repair_cycles: int = 2
     stored_output_limit: int = 1024 * 1024
     model_output_limit: int = 16 * 1024
+    suggested_task: str | None = None
 
     @classmethod
     def from_env(cls, workspace: Path, *, require_api_key: bool = True) -> Settings:
-        resolved = workspace.expanduser().resolve(strict=True)
+        try:
+            resolved = workspace.expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"Workspace is not a directory: {workspace}") from exc
         if not resolved.is_dir():
             raise ValueError(f"Workspace is not a directory: {resolved}")
         api_key = os.getenv("OPENAI_API_KEY", "")
@@ -53,4 +57,3 @@ def _positive_int(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
-

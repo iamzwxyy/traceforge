@@ -114,6 +114,7 @@ export interface AppStatus {
   model: string;
   base_url: string;
   api_key_configured: boolean;
+  suggested_task: string | null;
   limits: {
     context: number;
     steps: number;
@@ -126,4 +127,3 @@ export interface ClarificationAnswer {
   option_id?: string;
   custom_text?: string;
 }
-

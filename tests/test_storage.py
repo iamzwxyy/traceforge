@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from traceforge.config import Settings
@@ -48,7 +49,45 @@ def test_mark_active_runs_interrupted(storage: Storage, settings: Settings) -> N
     storage.create_run(
         RunRecord(id="run-done", task="Done", workspace=str(workspace), state=RunState.SUCCEEDED)
     )
+    storage.create_run(
+        RunRecord(
+            id="run-interrupted",
+            task="Already stopped",
+            workspace=str(workspace),
+            state=RunState.INTERRUPTED,
+            interrupted_from=RunState.EXECUTING,
+        )
+    )
 
     assert storage.mark_active_runs_interrupted(workspace) == 1
     assert storage.get_run("run-active").state is RunState.INTERRUPTED
     assert storage.get_run("run-done").state is RunState.SUCCEEDED
+    assert storage.get_run("run-interrupted").interrupted_from is RunState.EXECUTING
+
+
+def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.db"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TABLE runs (
+            id TEXT PRIMARY KEY, task TEXT NOT NULL, workspace TEXT NOT NULL,
+            state TEXT NOT NULL, verifier_enabled INTEGER NOT NULL, plan_json TEXT,
+            clarification_json TEXT, pending_approval_json TEXT, verification_json TEXT,
+            messages_json TEXT NOT NULL DEFAULT '[]', step_count INTEGER NOT NULL DEFAULT 0,
+            repair_cycles INTEGER NOT NULL DEFAULT 0, error TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = Storage(database)
+    try:
+        migrated.create_run(RunRecord(id="new", task="Task", workspace=str(tmp_path)))
+        loaded = migrated.get_run("new")
+        assert loaded.plan_approved is False
+        assert loaded.interrupted_from is None
+    finally:
+        migrated.close()

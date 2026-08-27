@@ -36,10 +36,14 @@ traceforge = "traceforge.cli:app"
 packages = ["src/traceforge"]
 artifacts = ["src/traceforge/static/**"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"demo/tenant-cache-api" = "traceforge/demo_workspace"
+
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient` is deprecated"]
 
 [tool.coverage.run]
 source = ["traceforge"]
@@ -48,6 +52,7 @@ branch = true
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
+fail_under = 85
 
 [tool.ruff]
 line-length = 100

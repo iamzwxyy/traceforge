@@ -75,6 +75,8 @@ export default function App() {
         <section className="main-stage">
           {!forge.run || showComposer ? (
             <TaskComposer
+              key={forge.status?.suggested_task ?? "standard"}
+              suggestedTask={forge.status?.suggested_task ?? ""}
               onCancel={() => setShowComposer(false)}
               onSubmit={async (task, verifier) => {
                 await forge.createRun(task, verifier);
@@ -189,15 +191,17 @@ function Sidebar({
 }
 
 function TaskComposer({
+  suggestedTask,
   onSubmit,
   onCancel,
   canCancel,
 }: {
+  suggestedTask: string;
   onSubmit: (task: string, verifier: boolean) => Promise<void>;
   onCancel: () => void;
   canCancel: boolean;
 }) {
-  const [task, setTask] = useState("");
+  const [task, setTask] = useState(suggestedTask);
   const [verifier, setVerifier] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   return (
@@ -324,7 +328,9 @@ function ActivityFeed({ events, stateLabel }: { events: RunEvent[]; stateLabel: 
   const visible = events.filter((event) =>
     ["message", "tool.completed", "state.changed", "error"].includes(event.type),
   );
-  useEffect(() => end.current?.scrollIntoView({ behavior: "smooth", block: "end" }), [events.length]);
+  useEffect(() => {
+    end.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [events.length]);
   return (
     <div className="activity-feed">
       {visible.length === 0 && (

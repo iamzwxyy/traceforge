@@ -101,9 +101,26 @@ class Storage:
                     ON runs(workspace, updated_at DESC);
                 """
             )
+            columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            migrations = {
+                "plan_approved": "INTEGER NOT NULL DEFAULT 0",
+                "interrupted_from": "TEXT",
+            }
+            for column, declaration in migrations.items():
+                if column not in columns:
+                    self._connection.execute(
+                        f"ALTER TABLE runs ADD COLUMN {column} {declaration}"
+                    )
 
     def mark_active_runs_interrupted(self, workspace: Path) -> int:
-        active = tuple(state.value for state in RunState if not state.terminal)
+        active = tuple(
+            state.value
+            for state in RunState
+            if not state.terminal and state is not RunState.INTERRUPTED
+        )
         placeholders = ",".join("?" for _ in active)
         with self._lock, self._connection:
             cursor = self._connection.execute(

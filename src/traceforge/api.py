@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -146,6 +147,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             "model": settings.model,
             "base_url": settings.masked_base_url,
             "api_key_configured": bool(settings.api_key),
+            "suggested_task": settings.suggested_task,
             "limits": {
                 "context": settings.context_limit,
                 "steps": settings.max_steps,
@@ -240,12 +242,26 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 await websocket.send_json(event.model_dump(mode="json"))
                 last_seq = event.seq
             while True:
-                event = await queue.get()
+                event_task = asyncio.create_task(queue.get())
+                receive_task = asyncio.create_task(websocket.receive())
+                done, pending = await asyncio.wait(
+                    {event_task, receive_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if receive_task in done:
+                    message = receive_task.result()
+                    if message["type"] == "websocket.disconnect":
+                        break
+                if event_task not in done:
+                    continue
+                event = event_task.result()
                 if event.seq <= last_seq:
                     continue
                 await websocket.send_json(event.model_dump(mode="json"))
                 last_seq = event.seq
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
             pass
         finally:
             broker.unsubscribe(run_id, queue)

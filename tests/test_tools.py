@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import traceforge.tools as tools_module
 from traceforge.config import Settings
 from traceforge.models import AcceptanceCheck, PlanStep, RunRecord, TaskPlan, ToolCall
 from traceforge.storage import Storage
@@ -32,6 +34,22 @@ def test_permission_policy(settings: Settings, workspace: Workspace) -> None:
     )
     assert registry.assess(unknown_call, None).decision is PermissionDecision.ASK
     assert registry.assess(denied_call, None).decision is PermissionDecision.DENY
+
+
+def test_permission_policy_denies_malformed_and_destructive_commands(
+    settings: Settings, workspace: Workspace
+) -> None:
+    registry = ToolRegistry(workspace, settings)
+
+    for arguments in ({"argv": []}, {"argv": "git status"}, {"argv": ["git", 1]}):
+        call = ToolCall(id="bad", name="run_command", arguments=arguments)
+        assert registry.assess(call, None).decision is PermissionDecision.DENY
+    for argv in (["git", "reset", "--hard"], ["rm", "-rf", "target"]):
+        call = ToolCall(id="danger", name="run_command", arguments={"argv": argv})
+        assert registry.assess(call, None).decision is PermissionDecision.DENY
+    assert registry.assess(
+        ToolCall(id="read", name="run_command", arguments={"argv": ["ls"]}), None
+    ).decision is PermissionDecision.ALLOW
 
 
 @pytest.mark.asyncio
@@ -102,6 +120,149 @@ async def test_command_timeout(
     assert result.metadata["timeout"] is True
 
 
+@pytest.mark.asyncio
+async def test_read_list_search_and_error_results(
+    settings: Settings, workspace: Workspace, storage: Storage, monkeypatch
+) -> None:
+    storage.create_run(RunRecord(id="run-1", task="Inspect", workspace=str(workspace.root)))
+    registry = ToolRegistry(workspace, settings)
+    (workspace.root / "notes.txt").write_text("alpha\nbeta\n")
+    (workspace.root / ".env").write_text("SECRET=value\n")
+    (workspace.root / ".env.example").write_text("SECRET=\n")
+    (workspace.root / "binary.bin").write_bytes(b"\xff\xfe")
+
+    listed = await registry.execute(
+        "run-1", ToolCall(id="list", name="list_files", arguments={})
+    )
+    read = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="read",
+            name="read_file",
+            arguments={"path": "notes.txt", "start_line": 2, "end_line": 2},
+        ),
+    )
+    secret = await registry.execute(
+        "run-1", ToolCall(id="secret", name="read_file", arguments={"path": ".env"})
+    )
+    backwards = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="backwards",
+            name="read_file",
+            arguments={"path": "notes.txt", "start_line": 2, "end_line": 1},
+        ),
+    )
+    monkeypatch.setattr(tools_module.shutil, "which", lambda _name: None)
+    found = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="search", name="search_text", arguments={"query": "beta", "path": "."}
+        ),
+    )
+
+    assert listed.ok and ".env.example" in listed.output and "SECRET=value" not in listed.output
+    assert "2 | beta" in read.output
+    assert not secret.ok and "Secret-bearing" in (secret.error or "")
+    assert not backwards.ok and "must not be before" in (backwards.error or "")
+    assert found.ok and "notes.txt:2:beta" in found.output
+
+
+@pytest.mark.asyncio
+async def test_command_failure_truncation_callback_and_validation(
+    settings: Settings, workspace: Workspace, storage: Storage
+) -> None:
+    storage.create_run(RunRecord(id="run-1", task="Run", workspace=str(workspace.root)))
+    limited = replace(settings, stored_output_limit=24, model_output_limit=16)
+    registry = ToolRegistry(workspace, limited)
+    streamed: list[str] = []
+
+    async def capture(chunk: str) -> None:
+        streamed.append(chunk)
+
+    result = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="large",
+            name="run_command",
+            arguments={"argv": ["python3", "-c", "print('x' * 100); raise SystemExit(3)"]},
+        ),
+        output_callback=capture,
+    )
+    missing = await registry.execute(
+        "run-1",
+        ToolCall(id="missing", name="run_command", arguments={"argv": ["not-a-program"]}),
+    )
+    bad_cwd_file = workspace.root / "file.txt"
+    bad_cwd_file.write_text("file")
+    bad_cwd = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="cwd",
+            name="run_command",
+            arguments={"argv": ["python3", "-V"], "cwd": "file.txt"},
+        ),
+    )
+    too_long = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="long",
+            name="run_command",
+            arguments={"argv": ["python3", "-V"], "timeout_seconds": 601},
+        ),
+    )
+    unknown = await registry.execute(
+        "run-1", ToolCall(id="unknown", name="unknown", arguments={})
+    )
+
+    assert not result.ok and result.metadata["exit_code"] == 3
+    assert result.metadata["truncated"] is True and "truncated" in result.output
+    assert streamed and "x" in "".join(streamed)
+    assert not missing.ok and "Executable not found" in (missing.error or "")
+    assert not bad_cwd.ok and "not a directory" in (bad_cwd.error or "")
+    assert not too_long.ok and "exceeds" in (too_long.error or "")
+    assert not unknown.ok and "Unknown" in (unknown.error or "")
+    await registry.cancel("run-1")
+
+
+@pytest.mark.asyncio
+async def test_patch_can_delete_and_reject_rename(
+    settings: Settings, workspace: Workspace, storage: Storage
+) -> None:
+    storage.create_run(RunRecord(id="run-1", task="Patch", workspace=str(workspace.root)))
+    registry = ToolRegistry(workspace, settings)
+    target = workspace.root / "old.txt"
+    target.write_text("old\n")
+
+    deleted = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="delete",
+            name="apply_patch",
+            arguments={
+                "patch": "--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+            },
+        ),
+    )
+    assert deleted.ok and not target.exists()
+
+    source = workspace.root / "source.txt"
+    source.write_text("value\n")
+    renamed = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="rename",
+            name="apply_patch",
+            arguments={
+                "patch": (
+                    "--- a/source.txt\n+++ b/renamed.txt\n@@ -1 +1 @@\n-value\n+changed\n"
+                )
+            },
+        ),
+    )
+    assert not renamed.ok and "renames" in (renamed.error or "")
+
+
 def test_diff_is_generated_for_modified_file(
     settings: Settings, workspace: Workspace, storage: Storage
 ) -> None:
@@ -114,4 +275,3 @@ def test_diff_is_generated_for_modified_file(
 
     assert "-old" in workspace.diff("run-1")
     assert "+new" in workspace.diff("run-1")
-

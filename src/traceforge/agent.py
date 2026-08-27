@@ -595,8 +595,30 @@ class AgentManager:
             read_calls = [
                 call for call in response.tool_calls if call.name != "submit_verification"
             ]
-            if submit_calls and not read_calls:
-                return VerificationReport.model_validate(submit_calls[0].arguments)
+            if len(submit_calls) == 1 and not read_calls:
+                try:
+                    return VerificationReport.model_validate(submit_calls[0].arguments)
+                except ValidationError as exc:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": submit_calls[0].id,
+                            "name": "submit_verification",
+                            "content": ToolResult(
+                                tool_call_id=submit_calls[0].id,
+                                name="submit_verification",
+                                ok=False,
+                                error=f"Invalid verification report: {exc}",
+                            ).model_dump_json(),
+                        }
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "Correct the report schema and submit one verdict.",
+                        }
+                    )
+                    continue
             for call in read_calls:
                 if call.name not in {"list_files", "read_file", "search_text"}:
                     result = ToolResult(
@@ -615,7 +637,23 @@ class AgentManager:
                         "content": result.model_dump_json(),
                     }
                 )
-            if submit_calls and read_calls:
+            if submit_calls and (read_calls or len(submit_calls) > 1):
+                for call in submit_calls:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "name": call.name,
+                            "content": ToolResult(
+                                tool_call_id=call.id,
+                                name=call.name,
+                                ok=False,
+                                error=(
+                                    "Submit exactly one verdict in a separate turn after reads."
+                                ),
+                            ).model_dump_json(),
+                        }
+                    )
                 messages.append(
                     {
                         "role": "user",
@@ -630,6 +668,9 @@ class AgentManager:
         )
 
     async def _complete(self, run: RunRecord, report: VerificationReport) -> None:
+        if run.plan:
+            for step in run.plan.steps:
+                step.status = "completed"
         self.storage.save_run(run)
         await self._transition(run, RunState.SUCCEEDED)
         await self.broker.emit(
