@@ -7,7 +7,19 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   });
 
   await page.goto("/");
-  await expect(page.getByRole("textbox")).toHaveValue(/multi-tenant cache isolation/);
+  await expect(page.locator("textarea")).toHaveValue(/multi-tenant cache isolation/);
+
+  await page.getByRole("button", { name: "Browse" }).click();
+  await expect(page.getByRole("heading", { name: "Choose a directory" })).toBeVisible();
+  await page.getByRole("button", { name: "Choose this directory" }).click();
+
+  await page.getByRole("button", { name: "Project", exact: true }).click();
+  await page.getByRole("button", { name: "New project" }).click();
+  await page.getByLabel("Project name").fill("Demo workspace");
+  await page.getByRole("button", { name: "Add project" }).click();
+  await expect(page.getByRole("combobox", { name: "Project" })).toHaveValue(/.+/);
+  await page.getByRole("button", { name: "Direct task" }).click();
+
   await page.getByRole("button", { name: "Start run" }).click();
 
   await expect(page.getByRole("heading", { name: /decisions change/ })).toBeVisible();

@@ -1,8 +1,13 @@
 import type {
   AppStatus,
   ClarificationAnswer,
+  DirectoryListing,
+  Project,
+  ProviderConfig,
+  ProviderProbe,
   Run,
   RunEvent,
+  RunTarget,
 } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -29,11 +34,28 @@ export const api = {
   getEvents: (runId: string, afterSeq = 0) =>
     request<RunEvent[]>(`/api/runs/${runId}/events?after_seq=${afterSeq}`),
   getDiff: (runId: string) => request<{ diff: string }>(`/api/runs/${runId}/diff`),
-  createRun: (task: string, verifierEnabled: boolean) =>
+  createRun: (task: string, verifierEnabled: boolean, target: RunTarget) =>
     request<Run>("/api/runs", {
       method: "POST",
-      body: JSON.stringify({ task, verifier_enabled: verifierEnabled }),
+      body: JSON.stringify({ task, verifier_enabled: verifierEnabled, ...target }),
     }),
+  listProjects: () => request<Project[]>("/api/projects"),
+  createProject: (name: string, root: string, createDirectory: boolean) =>
+    request<Project>("/api/projects", {
+      method: "POST",
+      body: JSON.stringify({ name, root, create_directory: createDirectory }),
+    }),
+  listDirectories: (path?: string) =>
+    request<DirectoryListing>(
+      `/api/filesystem/directories${path ? `?path=${encodeURIComponent(path)}` : ""}`,
+    ),
+  getProvider: () => request<ProviderConfig>("/api/provider"),
+  updateProvider: (config: Pick<ProviderConfig, "model" | "base_url" | "credential_file">) =>
+    request<ProviderConfig>("/api/provider", {
+      method: "PUT",
+      body: JSON.stringify(config),
+    }),
+  testProvider: () => request<ProviderProbe>("/api/provider/test", { method: "POST" }),
   answerQuestions: (runId: string, answers: ClarificationAnswer[]) =>
     request<{ accepted: boolean }>(`/api/runs/${runId}/answers`, {
       method: "POST",
@@ -57,4 +79,3 @@ export const api = {
       { method: "POST" },
     ),
 };
-

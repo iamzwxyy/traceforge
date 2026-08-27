@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import { mergeEvents } from "./lib";
-import type { AppStatus, ClarificationAnswer, Run, RunEvent } from "./types";
+import type {
+  AppStatus,
+  ClarificationAnswer,
+  Project,
+  ProviderConfig,
+  ProviderProbe,
+  Run,
+  RunEvent,
+  RunTarget,
+} from "./types";
 
 const refreshEventTypes = new Set([
   "message",
@@ -20,6 +29,8 @@ const refreshEventTypes = new Set([
 export function useTraceForge() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [provider, setProvider] = useState<ProviderConfig | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [run, setRun] = useState<Run | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
@@ -51,9 +62,11 @@ export function useTraceForge() {
   }, [storeRun]);
 
   useEffect(() => {
-    void Promise.all([api.status(), refreshRuns()])
-      .then(([nextStatus, nextRuns]) => {
+    void Promise.all([api.status(), refreshRuns(), api.listProjects(), api.getProvider()])
+      .then(([nextStatus, nextRuns, nextProjects, nextProvider]) => {
         setStatus(nextStatus);
+        setProjects(nextProjects);
+        setProvider(nextProvider);
         if (!selectedRunId && nextRuns.length) setSelectedRunId(nextRuns[0].id);
       })
       .catch((reason: unknown) => setError(String(reason)));
@@ -129,17 +142,66 @@ export function useTraceForge() {
   );
 
   const createRun = useCallback(
-    async (task: string, verifierEnabled: boolean) => {
+    async (task: string, verifierEnabled: boolean, target: RunTarget) => {
       setError(null);
-      const created = await api.createRun(task, verifierEnabled);
-      setRuns((current) => [created, ...current]);
-      setSelectedRunId(created.id);
+      try {
+        const created = await api.createRun(task, verifierEnabled, target);
+        setRuns((current) => [created, ...current]);
+        setSelectedRunId(created.id);
+        setStatus(await api.status());
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+        throw reason;
+      }
     },
     [],
   );
 
+  const createProject = useCallback(
+    async (name: string, root: string, createDirectory: boolean) => {
+      setError(null);
+      try {
+        const created = await api.createProject(name, root, createDirectory);
+        setProjects((current) => [created, ...current]);
+        return created;
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+        throw reason;
+      }
+    },
+    [],
+  );
+
+  const saveProvider = useCallback(
+    async (config: Pick<ProviderConfig, "model" | "base_url" | "credential_file">) => {
+      setError(null);
+      try {
+        const saved = await api.updateProvider(config);
+        setProvider(saved);
+        setStatus(await api.status());
+        return saved;
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+        throw reason;
+      }
+    },
+    [],
+  );
+
+  const testProvider = useCallback(async (): Promise<ProviderProbe> => {
+    setError(null);
+    try {
+      return await api.testProvider();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      throw reason;
+    }
+  }, []);
+
   return {
     status,
+    projects,
+    provider,
     runs,
     run,
     events,
@@ -150,6 +212,10 @@ export function useTraceForge() {
     selectedRunId,
     selectRun: setSelectedRunId,
     createRun,
+    createProject,
+    saveProvider,
+    testProvider,
+    listDirectories: api.listDirectories,
     answerQuestions: (answers: ClarificationAnswer[]) =>
       run && perform(() => api.answerQuestions(run.id, answers)),
     decidePlan: (decision: "approve" | "revise", feedback = "") =>

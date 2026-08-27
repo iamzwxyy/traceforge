@@ -87,6 +87,7 @@ export interface Run {
   id: string;
   task: string;
   workspace: string;
+  project_id: string | null;
   state: RunState;
   verifier_enabled: boolean;
   plan: TaskPlan | null;
@@ -113,6 +114,7 @@ export interface RunEvent {
 export interface AppStatus {
   version: string;
   workspace: string;
+  last_workspace: string;
   model: string;
   base_url: string;
   api_key_configured: boolean;
@@ -122,6 +124,48 @@ export interface AppStatus {
     steps: number;
     repair_cycles: number;
   };
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  root: string;
+  created_at: string;
+  updated_at: string;
+  last_opened_at: string;
+}
+
+export interface ProviderConfig {
+  model: string;
+  base_url: string | null;
+  credential_source: "file" | "environment" | "missing";
+  credential_file: string | null;
+  credential_env: string;
+  api_key_configured: boolean;
+  updated_at: string;
+}
+
+export interface ProviderProbe {
+  ok: boolean;
+  model: string;
+  latency_ms: number;
+  detail: string;
+}
+
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+}
+
+export interface DirectoryListing {
+  current: string;
+  parent: string | null;
+  children: DirectoryEntry[];
+}
+
+export interface RunTarget {
+  project_id?: string;
+  workspace?: string;
 }
 
 export interface ClarificationAnswer {

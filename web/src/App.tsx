@@ -7,6 +7,8 @@ import {
   ClipboardCheck,
   Code2,
   FileDiff,
+  Folder,
+  FolderOpen,
   Gauge,
   GitBranch,
   Hammer,
@@ -19,6 +21,7 @@ import {
   Plus,
   RotateCcw,
   Send,
+  Settings,
   ShieldCheck,
   Sparkles,
   Square,
@@ -28,14 +31,19 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { isActiveState, parseDiff, presentState } from "./lib";
 import type {
   ClarificationAnswer,
+  DirectoryListing,
+  Project,
+  ProviderConfig,
+  ProviderProbe,
   Run,
   RunEvent,
   RunState,
+  RunTarget,
   TaskPlan,
 } from "./types";
 import { useTraceForge } from "./useTraceForge";
@@ -45,6 +53,7 @@ type InspectorTab = "timeline" | "diff" | "checks" | "verifier";
 export default function App() {
   const forge = useTraceForge();
   const [showComposer, setShowComposer] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("timeline");
 
   useEffect(() => {
@@ -58,6 +67,8 @@ export default function App() {
         status={forge.status}
         connected={forge.connected}
         run={forge.run}
+        providerReady={Boolean(forge.provider?.api_key_configured)}
+        onSettings={() => setShowSettings(true)}
       />
       {forge.error && (
         <div className="global-error" role="alert">
@@ -69,6 +80,7 @@ export default function App() {
       <main className="workspace-grid">
         <Sidebar
           runs={forge.runs}
+          projects={forge.projects}
           selectedRunId={forge.selectedRunId}
           onSelect={forge.selectRun}
           onNew={() => setShowComposer(true)}
@@ -78,9 +90,15 @@ export default function App() {
             <TaskComposer
               key={forge.status?.suggested_task ?? "standard"}
               suggestedTask={forge.status?.suggested_task ?? ""}
+              lastWorkspace={forge.status?.last_workspace ?? forge.status?.workspace ?? ""}
+              projects={forge.projects}
+              providerReady={Boolean(forge.provider?.api_key_configured)}
+              onOpenSettings={() => setShowSettings(true)}
+              onListDirectories={forge.listDirectories}
+              onCreateProject={forge.createProject}
               onCancel={() => setShowComposer(false)}
-              onSubmit={async (task, verifier) => {
-                await forge.createRun(task, verifier);
+              onSubmit={async (task, verifier, target) => {
+                await forge.createRun(task, verifier, target);
                 setShowComposer(false);
               }}
               canCancel={Boolean(forge.run)}
@@ -106,6 +124,14 @@ export default function App() {
           onTab={setInspectorTab}
         />
       </main>
+      {showSettings && forge.provider && (
+        <ProviderDialog
+          provider={forge.provider}
+          onClose={() => setShowSettings(false)}
+          onSave={forge.saveProvider}
+          onTest={forge.testProvider}
+        />
+      )}
     </div>
   );
 }
@@ -114,10 +140,14 @@ function Header({
   status,
   connected,
   run,
+  providerReady,
+  onSettings,
 }: {
   status: ReturnType<typeof useTraceForge>["status"];
   connected: boolean;
   run: Run | null;
+  providerReady: boolean;
+  onSettings: () => void;
 }) {
   return (
     <header className="topbar">
@@ -129,9 +159,9 @@ function Header({
         </div>
       </div>
       <div className="topbar-context">
-        <div className="context-item workspace-path" title={status?.workspace}>
+        <div className="context-item workspace-path" title={run?.workspace ?? status?.last_workspace}>
           <GitBranch size={14} />
-          <span>{status?.workspace ?? "Connecting…"}</span>
+          <span>{run?.workspace ?? status?.last_workspace ?? "Connecting…"}</span>
         </div>
         <div className="context-item"><Sparkles size={14} /><span>{status?.model ?? "—"}</span></div>
         {run && <div className="context-item"><Wrench size={14} /><span>{run.step_count} steps</span></div>}
@@ -148,6 +178,15 @@ function Header({
           {!run || connected ? <Wifi size={14} /> : <WifiOff size={14} />}
           {!run ? "Ready" : connected ? "Live" : "Reconnecting"}
         </div>
+        <button
+          className={`icon-button settings-button ${providerReady ? "" : "needs-attention"}`}
+          type="button"
+          onClick={onSettings}
+          title={providerReady ? "Model settings" : "Configure model credentials"}
+          aria-label="Model settings"
+        >
+          <Settings size={16} />
+        </button>
       </div>
     </header>
   );
@@ -155,11 +194,13 @@ function Header({
 
 function Sidebar({
   runs,
+  projects,
   selectedRunId,
   onSelect,
   onNew,
 }: {
   runs: Run[];
+  projects: Project[];
   selectedRunId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
@@ -174,6 +215,7 @@ function Sidebar({
         {runs.length === 0 && <p className="muted empty-copy">No runs yet.</p>}
         {runs.map((run) => {
           const state = presentState(run.state);
+          const project = projects.find((item) => item.id === run.project_id);
           return (
             <button
               type="button"
@@ -187,7 +229,10 @@ function Sidebar({
                 <span className="run-time">{relativeTime(run.updated_at)}</span>
               </div>
               <strong>{run.task}</strong>
-              <span className="run-id">{run.id.slice(0, 8)}</span>
+              <div className="run-item-foot">
+                <span className="run-id">{run.id.slice(0, 8)}</span>
+                <span className="run-scope">{project?.name ?? "Direct"}</span>
+              </div>
             </button>
           );
         })}
@@ -202,18 +247,40 @@ function Sidebar({
 
 function TaskComposer({
   suggestedTask,
+  lastWorkspace,
+  projects,
+  providerReady,
+  onOpenSettings,
+  onListDirectories,
+  onCreateProject,
   onSubmit,
   onCancel,
   canCancel,
 }: {
   suggestedTask: string;
-  onSubmit: (task: string, verifier: boolean) => Promise<void>;
+  lastWorkspace: string;
+  projects: Project[];
+  providerReady: boolean;
+  onOpenSettings: () => void;
+  onListDirectories: (path?: string) => Promise<DirectoryListing>;
+  onCreateProject: (name: string, root: string, createDirectory: boolean) => Promise<Project>;
+  onSubmit: (task: string, verifier: boolean, target: RunTarget) => Promise<void>;
   onCancel: () => void;
   canCancel: boolean;
 }) {
   const [task, setTask] = useState(suggestedTask);
   const [verifier, setVerifier] = useState(true);
+  const [targetMode, setTargetMode] = useState<"direct" | "project">("direct");
+  const [workspace, setWorkspace] = useState(lastWorkspace);
+  const [projectId, setProjectId] = useState(projects[0]?.id ?? "");
+  const [showProject, setShowProject] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  useEffect(() => {
+    if (!workspace && lastWorkspace) setWorkspace(lastWorkspace);
+  }, [lastWorkspace, workspace]);
+  useEffect(() => {
+    if (!projectId && projects.length) setProjectId(projects[0].id);
+  }, [projectId, projects]);
   return (
     <div className="composer-wrap">
       <div className="hero-symbol"><Code2 size={30} /></div>
@@ -227,11 +294,46 @@ function TaskComposer({
         className="task-composer"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!task.trim()) return;
+          if (!task.trim() || (targetMode === "project" && !projectId)) return;
           setSubmitting(true);
-          void onSubmit(task.trim(), verifier).finally(() => setSubmitting(false));
+          const target = targetMode === "project" ? { project_id: projectId } : { workspace };
+          void onSubmit(task.trim(), verifier, target)
+            .catch(() => undefined)
+            .finally(() => setSubmitting(false));
         }}
       >
+        {!providerReady && (
+          <button className="setup-callout" type="button" onClick={onOpenSettings}>
+            <AlertTriangle size={15} />
+            <span><strong>Model setup required</strong><small>Add a credential file and verify native tool calling.</small></span>
+            <ArrowRight size={15} />
+          </button>
+        )}
+        <div className="target-panel">
+          <div className="segmented" aria-label="Run target">
+            <button type="button" className={targetMode === "direct" ? "active" : ""} onClick={() => setTargetMode("direct")}>Direct task</button>
+            <button type="button" className={targetMode === "project" ? "active" : ""} onClick={() => setTargetMode("project")}>Project</button>
+          </div>
+          {targetMode === "direct" ? (
+            <DirectoryField
+              label="Workspace directory"
+              value={workspace}
+              onChange={setWorkspace}
+              onListDirectories={onListDirectories}
+            />
+          ) : (
+            <div className="project-target-row">
+              <label className="field-label">
+                <span>Project</span>
+                <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+                  <option value="" disabled>{projects.length ? "Choose a project" : "No projects yet"}</option>
+                  {projects.map((project) => <option value={project.id} key={project.id}>{project.name} — {project.root}</option>)}
+                </select>
+              </label>
+              <button className="button" type="button" onClick={() => setShowProject(true)}><Plus size={14} /> New project</button>
+            </div>
+          )}
+        </div>
         <textarea
           autoFocus
           value={task}
@@ -247,13 +349,293 @@ function TaskComposer({
           </label>
           <div className="button-row">
             {canCancel && <button className="button ghost" type="button" onClick={onCancel}>Cancel</button>}
-            <button className="button primary" type="submit" disabled={!task.trim() || submitting}>
+            <button
+              className="button primary"
+              type="submit"
+              disabled={!task.trim() || !providerReady || submitting || (targetMode === "project" && !projectId)}
+            >
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={16} />}
               Start run
             </button>
           </div>
         </div>
       </form>
+      {showProject && (
+        <ProjectDialog
+          initialDirectory={workspace || lastWorkspace}
+          onClose={() => setShowProject(false)}
+          onListDirectories={onListDirectories}
+          onCreate={async (name, root, createDirectory) => {
+            const project = await onCreateProject(name, root, createDirectory);
+            setProjectId(project.id);
+            setTargetMode("project");
+            setShowProject(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function DirectoryField({
+  label,
+  value,
+  onChange,
+  onListDirectories,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  onListDirectories: (path?: string) => Promise<DirectoryListing>;
+}) {
+  const [showPicker, setShowPicker] = useState(false);
+  return (
+    <>
+      <label className="field-label directory-field">
+        <span>{label}</span>
+        <div>
+          <input value={value} onChange={(event) => onChange(event.target.value)} />
+          <button className="button" type="button" onClick={() => setShowPicker(true)}>
+            <FolderOpen size={14} /> Browse
+          </button>
+        </div>
+      </label>
+      {showPicker && (
+        <DirectoryDialog
+          initialPath={value}
+          onClose={() => setShowPicker(false)}
+          onChoose={(path) => {
+            onChange(path);
+            setShowPicker(false);
+          }}
+          onListDirectories={onListDirectories}
+        />
+      )}
+    </>
+  );
+}
+
+function DirectoryDialog({
+  initialPath,
+  onClose,
+  onChoose,
+  onListDirectories,
+}: {
+  initialPath?: string;
+  onClose: () => void;
+  onChoose: (path: string) => void;
+  onListDirectories: (path?: string) => Promise<DirectoryListing>;
+}) {
+  const [listing, setListing] = useState<DirectoryListing | null>(null);
+  const [path, setPath] = useState(initialPath ?? "");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback((nextPath?: string) => {
+    setLoading(true);
+    setError(null);
+    void onListDirectories(nextPath || undefined)
+      .then((next) => {
+        setListing(next);
+        setPath(next.current);
+      })
+      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)))
+      .finally(() => setLoading(false));
+  }, [onListDirectories]);
+
+  useEffect(() => load(initialPath), [initialPath, load]);
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="modal directory-modal" role="dialog" aria-modal="true" aria-labelledby="directory-title">
+        <div className="modal-heading">
+          <div><p className="eyebrow">LOCAL WORKSPACE</p><h2 id="directory-title">Choose a directory</h2></div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close directory browser"><X size={17} /></button>
+        </div>
+        <div className="path-entry">
+          <input value={path} onChange={(event) => setPath(event.target.value)} aria-label="Directory path" />
+          <button className="button" type="button" onClick={() => load(path)}>Go</button>
+        </div>
+        {error && <p className="inline-error">{error}</p>}
+        <div className="directory-list">
+          {loading && <div className="thinking-row"><LoaderCircle className="spin" size={15} /> Loading…</div>}
+          {!loading && listing?.parent && (
+            <button type="button" onClick={() => load(listing.parent ?? undefined)}>
+              <FolderOpen size={16} /><span><strong>..</strong><small>{listing.parent}</small></span>
+            </button>
+          )}
+          {!loading && listing?.children.map((entry) => (
+            <button type="button" key={entry.path} onClick={() => load(entry.path)}>
+              <Folder size={16} /><span><strong>{entry.name}</strong><small>{entry.path}</small></span>
+            </button>
+          ))}
+          {!loading && listing && listing.children.length === 0 && <p className="muted empty-copy">No visible subdirectories.</p>}
+        </div>
+        <div className="modal-actions">
+          <span className="selected-path" title={listing?.current}>{listing?.current ?? "Choose a readable directory"}</span>
+          <div className="button-row">
+            <button className="button ghost" type="button" onClick={onClose}>Cancel</button>
+            <button className="button primary" type="button" disabled={!listing} onClick={() => listing && onChoose(listing.current)}>Choose this directory</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ProjectDialog({
+  initialDirectory,
+  onClose,
+  onListDirectories,
+  onCreate,
+}: {
+  initialDirectory: string;
+  onClose: () => void;
+  onListDirectories: (path?: string) => Promise<DirectoryListing>;
+  onCreate: (name: string, root: string, createDirectory: boolean) => Promise<void>;
+}) {
+  const [mode, setMode] = useState<"open" | "create">("open");
+  const [name, setName] = useState("");
+  const [directory, setDirectory] = useState(initialDirectory);
+  const [folderName, setFolderName] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const root = mode === "create"
+    ? `${directory.replace(/\/$/, "")}/${folderName.trim()}`
+    : directory;
+  const valid = Boolean(name.trim() && directory.trim() && (mode === "open" || folderName.trim()));
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="project-title">
+        <div className="modal-heading">
+          <div><p className="eyebrow">PROJECT WORKSPACE</p><h2 id="project-title">Add a project</h2></div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close project dialog"><X size={17} /></button>
+        </div>
+        <div className="segmented wide" aria-label="Project directory mode">
+          <button type="button" className={mode === "open" ? "active" : ""} onClick={() => setMode("open")}>Open existing</button>
+          <button type="button" className={mode === "create" ? "active" : ""} onClick={() => setMode("create")}>Create empty</button>
+        </div>
+        <label className="field-label"><span>Project name</span><input value={name} onChange={(event) => setName(event.target.value)} autoFocus /></label>
+        <DirectoryField
+          label={mode === "create" ? "Parent directory" : "Existing directory"}
+          value={directory}
+          onChange={setDirectory}
+          onListDirectories={onListDirectories}
+        />
+        {mode === "create" && (
+          <label className="field-label"><span>New folder name</span><input value={folderName} onChange={(event) => setFolderName(event.target.value)} placeholder="traceforge-project" /></label>
+        )}
+        <div className="path-preview"><span>Project root</span><code>{root}</code></div>
+        <div className="modal-actions">
+          <span className="muted">Projects group runs; files always stay in the selected local directory.</span>
+          <div className="button-row">
+            <button className="button ghost" type="button" onClick={onClose}>Cancel</button>
+            <button
+              className="button primary"
+              type="button"
+              disabled={!valid || submitting}
+              onClick={() => {
+                setSubmitting(true);
+                void onCreate(name.trim(), root, mode === "create")
+                  .catch(() => undefined)
+                  .finally(() => setSubmitting(false));
+              }}
+            >
+              {submitting ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />} Add project
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ProviderDialog({
+  provider,
+  onClose,
+  onSave,
+  onTest,
+}: {
+  provider: ProviderConfig;
+  onClose: () => void;
+  onSave: (config: Pick<ProviderConfig, "model" | "base_url" | "credential_file">) => Promise<ProviderConfig>;
+  onTest: () => Promise<ProviderProbe>;
+}) {
+  const [model, setModel] = useState(provider.model);
+  const [baseUrl, setBaseUrl] = useState(provider.base_url ?? "");
+  const [credentialFile, setCredentialFile] = useState(provider.credential_file ?? "");
+  const [working, setWorking] = useState<"save" | "test" | null>(null);
+  const [probe, setProbe] = useState<ProviderProbe | null>(null);
+
+  const config = {
+    model: model.trim(),
+    base_url: baseUrl.trim() || null,
+    credential_file: credentialFile.trim() || null,
+  };
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="modal provider-modal" role="dialog" aria-modal="true" aria-labelledby="provider-title">
+        <div className="modal-heading">
+          <div><p className="eyebrow">MODEL PROVIDER</p><h2 id="provider-title">Connection settings</h2></div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close model settings"><X size={17} /></button>
+        </div>
+        <div className={`credential-status ${provider.api_key_configured ? "ready" : "missing"}`}>
+          {provider.api_key_configured ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}
+          <div>
+            <strong>{provider.api_key_configured ? "Credential source ready" : "Credential required"}</strong>
+            <small>{provider.credential_source === "file" ? "Owner-only local file" : provider.credential_source === "environment" ? provider.credential_env : "Add a file path below or set OPENAI_API_KEY"}</small>
+          </div>
+        </div>
+        <label className="field-label"><span>Model</span><input value={model} onChange={(event) => setModel(event.target.value)} /></label>
+        <label className="field-label"><span>OpenAI-compatible base URL</span><input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.deepseek.com" /></label>
+        <label className="field-label">
+          <span>Credential file path</span>
+          <input value={credentialFile} onChange={(event) => setCredentialFile(event.target.value)} placeholder="/absolute/path/to/owner-only-key-file" />
+          <small>The file must contain one line and use owner-only permissions (chmod 600). Its content is never saved or returned.</small>
+        </label>
+        {probe && (
+          <div className={`probe-result ${probe.ok ? "ready" : "failed"}`} role="status">
+            {probe.ok ? <CheckCircle2 size={16} /> : <OctagonX size={16} />}
+            <span><strong>{probe.ok ? "Native tool calling verified" : "Connection check failed"}</strong><small>{probe.detail} · {probe.latency_ms} ms</small></span>
+          </div>
+        )}
+        <div className="modal-actions">
+          <span className="muted">Settings can only change when no run is active or interrupted.</span>
+          <div className="button-row">
+            <button
+              className="button"
+              type="button"
+              disabled={!config.model || Boolean(working)}
+              onClick={() => {
+                setWorking("test");
+                setProbe(null);
+                void onSave(config)
+                  .then(() => onTest())
+                  .then(setProbe)
+                  .catch(() => undefined)
+                  .finally(() => setWorking(null));
+              }}
+            >
+              {working === "test" ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />} Test connection
+            </button>
+            <button
+              className="button primary"
+              type="button"
+              disabled={!config.model || Boolean(working)}
+              onClick={() => {
+                setWorking("save");
+                void onSave(config)
+                  .then(() => onClose())
+                  .catch(() => undefined)
+                  .finally(() => setWorking(null));
+              }}
+            >
+              {working === "save" ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />} Save settings
+            </button>
+          </div>
+        </div>
+      </section>
     </div>
   );
 }
