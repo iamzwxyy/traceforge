@@ -10,8 +10,10 @@ from traceforge.config import Settings
 from traceforge.models import (
     ClarificationAnswer,
     EventType,
+    PlanGate,
     RunRecord,
     RunState,
+    TaskPlan,
     ToolCall,
     Verdict,
 )
@@ -137,7 +139,7 @@ async def test_full_clarify_build_verify_flow(
 
     completed = await manager.wait(run.id)
 
-    assert completed.state is RunState.SUCCEEDED
+    assert completed.state is RunState.SUCCEEDED, completed.error
     assert completed.verification is not None
     assert completed.verification.verdict is Verdict.PASS
     assert (settings.workspace / "result.txt").read_text() == "hello\n"
@@ -145,6 +147,112 @@ async def test_full_clarify_build_verify_flow(
     assert EventType.CLARIFICATION_REQUESTED in event_types
     assert EventType.DIFF_UPDATED in event_types
     assert EventType.VERIFICATION_COMPLETED in event_types
+
+
+@pytest.mark.asyncio
+async def test_low_risk_single_file_plan_is_auto_approved_but_stays_visible(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments={
+                            "summary": "Create one note",
+                            "steps": [{"id": "create", "title": "Create the note"}],
+                            "acceptance_checks": [
+                                {"id": "review", "label": "The note is correct"}
+                            ],
+                            "impacted_files": ["note.txt"],
+                        },
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="create",
+                        name="create_file",
+                        arguments={"path": "note.txt", "content": "ready\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Created note", "evidence": ["diff"]},
+                    )
+                ]
+            ),
+            _verification("pass", "The single-file change satisfies the task."),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Create note.txt")
+
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert completed.plan is not None
+    assert completed.plan_gate is not None
+    assert completed.plan_gate.decision == "auto_approved"
+    state_events = [
+        event.payload["state"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.STATE_CHANGED
+    ]
+    assert RunState.AWAITING_PLAN_APPROVAL.value not in state_events
+    assert EventType.PLAN_GATED in [event.type for event in storage.get_events(run.id)]
+
+
+@pytest.mark.asyncio
+async def test_fast_path_scope_drift_requires_action_approval(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments={
+                            "summary": "Create one allowed file",
+                            "steps": [{"id": "create", "title": "Create the file"}],
+                            "acceptance_checks": [
+                                {"id": "review", "label": "The file is correct"}
+                            ],
+                            "impacted_files": ["allowed.txt"],
+                        },
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="drift",
+                        name="create_file",
+                        arguments={"path": "outside-plan.txt", "content": "drift\n"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Create allowed.txt")
+
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.pending_approval is not None
+    assert "exceeds the visible plan scope" in waiting.pending_approval.reason
+    assert not (settings.workspace / "outside-plan.txt").exists()
+    await manager.cancel(run.id)
 
 
 @pytest.mark.asyncio
@@ -541,6 +649,63 @@ async def test_shutdown_resume_plan_then_rollback(
     rollback = await second.rollback(run.id)
     assert rollback.conflicts == []
     assert storage.get_run(run.id).state is RunState.ROLLED_BACK
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_persisted_fast_path_decision(
+    settings: Settings, storage: Storage
+) -> None:
+    plan = TaskPlan.model_validate(
+        {
+            "summary": "Record one low-risk note",
+            "steps": [{"id": "note", "title": "Record the note"}],
+            "acceptance_checks": [{"id": "review", "label": "Review the note"}],
+            "impacted_files": ["note.txt"],
+        }
+    )
+    run = RunRecord(
+        id="resume-fast-path",
+        task="Record note.txt",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.PLANNING,
+        verifier_enabled=False,
+        plan=plan,
+        plan_gate=PlanGate(
+            decision="auto_approved",
+            risk="low",
+            reasons=["Explicit single-file scope"],
+        ),
+    )
+    storage.create_run(run)
+    manager = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish",
+                            name="finish",
+                            arguments={"summary": "Resumed", "evidence": ["plan"]},
+                        )
+                    ]
+                )
+            ]
+        ),
+    )
+
+    await manager.resume(run.id)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    state_events = [
+        event.payload["state"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.STATE_CHANGED
+    ]
+    assert RunState.AWAITING_PLAN_APPROVAL.value not in state_events
 
 
 @pytest.mark.asyncio

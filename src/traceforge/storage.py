@@ -14,6 +14,7 @@ from traceforge.models import (
     ApprovalRequest,
     ClarificationRequest,
     EventType,
+    PlanGate,
     ProjectRecord,
     ProviderConfig,
     RunEvent,
@@ -68,6 +69,7 @@ class Storage:
                     clarification_json TEXT,
                     pending_approval_json TEXT,
                     verification_json TEXT,
+                    plan_gate_json TEXT,
                     messages_json TEXT NOT NULL DEFAULT '[]',
                     plan_approved INTEGER NOT NULL DEFAULT 0,
                     interrupted_from TEXT,
@@ -134,6 +136,7 @@ class Storage:
                 "plan_approved": "INTEGER NOT NULL DEFAULT 0",
                 "interrupted_from": "TEXT",
                 "project_id": "TEXT",
+                "plan_gate_json": "TEXT",
             }
             for column, declaration in migrations.items():
                 if column not in columns:
@@ -199,9 +202,9 @@ class Storage:
                 INSERT INTO runs (
                     id, task, workspace, project_id, state, verifier_enabled, plan_json,
                     clarification_json, pending_approval_json, verification_json,
-                    messages_json, plan_approved, interrupted_from, step_count,
-                    repair_cycles, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    plan_gate_json, messages_json, plan_approved, interrupted_from,
+                    step_count, repair_cycles, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._run_values(run),
             )
@@ -215,9 +218,9 @@ class Storage:
                 UPDATE runs SET
                     task = ?, workspace = ?, project_id = ?, state = ?, verifier_enabled = ?,
                     plan_json = ?, clarification_json = ?, pending_approval_json = ?,
-                    verification_json = ?, messages_json = ?, plan_approved = ?,
-                    interrupted_from = ?, step_count = ?, repair_cycles = ?,
-                    error = ?, created_at = ?, updated_at = ?
+                    verification_json = ?, plan_gate_json = ?, messages_json = ?,
+                    plan_approved = ?, interrupted_from = ?, step_count = ?,
+                    repair_cycles = ?, error = ?, created_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (*values[1:], values[0]),
@@ -482,6 +485,7 @@ class Storage:
             _dump_model(run.clarification),
             _dump_model(run.pending_approval),
             _dump_model(run.verification),
+            _dump_model(run.plan_gate),
             json.dumps(run.messages, ensure_ascii=False),
             int(run.plan_approved),
             run.interrupted_from.value if run.interrupted_from else None,
@@ -505,6 +509,7 @@ class Storage:
             clarification=_load_model(ClarificationRequest, row["clarification_json"]),
             pending_approval=_load_model(ApprovalRequest, row["pending_approval_json"]),
             verification=_load_model(VerificationReport, row["verification_json"]),
+            plan_gate=_load_model(PlanGate, row["plan_gate_json"]),
             messages=json.loads(row["messages_json"]),
             plan_approved=bool(row["plan_approved"]),
             interrupted_from=(

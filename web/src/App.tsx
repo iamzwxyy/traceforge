@@ -6,7 +6,9 @@ import {
   Circle,
   ClipboardCheck,
   Code2,
+  Download,
   FileDiff,
+  Fingerprint,
   Folder,
   FolderOpen,
   Gauge,
@@ -30,6 +32,7 @@ import {
   WifiOff,
   Wrench,
   X,
+  Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -37,7 +40,9 @@ import { isActiveState, parseDiff, presentState } from "./lib";
 import type {
   ClarificationAnswer,
   DirectoryListing,
+  PlanGate,
   Project,
+  ProofPack,
   ProviderConfig,
   ProviderProbe,
   Run,
@@ -54,12 +59,15 @@ export default function App() {
   const forge = useTraceForge();
   const [showComposer, setShowComposer] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showProof, setShowProof] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("timeline");
 
   useEffect(() => {
     if (forge.run?.state === "verifying") setInspectorTab("verifier");
     if (forge.run?.state === "succeeded") setInspectorTab("checks");
   }, [forge.run?.state]);
+
+  useEffect(() => setShowProof(false), [forge.run?.id]);
 
   return (
     <div className="app-shell">
@@ -113,6 +121,10 @@ export default function App() {
               onCancel={() => void forge.cancel()}
               onResume={() => void forge.resume()}
               onRollback={() => void forge.rollback()}
+              onProof={() => {
+                setShowProof(true);
+                void forge.loadProofPack(forge.run!.id);
+              }}
             />
           )}
         </section>
@@ -130,6 +142,13 @@ export default function App() {
           onClose={() => setShowSettings(false)}
           onSave={forge.saveProvider}
           onTest={forge.testProvider}
+        />
+      )}
+      {showProof && forge.run && (
+        <ProofPackDialog
+          pack={forge.proofPack}
+          runId={forge.run.id}
+          onClose={() => setShowProof(false)}
         />
       )}
     </div>
@@ -649,6 +668,7 @@ function RunStage({
   onCancel,
   onResume,
   onRollback,
+  onProof,
 }: {
   run: Run;
   events: RunEvent[];
@@ -658,6 +678,7 @@ function RunStage({
   onCancel: () => void;
   onResume: () => void;
   onRollback: () => void;
+  onProof: () => void;
 }) {
   const state = presentState(run.state);
   return (
@@ -666,6 +687,7 @@ function RunStage({
         <div>
           <div className="run-header-meta">
             <StateBadge state={run.state} />
+            {run.plan_gate && <PlanGateBadge gate={run.plan_gate} />}
             <span>RUN {run.id.slice(0, 8).toUpperCase()}</span>
           </div>
           <h2>{run.task}</h2>
@@ -698,7 +720,7 @@ function RunStage({
           <ClarificationPanel request={run.clarification} onSubmit={onAnswer} />
         )}
         {run.state === "awaiting_plan_approval" && run.plan && (
-          <PlanPanel plan={run.plan} onDecision={onPlan} />
+          <PlanPanel plan={run.plan} gate={run.plan_gate} onDecision={onPlan} />
         )}
         {run.state === "awaiting_action_approval" && run.pending_approval && (
           <ApprovalPanel approval={run.pending_approval} onDecision={onAction} />
@@ -709,7 +731,7 @@ function RunStage({
           </Notice>
         )}
         {run.error && <Notice icon={<OctagonX size={18} />} title="Run stopped" danger>{run.error}</Notice>}
-        {run.state === "succeeded" && <EvidenceBoard run={run} />}
+        {run.state === "succeeded" && <EvidenceBoard run={run} onProof={onProof} />}
       </div>
     </div>
   );
@@ -812,13 +834,15 @@ function ClarificationPanel({ request, onSubmit }: { request: NonNullable<Run["c
   );
 }
 
-function PlanPanel({ plan, onDecision }: { plan: TaskPlan; onDecision: (decision: "approve" | "revise", feedback?: string) => void }) {
+function PlanPanel({ plan, gate, onDecision }: { plan: TaskPlan; gate: PlanGate | null; onDecision: (decision: "approve" | "revise", feedback?: string) => void }) {
   const [revising, setRevising] = useState(false);
   const [feedback, setFeedback] = useState("");
   return (
     <div className="decision-panel plan-panel">
       <div className="decision-heading"><ClipboardCheck size={19} /><div><p>PLAN REVIEW</p><h3>{plan.summary}</h3></div></div>
+      {gate && <PlanGateSummary gate={gate} />}
       <ol className="plan-steps">{plan.steps.map((step) => <li key={step.id}><span>{step.id}</span><div><strong>{step.title}</strong>{step.description && <small>{step.description}</small>}</div></li>)}</ol>
+      {plan.impacted_files.length > 0 && <div className="impact-files"><span>PLANNED FILES</span>{plan.impacted_files.map((path) => <code key={path}>{path}</code>)}</div>}
       <div className="plan-checks"><p>Completion contract</p>{plan.acceptance_checks.map((check) => <div key={check.id}><ShieldCheck size={14} /><span>{check.label}</span>{check.command && <code>{check.command.join(" ")}</code>}</div>)}</div>
       {plan.risks.length > 0 && <div className="risk-strip"><AlertTriangle size={15} /><span>{plan.risks.join(" · ")}</span></div>}
       {revising && <textarea className="revision-input" autoFocus placeholder="What should change in this plan?" value={feedback} onChange={(event) => setFeedback(event.target.value)} />}
@@ -838,12 +862,12 @@ function ApprovalPanel({ approval, onDecision }: { approval: NonNullable<Run["pe
   );
 }
 
-function EvidenceBoard({ run }: { run: Run }) {
+function EvidenceBoard({ run, onProof }: { run: Run; onProof: () => void }) {
   return (
     <div className="evidence-board">
       <div className="evidence-seal"><CheckCircle2 size={24} /></div>
       <div><p className="eyebrow">COMPLETION EVIDENCE</p><h3>Work proven, not merely reported</h3><p>{run.verification?.summary}</p></div>
-      <div className="evidence-stats"><div><strong>{run.plan?.acceptance_checks.filter((check) => check.status === "passed").length ?? 0}</strong><span>checks passed</span></div><div><strong>{run.step_count}</strong><span>tool steps</span></div><div><strong>{run.repair_cycles}</strong><span>repair cycles</span></div></div>
+      <div className="evidence-actions"><div className="evidence-stats"><div><strong>{run.plan?.acceptance_checks.filter((check) => check.status === "passed").length ?? 0}</strong><span>checks passed</span></div><div><strong>{run.step_count}</strong><span>tool steps</span></div><div><strong>{run.repair_cycles}</strong><span>repair cycles</span></div></div><button className="button" type="button" onClick={onProof}><Fingerprint size={14} /> Proof Pack</button></div>
     </div>
   );
 }
@@ -852,7 +876,7 @@ function Inspector({ run, events, diff, tab, onTab }: { run: Run | null; events:
   const tabs: Array<{ id: InspectorTab; label: string; icon: typeof History }> = [
     { id: "timeline", label: "Timeline", icon: History },
     { id: "diff", label: "Diff", icon: FileDiff },
-    { id: "checks", label: "Checks", icon: ClipboardCheck },
+    { id: "checks", label: "Plan", icon: ClipboardCheck },
     { id: "verifier", label: "Verifier", icon: ShieldCheck },
   ];
   return (
@@ -881,7 +905,33 @@ function DiffView({ diff }: { diff: string }) {
 
 function ChecksView({ run }: { run: Run }) {
   if (!run.plan) return <div className="inspector-empty"><ClipboardCheck size={26} /><p>Checks appear after planning.</p></div>;
-  return <div className="checks-view"><div className="section-kicker">ACCEPTANCE CONTRACT</div>{run.plan.acceptance_checks.map((check) => <article className={`check-row ${check.status}`} key={check.id}><div className="check-icon">{check.status === "passed" ? <Check size={14} /> : check.status === "failed" ? <X size={14} /> : <Circle size={10} />}</div><div><strong>{check.label}</strong>{check.command && <code>{check.command.join(" ")}</code>}{check.evidence && <pre>{check.evidence}</pre>}</div><span>{check.status}</span></article>)}</div>;
+  return <div className="checks-view">{run.plan_gate && <PlanGateSummary gate={run.plan_gate} />}<div className="section-kicker">VISIBLE PLAN</div><ol className="plan-steps inspector-plan">{run.plan.steps.map((step) => <li key={step.id}><span>{step.status === "completed" ? <Check size={11} /> : step.id}</span><div><strong>{step.title}</strong>{step.description && <small>{step.description}</small>}</div></li>)}</ol>{run.plan.impacted_files.length > 0 && <div className="impact-files"><span>PLANNED FILES</span>{run.plan.impacted_files.map((path) => <code key={path}>{path}</code>)}</div>}<div className="section-kicker contract-kicker">ACCEPTANCE CONTRACT</div>{run.plan.acceptance_checks.map((check) => <article className={`check-row ${check.status}`} key={check.id}><div className="check-icon">{check.status === "passed" ? <Check size={14} /> : check.status === "failed" ? <X size={14} /> : <Circle size={10} />}</div><div><strong>{check.label}</strong>{check.command && <code>{check.command.join(" ")}</code>}{check.evidence && <pre>{check.evidence}</pre>}</div><span>{check.status}</span></article>)}</div>;
+}
+
+function PlanGateBadge({ gate }: { gate: PlanGate }) {
+  return <span className={`plan-gate-badge ${gate.decision === "auto_approved" ? "fast" : "reviewed"}`}>{gate.decision === "auto_approved" ? <Zap size={10} /> : <ShieldCheck size={10} />}{gate.decision === "auto_approved" ? "Fast path" : `${gate.risk} risk`}</span>;
+}
+
+function PlanGateSummary({ gate }: { gate: PlanGate }) {
+  return <div className={`plan-gate-summary ${gate.decision === "auto_approved" ? "fast" : "review"}`}><div>{gate.decision === "auto_approved" ? <Zap size={15} /> : <ShieldCheck size={15} />}<span><strong>{gate.decision === "auto_approved" ? "Low-risk fast path" : "Plan approval required"}</strong><small>Deterministic assessment · {gate.risk} risk</small></span></div><ul>{gate.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></div>;
+}
+
+function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; runId: string; onClose: () => void }) {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="modal proof-modal" role="dialog" aria-modal="true" aria-labelledby="proof-title">
+        <div className="modal-heading"><div><p className="eyebrow">AUDITABLE COMPLETION</p><h2 id="proof-title">Proof Pack</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close proof pack"><X size={17} /></button></div>
+        {!pack ? <div className="proof-loading"><LoaderCircle className="spin" size={18} /> Assembling persisted evidence…</div> : <>
+          <div className={`proof-verdict ${pack.proof_status}`}><div className="evidence-seal"><Fingerprint size={22} /></div><div><span>PROOF STATUS</span><strong>{pack.proof_status.replaceAll("_", " ")}</strong><small>{pack.verification?.summary ?? "Evidence is still being assembled."}</small></div><div><span>FRESH CHECKS</span><strong>{pack.checks_fresh ? "YES" : "NO"}</strong></div></div>
+          <div className="proof-grid"><article><span>PLAN GATE</span><strong>{pack.plan_gate?.decision.replaceAll("_", " ") ?? "not assessed"}</strong><small>{pack.plan_gate?.reasons.join(" · ")}</small></article><article><span>CHANGE SCOPE</span><strong>{pack.changed_files.length} file{pack.changed_files.length === 1 ? "" : "s"}</strong><small>{pack.changed_files.join(" · ") || "No snapshots"} · {pack.diff_source.replaceAll("_", " ")}</small></article><article><span>ROLLBACK</span><strong>{pack.rollback.status}</strong><small>{pack.rollback.conflicts.length ? `${pack.rollback.conflicts.length} conflicts preserved` : "Conflict-aware"}</small></article><article><span>EVENT LEDGER</span><strong>{pack.event_count} events</strong><small>{pack.step_count} tool steps · {pack.repair_cycles} repairs</small></article></div>
+          <div className="proof-section"><div className="section-kicker">REQUEST</div><p>{pack.task}</p></div>
+          <div className="proof-section"><div className="section-kicker">ACCEPTANCE EVIDENCE</div>{pack.plan?.acceptance_checks.map((check) => <div className="proof-check" key={check.id}><CheckCircle2 size={14} /><span><strong>{check.label}</strong><small>{check.evidence || check.command?.join(" ") || "Awaiting evidence"}</small></span><em>{check.status}</em></div>) ?? <p className="muted">No completion contract yet.</p>}</div>
+          <div className="digest-card"><Fingerprint size={15} /><span><small>STABLE EVIDENCE SHA-256</small><code>{pack.evidence_sha256}</code></span></div>
+        </>}
+        <div className="modal-actions"><span className="muted">The digest covers persisted plan, diff, checks, verdict, rollback state, and event ledger.</span><div className="button-row"><button className="button ghost" type="button" onClick={onClose}>Close</button><a className={`button primary ${pack ? "" : "disabled"}`} href={pack ? `/api/runs/${runId}/proof-pack.md` : undefined} download><Download size={14} /> Download Markdown</a></div></div>
+      </section>
+    </div>
+  );
 }
 
 function VerifierView({ run }: { run: Run }) {
@@ -921,6 +971,11 @@ function eventSummary(event: RunEvent): string {
     return call?.name ?? "Tool result";
   }
   if (event.type === "plan.updated") return "Completion contract updated";
+  if (event.type === "plan.gated") {
+    const decision = String(event.payload.decision ?? "assessed").replaceAll("_", " ");
+    const risk = String(event.payload.risk ?? "unknown");
+    return `${decision} · ${risk} risk`;
+  }
   if (event.type === "diff.updated") return "Workspace diff changed";
   return "Evidence recorded";
 }

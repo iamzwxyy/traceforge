@@ -15,6 +15,7 @@ flowchart TB
     API --> Runtime[AgentRuntime workspace router]
     Runtime --> Manager[AgentManager per active workspace]
     Manager --> Provider[ModelProvider]
+    Manager --> Gate[Deterministic plan gate]
     Manager --> Tools[ToolRegistry]
     Manager --> Context[ContextManager]
     Tools --> Guard[Workspace guard + snapshots]
@@ -22,6 +23,7 @@ flowchart TB
     Manager --> Broker[EventBroker]
     Broker --> DB[(SQLite WAL)]
     Guard --> DB
+    DB --> Proof[Proof Pack projection]
 ```
 
 - `ModelProvider` only translates OpenAI-compatible tool calls. It does not own the loop.
@@ -29,6 +31,8 @@ flowchart TB
   allowing independent workspaces to progress concurrently without overlapping writers.
 - `AgentManager` is the product core: phases, approvals, retries, evidence freshness, repair
   cycles, cancellation, resume, and completion.
+- `assess_plan_gate` is a deterministic policy projection over the task and structured plan; the
+  model cannot label its own work low-risk.
 - `ToolRegistry` defines and executes the bounded local capability surface.
 - `Workspace` resolves paths, records the first pre-change snapshot, creates diffs, and rolls back.
 - `EventBroker` persists an event before publishing it, so reconnecting clients cannot miss a
@@ -44,6 +48,7 @@ stateDiagram-v2
     planning --> awaiting_clarification
     awaiting_clarification --> planning
     planning --> awaiting_plan_approval
+    planning --> executing: deterministic low-risk fast path
     awaiting_plan_approval --> planning: revise
     awaiting_plan_approval --> executing: approve
     executing --> awaiting_action_approval: unknown action
@@ -60,6 +65,7 @@ stateDiagram-v2
     executing --> interrupted: process exit
     interrupted --> planning: resume before plan
     interrupted --> awaiting_plan_approval: resume at plan
+    interrupted --> executing: resume persisted fast path
     interrupted --> executing: resume approved work
     succeeded --> rolled_back
     failed --> rolled_back
@@ -78,8 +84,15 @@ result before the model is called again, preserving the provider protocol.
 
 The planner can only list, read, and search. Material ambiguity is represented as structured
 questions: at most three per round, two to four options per question, and at most two rounds. A
-validated `TaskPlan` contains steps, acceptance checks, optional argv commands, and risks. The
-user must approve it before mutation.
+validated `TaskPlan` contains steps, an explicit relative file scope, acceptance checks, optional
+argv commands, and risks.
+
+After validation, application code grades the plan. Automatic approval requires exactly one
+declared file, at most two steps and checks, no clarification or explicit risk, no sensitive-area
+keywords, and only recognized local verification commands. Every other plan enters the visible
+approval state. The decision and reasons are persisted as a `PlanGate`; a restart preserves an
+already-recorded fast-path decision. Any later file mutation outside `impacted_files` is a separate
+action approval, so automatic plan approval does not silently broaden the scope.
 
 ### Building
 
@@ -114,6 +127,20 @@ Tool output has two limits: at most 1 MiB is persisted and at most 16 KiB (head 
 back to the model. The complete public status still includes exit code, timeout, truncation, argv,
 and working directory metadata.
 
+## Proof Pack projection
+
+`GET /api/runs/{id}/proof-pack` assembles a versioned evidence projection from the run, snapshots,
+and sequenced events. For completed work it prefers the diff stored in the completion event; for
+earlier terminal states it uses the last persisted diff event, falling back to the live workspace
+only when no persisted diff exists. Later user edits therefore do not rewrite a successful run's
+historical delivery evidence.
+
+The projection includes the visible plan and gate, touched paths, final diff, fresh check results,
+independent verdict, rollback outcome, counts, and two SHA-256 values: one for the event sequence
+and one for the assembled evidence. The Markdown route renders the same projection as a download.
+These hashes detect accidental or post-export changes; they are not signatures or a defense
+against a local user deliberately rewriting both SQLite and the artifact.
+
 ## Context management
 
 TraceForge estimates tokens deterministically from serialized UTF-8 bytes. At 70% of the configured
@@ -125,8 +152,8 @@ hidden reasoning is neither requested nor displayed.
 
 SQLite uses WAL mode and six tables:
 
-- `runs`: public state, optional project association, internal messages, plan approval, and
-  interrupted origin;
+- `runs`: public state, optional project association, internal messages, plan and deterministic
+  gate, approval state, and interrupted origin;
 - `events`: per-run monotonically increasing sequence and JSON payload;
 - `snapshots`: original bytes, mode, original hash, and last agent-written hash per path.
 - `projects`: reusable display names and canonical local root directories;
@@ -155,9 +182,10 @@ post-agent user change.
 
 The same-origin service defaults to `127.0.0.1`. REST manages direct-task directories, projects,
 provider references, connection probes, and run controls; it returns current state/diff/events and
-resolves plan or action decisions. WebSocket pushes the persisted event stream. Origins are
-restricted to localhost, and responses include CSP, frame denial, referrer, and MIME-sniffing
-headers. The React production build is part of the Python wheel.
+resolves plan or action decisions. JSON and Markdown Proof Pack routes expose the evidence
+projection. WebSocket pushes the persisted event stream. Origins are restricted to localhost, and
+responses include CSP, frame denial, referrer, and MIME-sniffing headers. The React production
+build is part of the Python wheel.
 
 ## Why one agent loop
 

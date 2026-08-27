@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -55,6 +56,7 @@ class EventType(StrEnum):
     CLARIFICATION_REQUESTED = "clarification.requested"
     CLARIFICATION_ANSWERED = "clarification.answered"
     PLAN_UPDATED = "plan.updated"
+    PLAN_GATED = "plan.gated"
     TOOL_REQUESTED = "tool.requested"
     TOOL_STARTED = "tool.started"
     TOOL_OUTPUT = "tool.output"
@@ -139,7 +141,36 @@ class TaskPlan(BaseModel):
     summary: str = Field(min_length=1, max_length=2_000)
     steps: list[PlanStep] = Field(min_length=1, max_length=12)
     acceptance_checks: list[AcceptanceCheck] = Field(min_length=1, max_length=12)
+    impacted_files: list[str] = Field(default_factory=list, max_length=24)
     risks: list[str] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> TaskPlan:
+        normalized: list[str] = []
+        for raw in self.impacted_files:
+            path = PurePosixPath(raw.strip())
+            if (
+                not raw.strip()
+                or path.is_absolute()
+                or path.as_posix() == "."
+                or ".." in path.parts
+                or ".git" in path.parts
+            ):
+                raise ValueError(f"Impacted file must be a safe relative path: {raw}")
+            normalized.append(path.as_posix())
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("Impacted files must be unique")
+        self.impacted_files = normalized
+        return self
+
+
+class PlanGate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["auto_approved", "approval_required"]
+    risk: Literal["low", "medium", "high"]
+    reasons: list[str] = Field(min_length=1, max_length=12)
+    assessed_at: datetime = Field(default_factory=utc_now)
 
 
 class ToolCall(BaseModel):
@@ -219,6 +250,45 @@ class ProviderConfig(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class ProofRollback(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["available", "completed", "not_available"]
+    conflict_aware: bool = True
+    restored: list[str] = Field(default_factory=list)
+    removed: list[str] = Field(default_factory=list)
+    conflicts: list[str] = Field(default_factory=list)
+
+
+class ProofPack(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["traceforge.proof-pack.v1"] = "traceforge.proof-pack.v1"
+    generated_at: datetime = Field(default_factory=utc_now)
+    run_id: str
+    task: str
+    workspace: str
+    project_id: str | None = None
+    state: RunState
+    proof_status: Literal["in_progress", "proven", "checks_only", "not_proven"]
+    plan: TaskPlan | None = None
+    plan_gate: PlanGate | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    diff: str = ""
+    diff_source: Literal["completion_event", "diff_event", "live_workspace"]
+    diff_sha256: str
+    checks_fresh: bool
+    verification: VerificationReport | None = None
+    rollback: ProofRollback
+    event_count: int = Field(ge=0)
+    event_chain_sha256: str
+    step_count: int = Field(ge=0)
+    repair_cycles: int = Field(ge=0)
+    created_at: datetime
+    updated_at: datetime
+    evidence_sha256: str
+
+
 class RunRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -232,6 +302,7 @@ class RunRecord(BaseModel):
     clarification: ClarificationRequest | None = None
     pending_approval: ApprovalRequest | None = None
     verification: VerificationReport | None = None
+    plan_gate: PlanGate | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
     plan_approved: bool = False
     interrupted_from: RunState | None = None

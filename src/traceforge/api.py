@@ -19,7 +19,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -32,7 +32,9 @@ from traceforge.models import (
     ApprovalRequest,
     ClarificationAnswer,
     ClarificationRequest,
+    PlanGate,
     ProjectRecord,
+    ProofPack,
     ProviderConfig,
     RunEvent,
     RunRecord,
@@ -40,6 +42,7 @@ from traceforge.models import (
     TaskPlan,
     VerificationReport,
 )
+from traceforge.proof import build_proof_pack, proof_pack_markdown
 from traceforge.provider import ModelProvider
 from traceforge.runtime import AgentRuntime, resolve_workspace
 from traceforge.storage import Storage
@@ -114,6 +117,7 @@ class RunView(BaseModel):
     clarification: ClarificationRequest | None
     pending_approval: ApprovalRequest | None
     verification: VerificationReport | None
+    plan_gate: PlanGate | None
     step_count: int
     repair_cycles: int
     context_tokens: int
@@ -322,6 +326,23 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     async def get_diff(run_id: str) -> dict[str, str]:
         run = storage.get_run(run_id)
         return {"diff": Workspace(Path(run.workspace), storage).diff(run_id)}
+
+    @app.get("/api/runs/{run_id}/proof-pack", response_model=ProofPack)
+    async def get_proof_pack(run_id: str) -> ProofPack:
+        return build_proof_pack(storage.get_run(run_id), storage)
+
+    @app.get("/api/runs/{run_id}/proof-pack.md", response_class=PlainTextResponse)
+    async def download_proof_pack(run_id: str) -> PlainTextResponse:
+        pack = build_proof_pack(storage.get_run(run_id), storage)
+        return PlainTextResponse(
+            proof_pack_markdown(pack),
+            media_type="text/markdown; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="traceforge-{run_id[:8]}-proof-pack.md"'
+                )
+            },
+        )
 
     @app.post("/api/runs/{run_id}/answers", status_code=status.HTTP_202_ACCEPTED)
     async def answer_questions(

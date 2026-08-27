@@ -10,7 +10,9 @@ that can be discovered from the workspace. Do not ask cosmetic or low-impact que
 
 After enough context is available, call submit_plan exactly once. Every plan must include at
 least one acceptance check. Use argv arrays for executable checks; do not use shell strings.
-Keep the plan concrete enough to approve but do not make code changes during planning.
+List every file the builder is expected to create, update, or delete in impacted_files. An empty
+list means the mutation scope is unknown and will require review. Keep the plan concrete enough
+to approve but do not make code changes during planning.
 """
 
 

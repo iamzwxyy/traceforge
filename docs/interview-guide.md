@@ -5,20 +5,21 @@
 TraceForge is a local coding agent built without an agent framework. The model can propose tool
 calls, but the application owns every consequential decision: a state machine, structured
 clarification, plan approval, path and command policy, subprocess lifecycle, evidence freshness,
-persistence, recovery, rollback, and independent verification. The visual workbench exposes the
-same persisted event stream used for recovery, so the demo is not a decorative chat replay. The
-project's deliberate tradeoff is one reliable writer plus one read-only verifier instead of many
-parallel agents.
+persistence, recovery, rollback, and independent verification. Simple, explicitly scoped work can
+take a deterministic low-risk fast path; complex work still requires approval. The visual
+workbench exposes the same persisted evidence used for recovery and a downloadable Proof Pack, so
+the demo is not a decorative chat replay. The project's deliberate tradeoff is one reliable writer
+plus one read-only verifier instead of many parallel agents.
 
 ## Two-minute video outline
 
 | Time | Screen | Narration point |
 | --- | --- | --- |
 | 0:00-0:10 | Empty workbench and prefilled task | “A real multi-tenant cache leaks values.” |
-| 0:10-0:25 | Clarification card and plan | Options prevent a silent compatibility assumption; no file changed yet. |
+| 0:10-0:25 | Clarification card, plan, and risk gate | Options prevent a silent compatibility assumption; the gate explains why approval is required. |
 | 0:25-1:05 | Accelerated tool timeline and diff | Bounded native tools, dynamic plan status, real test command, stale-check invalidation. |
 | 1:05-1:30 | Checks and verifier tabs | Exit code and output are evidence; verifier has no write/execute tools. |
-| 1:30-1:50 | Evidence board and rollback button | Final verdict, exact changed files, conflict-aware whole-run recovery. |
+| 1:30-1:50 | Evidence board and Proof Pack | Final verdict, persisted diff source, integrity digest, and conflict-aware recovery. |
 | 1:50-2:00 | Architecture diagram | Model proposes; TraceForge controls and proves. |
 
 ## Likely questions
@@ -42,6 +43,20 @@ configured model may be the same.
 check lacks fresh passing evidence. Mutations reset those checks. After `finish`, the verifier can
 still reject the result and trigger a bounded repair cycle.
 
+### Does automatic plan approval let the model bypass the user?
+
+No. The model supplies structured facts, but deterministic application code assigns the gate.
+Automatic approval requires one named file, small step/check counts, routine local checks, and no
+clarification, explicit risk, or sensitive-area language. The plan stays visible. If the builder
+later targets an undeclared path, execution pauses for a separate action approval before writing.
+
+### What does the Proof Pack hash prove?
+
+It fingerprints the persisted plan, gate, final diff, checks, verifier verdict, rollback state, and
+event ledger, making accidental changes and two exported packs easy to compare. It is not a digital
+signature or remote attestation; a local actor able to rewrite SQLite can recompute it. That precise
+claim is more defensible than calling the artifact tamper-proof.
+
 ### Why not run everything in Docker?
 
 The product targets a low-friction local demo on macOS/Linux. Application-level boundaries make
@@ -62,9 +77,10 @@ recoverable view of the same source of truth rather than a best-effort stream.
 
 ### What would you build next?
 
-First: OS-level sandbox profiles and finer command capabilities. Second: richer language-aware
-patch validation. Third: evaluation across a fixed task corpus. Parallel writers and plugins come
-later because they complicate attribution and recovery more than they improve this v0.1 demo.
+First: fault-injection scenarios and OS-level sandbox profiles with explicit degraded states.
+Second: richer language-aware patch validation. Third: evaluation across a fixed task corpus.
+Parallel writers and plugins come later because they complicate attribution and recovery more than
+they improve this v0.1 demo.
 
 ## Code landmarks
 

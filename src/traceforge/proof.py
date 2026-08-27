@@ -1,0 +1,216 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Literal
+
+from traceforge.models import (
+    CheckStatus,
+    EventType,
+    ProofPack,
+    ProofRollback,
+    RunEvent,
+    RunRecord,
+    RunState,
+    Verdict,
+    utc_now,
+)
+from traceforge.storage import Storage
+from traceforge.workspace import Workspace
+
+
+def build_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
+    events = storage.get_events(run.id)
+    snapshots = storage.list_snapshots(run.id)
+    diff, diff_source = _evidence_diff(run, storage, events)
+    rollback = _rollback_evidence(events, has_snapshots=bool(snapshots))
+    proof_status = _proof_status(run)
+    checks = run.plan.acceptance_checks if run.plan else []
+    checks_fresh = bool(checks) and all(
+        check.status is CheckStatus.PASSED for check in checks
+    )
+    event_chain_sha256 = _digest_json(
+        [event.model_dump(mode="json") for event in events]
+    )
+    evidence: dict[str, Any] = {
+        "schema_version": "traceforge.proof-pack.v1",
+        "run_id": run.id,
+        "task": run.task,
+        "workspace": run.workspace,
+        "project_id": run.project_id,
+        "state": run.state.value,
+        "proof_status": proof_status,
+        "plan": run.plan.model_dump(mode="json") if run.plan else None,
+        "plan_gate": run.plan_gate.model_dump(mode="json") if run.plan_gate else None,
+        "changed_files": [snapshot.path for snapshot in snapshots],
+        "diff": diff,
+        "diff_source": diff_source,
+        "diff_sha256": _digest_text(diff),
+        "checks_fresh": checks_fresh,
+        "verification": (
+            run.verification.model_dump(mode="json") if run.verification else None
+        ),
+        "rollback": rollback.model_dump(mode="json"),
+        "event_count": len(events),
+        "event_chain_sha256": event_chain_sha256,
+        "step_count": run.step_count,
+        "repair_cycles": run.repair_cycles,
+        "created_at": run.created_at.isoformat(),
+        "updated_at": run.updated_at.isoformat(),
+    }
+    return ProofPack(
+        generated_at=utc_now(),
+        **evidence,
+        evidence_sha256=_digest_json(evidence),
+    )
+
+
+def proof_pack_markdown(pack: ProofPack) -> str:
+    lines = [
+        f"# TraceForge Proof Pack · {pack.run_id[:8]}",
+        "",
+        f"- Proof status: **{pack.proof_status}**",
+        f"- Run state: `{pack.state.value}`",
+        f"- Evidence SHA-256: `{pack.evidence_sha256}`",
+        f"- Event chain SHA-256: `{pack.event_chain_sha256}` ({pack.event_count} events)",
+        f"- Diff source: `{pack.diff_source}`",
+        f"- Generated: {pack.generated_at.isoformat()}",
+        "",
+        "## Request",
+        "",
+        pack.task,
+        "",
+        f"Workspace: `{pack.workspace}`",
+    ]
+    if pack.project_id:
+        lines.append(f"Project ID: `{pack.project_id}`")
+    lines.extend(["", "## Plan and gate", ""])
+    if pack.plan:
+        lines.append(pack.plan.summary)
+        lines.append("")
+        if pack.plan_gate:
+            lines.append(
+                f"Gate: **{pack.plan_gate.decision}** · risk **{pack.plan_gate.risk}**"
+            )
+            lines.extend(f"- {reason}" for reason in pack.plan_gate.reasons)
+            lines.append("")
+        lines.extend(
+            f"{index}. **{step.title}** — {step.description or step.status}"
+            for index, step in enumerate(pack.plan.steps, start=1)
+        )
+    else:
+        lines.append("No plan has been recorded yet.")
+    lines.extend(["", "## Changed files", ""])
+    lines.extend(f"- `{path}`" for path in pack.changed_files)
+    if not pack.changed_files:
+        lines.append("No agent-authored file snapshots.")
+    lines.extend(["", "## Unified diff", "", "```diff", pack.diff or "(no diff)", "```"])
+    lines.extend(["", "## Acceptance evidence", ""])
+    if pack.plan:
+        lines.extend(
+            [
+                "| Check | Status | Command | Evidence |",
+                "| --- | --- | --- | --- |",
+                *(
+                    "| "
+                    + " | ".join(
+                        [
+                            _table(check.label),
+                            check.status.value,
+                            _table(" ".join(check.command or [])),
+                            _table(check.evidence),
+                        ]
+                    )
+                    + " |"
+                    for check in pack.plan.acceptance_checks
+                ),
+            ]
+        )
+    else:
+        lines.append("No acceptance evidence yet.")
+    lines.extend(["", "## Independent verification", ""])
+    if pack.verification:
+        lines.append(f"Verdict: **{pack.verification.verdict.value}**")
+        lines.append("")
+        lines.append(pack.verification.summary)
+        for finding in pack.verification.findings:
+            lines.append(f"- **{finding.severity}: {finding.title}** — {finding.evidence}")
+    else:
+        lines.append("No independent verdict has been recorded yet.")
+    lines.extend(
+        [
+            "",
+            "## Conflict-aware rollback",
+            "",
+            f"Status: **{pack.rollback.status}**",
+            f"- Restored: {', '.join(pack.rollback.restored) or 'none'}",
+            f"- Removed: {', '.join(pack.rollback.removed) or 'none'}",
+            f"- Conflicts preserved: {', '.join(pack.rollback.conflicts) or 'none'}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _proof_status(
+    run: RunRecord,
+) -> Literal["in_progress", "proven", "checks_only", "not_proven"]:
+    if not run.state.terminal and run.state is not RunState.INTERRUPTED:
+        return "in_progress"
+    if run.state is RunState.SUCCEEDED:
+        if run.verification and run.verification.verdict is Verdict.PASS:
+            return "proven"
+        return "checks_only"
+    return "not_proven"
+
+
+def _rollback_evidence(
+    events: list[RunEvent], *, has_snapshots: bool
+) -> ProofRollback:
+    completed = [event for event in events if event.type is EventType.ROLLBACK_COMPLETED]
+    if completed:
+        payload = completed[-1].payload
+        return ProofRollback(
+            status="completed",
+            restored=list(payload.get("restored", [])),
+            removed=list(payload.get("removed", [])),
+            conflicts=list(payload.get("conflicts", [])),
+        )
+    return ProofRollback(status="available" if has_snapshots else "not_available")
+
+
+def _evidence_diff(
+    run: RunRecord,
+    storage: Storage,
+    events: list[RunEvent],
+) -> tuple[str, Literal["completion_event", "diff_event", "live_workspace"]]:
+    for event in reversed(events):
+        if event.type is EventType.RUN_COMPLETED:
+            diff = event.payload.get("diff")
+            if isinstance(diff, str):
+                return diff, "completion_event"
+    for event in reversed(events):
+        if event.type is EventType.DIFF_UPDATED:
+            diff = event.payload.get("diff")
+            if isinstance(diff, str):
+                return diff, "diff_event"
+    return Workspace(Path(run.workspace), storage).diff(run.id), "live_workspace"
+
+
+def _digest_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _digest_json(value: Any) -> str:
+    rendered = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return _digest_text(rendered)
+
+
+def _table(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", "<br>")

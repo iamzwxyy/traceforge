@@ -9,7 +9,7 @@ import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from traceforge.config import Settings
@@ -123,6 +123,21 @@ class ToolRegistry:
         ]
 
     def assess(self, call: ToolCall, plan: TaskPlan | None) -> PermissionAssessment:
+        if call.name in {"apply_patch", "create_file"} and plan and plan.impacted_files:
+            try:
+                mutation_paths = _mutation_paths(call)
+            except PatchError as exc:
+                return PermissionAssessment(PermissionDecision.DENY, str(exc), "dangerous")
+            unexpected = sorted(set(mutation_paths) - set(plan.impacted_files))
+            if unexpected:
+                return PermissionAssessment(
+                    PermissionDecision.ASK,
+                    "Mutation exceeds the visible plan scope: " + ", ".join(unexpected),
+                    "elevated",
+                )
+            return PermissionAssessment(
+                PermissionDecision.ALLOW, "Mutation stays inside the visible plan scope"
+            )
         if call.name != "run_command":
             return PermissionAssessment(PermissionDecision.ALLOW, "Workspace tool")
         argv = call.arguments.get("argv")
@@ -450,6 +465,18 @@ def _matches_accepted_check(argv: list[str], plan: TaskPlan | None) -> bool:
     if plan is None:
         return False
     return any(check.command == argv for check in plan.acceptance_checks if check.command)
+
+
+def _mutation_paths(call: ToolCall) -> list[str]:
+    if call.name == "create_file":
+        raw = call.arguments.get("path")
+        if not isinstance(raw, str) or not raw.strip():
+            raise PatchError("create_file path must be a non-empty string")
+        return [PurePosixPath(raw).as_posix()]
+    raw_patch = call.arguments.get("patch")
+    if not isinstance(raw_patch, str):
+        raise PatchError("apply_patch patch must be a string")
+    return [PurePosixPath(patch.path).as_posix() for patch in parse_unified_diff(raw_patch)]
 
 
 def _is_read_only(argv: list[str]) -> bool:

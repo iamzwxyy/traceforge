@@ -151,5 +151,6 @@ def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:
         assert loaded.plan_approved is False
         assert loaded.interrupted_from is None
         assert loaded.project_id is None
+        assert loaded.plan_gate is None
     finally:
         migrated.close()

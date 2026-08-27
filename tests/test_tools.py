@@ -36,6 +36,51 @@ def test_permission_policy(settings: Settings, workspace: Workspace) -> None:
     assert registry.assess(denied_call, None).decision is PermissionDecision.DENY
 
 
+def test_permission_policy_enforces_visible_mutation_scope(
+    settings: Settings, workspace: Workspace
+) -> None:
+    registry = ToolRegistry(workspace, settings)
+    plan = _plan(["uv", "run", "pytest"]).model_copy(
+        update={"impacted_files": ["src/allowed.py"]}
+    )
+    allowed = ToolCall(
+        id="allowed",
+        name="create_file",
+        arguments={"path": "src/allowed.py", "content": "value = 1\n"},
+    )
+    drift = ToolCall(
+        id="drift",
+        name="create_file",
+        arguments={"path": "src/unplanned.py", "content": "value = 2\n"},
+    )
+    multi_file_patch = ToolCall(
+        id="patch",
+        name="apply_patch",
+        arguments={
+            "patch": (
+                "--- a/src/allowed.py\n"
+                "+++ b/src/allowed.py\n"
+                "@@ -1 +1 @@\n"
+                "-value = 1\n"
+                "+value = 2\n"
+                "--- a/src/unplanned.py\n"
+                "+++ b/src/unplanned.py\n"
+                "@@ -1 +1 @@\n"
+                "-value = 1\n"
+                "+value = 2\n"
+            )
+        },
+    )
+
+    assert registry.assess(allowed, plan).decision is PermissionDecision.ALLOW
+    drift_assessment = registry.assess(drift, plan)
+    assert drift_assessment.decision is PermissionDecision.ASK
+    assert "src/unplanned.py" in drift_assessment.reason
+    patch_assessment = registry.assess(multi_file_patch, plan)
+    assert patch_assessment.decision is PermissionDecision.ASK
+    assert "src/unplanned.py" in patch_assessment.reason
+
+
 def test_permission_policy_denies_malformed_and_destructive_commands(
     settings: Settings, workspace: Workspace
 ) -> None:

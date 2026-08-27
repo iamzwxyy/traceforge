@@ -3,6 +3,7 @@ import type {
   ClarificationAnswer,
   DirectoryListing,
   Project,
+  ProofPack,
   ProviderConfig,
   ProviderProbe,
   Run,
@@ -34,6 +35,7 @@ export const api = {
   getEvents: (runId: string, afterSeq = 0) =>
     request<RunEvent[]>(`/api/runs/${runId}/events?after_seq=${afterSeq}`),
   getDiff: (runId: string) => request<{ diff: string }>(`/api/runs/${runId}/diff`),
+  getProofPack: (runId: string) => request<ProofPack>(`/api/runs/${runId}/proof-pack`),
   createRun: (task: string, verifierEnabled: boolean, target: RunTarget) =>
     request<Run>("/api/runs", {
       method: "POST",

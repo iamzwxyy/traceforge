@@ -135,6 +135,10 @@ def scripted_demo_provider() -> ScriptedProvider:
                                     "command": check,
                                 }
                             ],
+                            "impacted_files": [
+                                "src/tenant_cache_api/cache.py",
+                                "tests/test_tenant_isolation.py",
+                            ],
                             "risks": [
                                 "Changing the key must not reset the TTL or defeat "
                                 "same-tenant hits."

@@ -22,6 +22,20 @@ symlink component are rejected.
 Reads omit `.env` and `.env.*` except `.env.example`; directory listing and search also hide these
 files. This reduces accidental disclosure to the model but is not a general secret vault.
 
+## Plan and mutation policy
+
+The model proposes a structured plan, but application code assigns the plan gate. The fast path is
+limited to an explicit single-file scope, at most two steps and checks, no clarification or stated
+risk, no sensitive-area keywords, and routine local verification commands. The plan and policy
+reasons remain visible even when no click is required. Unknown scope, multiple files, credentials,
+permissions, migrations, dependencies, deployment, deletion, or other high-impact language forces
+human plan approval.
+
+After planning, each `create_file` and every file in an `apply_patch` is compared with the declared
+scope. An unexpected path pauses for a one-time action decision before any bytes are written. This
+is a policy boundary, not an OS sandbox: a separately approved project command can still write
+outside the plan or workspace using the current user's authority.
+
 ## Command policy
 
 Commands are argv arrays passed to `asyncio.create_subprocess_exec`; shell parsing and expansion do
@@ -66,6 +80,11 @@ permissions follow the local user account; TraceForge does not encrypt this data
 Rollback is hash-conditional. A file changed by the user after the agent wrote it is reported as a
 conflict and preserved. This prevents recovery from becoming a second destructive action.
 
+The Proof Pack reads the successful final diff from the persisted completion event, so later user
+edits do not silently change historical evidence. Its SHA-256 fingerprints provide integrity and
+comparison, not authenticity: TraceForge does not sign the artifact, and a local actor who can
+rewrite the database can also recompute the hashes.
+
 ## Local web service
 
 The CLI binds to `127.0.0.1` by default. WebSocket origins must be `localhost` or `127.0.0.1`.
@@ -79,6 +98,9 @@ interface expands the trust boundary and should only be done behind controls cho
 - A benign repository may contain secrets in ordinary source files that the user asked the model
   to inspect.
 - SQLite data remains until the platform data directory is removed.
+- The risk gate is deliberately conservative but still syntactic; human approval and planned file
+  scope do not establish semantic safety.
+- Proof Pack hashes are not signatures or remote attestations.
 - Provider behavior and availability are external dependencies; retries do not guarantee service.
 
 The safe default for an unfamiliar repository is a disposable OS account, container, or virtual

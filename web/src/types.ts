@@ -52,7 +52,15 @@ export interface TaskPlan {
   summary: string;
   steps: PlanStep[];
   acceptance_checks: AcceptanceCheck[];
+  impacted_files: string[];
   risks: string[];
+}
+
+export interface PlanGate {
+  decision: "auto_approved" | "approval_required";
+  risk: "low" | "medium" | "high";
+  reasons: string[];
+  assessed_at: string;
 }
 
 export interface ToolCall {
@@ -94,6 +102,7 @@ export interface Run {
   clarification: ClarificationRequest | null;
   pending_approval: ApprovalRequest | null;
   verification: VerificationReport | null;
+  plan_gate: PlanGate | null;
   step_count: number;
   repair_cycles: number;
   context_tokens: number;
@@ -166,6 +175,41 @@ export interface DirectoryListing {
 export interface RunTarget {
   project_id?: string;
   workspace?: string;
+}
+
+export interface ProofRollback {
+  status: "available" | "completed" | "not_available";
+  conflict_aware: boolean;
+  restored: string[];
+  removed: string[];
+  conflicts: string[];
+}
+
+export interface ProofPack {
+  schema_version: "traceforge.proof-pack.v1";
+  generated_at: string;
+  run_id: string;
+  task: string;
+  workspace: string;
+  project_id: string | null;
+  state: RunState;
+  proof_status: "in_progress" | "proven" | "checks_only" | "not_proven";
+  plan: TaskPlan | null;
+  plan_gate: PlanGate | null;
+  changed_files: string[];
+  diff: string;
+  diff_source: "completion_event" | "diff_event" | "live_workspace";
+  diff_sha256: string;
+  checks_fresh: boolean;
+  verification: VerificationReport | null;
+  rollback: ProofRollback;
+  event_count: number;
+  event_chain_sha256: string;
+  step_count: number;
+  repair_cycles: number;
+  created_at: string;
+  updated_at: string;
+  evidence_sha256: string;
 }
 
 export interface ClarificationAnswer {

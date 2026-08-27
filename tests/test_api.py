@@ -76,6 +76,14 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
         events = client.get(f"/api/runs/{run_id}/events").json()
         assert events[-1]["type"] == "run.completed"
 
+        proof = client.get(f"/api/runs/{run_id}/proof-pack")
+        assert proof.status_code == 200
+        assert proof.json()["proof_status"] == "checks_only"
+        downloaded = client.get(f"/api/runs/{run_id}/proof-pack.md")
+        assert downloaded.status_code == 200
+        assert "attachment;" in downloaded.headers["content-disposition"]
+        assert "TraceForge Proof Pack" in downloaded.text
+
 
 def test_api_rejects_second_active_run(settings: Settings) -> None:
     app = create_app(settings, provider=ScriptedProvider([_plan_response()]))

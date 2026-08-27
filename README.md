@@ -3,7 +3,7 @@
 [![CI](https://github.com/iamzwxyy/traceforge/actions/workflows/ci.yml/badge.svg)](https://github.com/iamzwxyy/traceforge/actions/workflows/ci.yml)
 
 TraceForge is a local coding agent that makes completion evidence visible. It turns a request
-into an approved plan, works through a bounded set of native tools, runs explicit acceptance
+into a risk-assessed plan, works through a bounded set of native tools, runs explicit acceptance
 checks, and asks an independent read-only verifier to judge the result.
 
 The project is intentionally focused: no pet, plugin market, hosted execution, or IDE clone.
@@ -13,10 +13,16 @@ Its differentiator is a defensible engineering loop with useful human control.
 
 - **Material clarification, not guesswork.** Complex requests can pause for one to three
   questions, each with mutually exclusive options and a recommended choice.
-- **Plan as a completion contract.** No mutation starts before plan approval. Builder progress,
-  check status, exact commands, and evidence stay visible.
+- **Risk-adaptive human control.** Every plan remains visible. Only an explicitly scoped,
+  single-file, low-risk change with routine local checks takes the deterministic fast path;
+  ambiguity, sensitive areas, larger scope, or unusual commands require approval.
+- **Plan as a completion contract.** Planned files, builder progress, check status, exact commands,
+  and evidence stay visible. A write outside the declared file scope pauses for action approval.
 - **Independent verification.** The verifier cannot write files or run commands. A rejection
   returns concrete findings to the builder for at most two repair cycles.
+- **Downloadable Proof Pack.** One auditable Markdown artifact joins the persisted final diff,
+  fresh checks, verifier verdict, conflict-aware rollback state, event ledger, and SHA-256
+  integrity fingerprints.
 - **Evidence-first UI.** Timeline, unified diff, check output, verdict, approvals, Stop, Resume,
   and Rollback are available in one local web workbench.
 - **Low-friction workspaces.** Start a direct task in the last-used directory, or register a
@@ -41,7 +47,8 @@ uv run traceforge demo
 Open <http://127.0.0.1:8765>. The task is prefilled. Start it, choose the recommended API
 compatibility option, approve the plan, and watch TraceForge repair a real cross-tenant cache
 isolation bug. The demo changes a disposable copy, executes four real Pytest tests, and produces
-a read-only verifier verdict.
+a read-only verifier verdict. Open **Proof Pack** on the evidence board to inspect or download the
+complete delivery record.
 
 ## Run against your own workspaces
 
@@ -77,13 +84,15 @@ complete a native function call, so a successful HTTP response alone is not trea
 ```mermaid
 flowchart LR
     A[Task] --> B[Inspect and clarify]
-    B --> C[Plan approval]
-    C --> D[Builder and native tools]
+    B --> C[Visible plan + deterministic risk gate]
+    C -->|low-risk fast path| D[Builder and native tools]
+    C -->|review required| H[Human approval]
+    H --> D
     D --> E[Acceptance checks]
     E --> F[Read-only verifier]
-    F -->|pass| G[Evidence board]
+    F -->|pass| G[Evidence board + Proof Pack]
     F -->|findings, max 2| D
-    D -. snapshots .-> H[Conflict-aware rollback]
+    D -. snapshots .-> I[Conflict-aware rollback]
 ```
 
 The model proposes actions; TraceForge owns the state machine, message history, tool dispatch,
@@ -113,8 +122,8 @@ pnpm --filter traceforge-web build
 pnpm --filter traceforge-web e2e
 ```
 
-The current suite has 69 backend tests with a hard 85% coverage gate, frontend unit tests, a
-full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
+The current suite has 83 backend tests at 86.53% coverage (with a hard 85% gate), frontend unit
+tests, a full Chrome demo test, locked dependencies, an Ubuntu quality job, and a macOS smoke job.
 
 ## Repository map
 

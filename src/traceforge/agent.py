@@ -27,6 +27,7 @@ from traceforge.models import (
     Verdict,
     VerificationReport,
 )
+from traceforge.planning import assess_plan_gate
 from traceforge.prompts import BUILDER_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT
 from traceforge.provider import ModelProvider, ModelResponse, ProviderError
 from traceforge.storage import Storage
@@ -79,6 +80,7 @@ _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
     RunState.PLANNING: {
         RunState.AWAITING_CLARIFICATION,
         RunState.AWAITING_PLAN_APPROVAL,
+        RunState.EXECUTING,
         RunState.CANCELLED,
         RunState.FAILED,
         RunState.INTERRUPTED,
@@ -350,12 +352,17 @@ class AgentManager:
             run.clarification = None
             await self._transition(run, RunState.PLANNING)
         elif run.plan is not None and not run.plan_approved:
-            await self._transition(run, RunState.AWAITING_PLAN_APPROVAL)
-            approved = await self._await_plan_decision(run)
-            if approved:
+            if run.plan_gate and run.plan_gate.decision == "auto_approved":
                 run.plan_approved = True
                 run.messages = self._builder_messages(run, run.plan)
                 await self._transition(run, RunState.EXECUTING)
+            else:
+                await self._transition(run, RunState.AWAITING_PLAN_APPROVAL)
+                approved = await self._await_plan_decision(run)
+                if approved:
+                    run.plan_approved = True
+                    run.messages = self._builder_messages(run, run.plan)
+                    await self._transition(run, RunState.EXECUTING)
         elif run.plan_approved:
             run.pending_approval = None
             run.messages.append(
@@ -442,7 +449,25 @@ class AgentManager:
                 if call.name == "submit_plan":
                     plan = TaskPlan.model_validate(call.arguments)
                     run.plan = plan
+                    run.plan_gate = assess_plan_gate(
+                        run.task,
+                        plan,
+                        clarification_rounds=self._clarification_round(run.id),
+                    )
                     self.storage.save_run(run)
+                    await self.broker.emit(
+                        run.id,
+                        EventType.PLAN_GATED,
+                        run.plan_gate.model_dump(mode="json"),
+                    )
+                    if run.plan_gate.decision == "auto_approved":
+                        await self.broker.emit(
+                            run.id, EventType.PLAN_UPDATED, plan.model_dump(mode="json")
+                        )
+                        run.plan_approved = True
+                        run.messages = self._builder_messages(run, plan)
+                        await self._transition(run, RunState.EXECUTING)
+                        return
                     await self._transition(run, RunState.AWAITING_PLAN_APPROVAL)
                     approved = await self._await_plan_decision(run, tool_call_id=call.id)
                     if approved:
@@ -841,6 +866,7 @@ class AgentManager:
                 ),
             )
         run.plan = None
+        run.plan_gate = None
         await self._transition(run, RunState.PLANNING)
         return False
 

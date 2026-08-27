@@ -5,6 +5,7 @@ import type {
   AppStatus,
   ClarificationAnswer,
   Project,
+  ProofPack,
   ProviderConfig,
   ProviderProbe,
   Run,
@@ -19,6 +20,7 @@ const refreshEventTypes = new Set([
   "clarification.requested",
   "clarification.answered",
   "plan.updated",
+  "plan.gated",
   "approval.requested",
   "approval.resolved",
   "verification.completed",
@@ -31,6 +33,7 @@ export function useTraceForge() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [provider, setProvider] = useState<ProviderConfig | null>(null);
+  const [proofPack, setProofPack] = useState<ProofPack | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [run, setRun] = useState<Run | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
@@ -77,12 +80,14 @@ export function useTraceForge() {
       setRun(null);
       setEvents([]);
       setDiff("");
+      setProofPack(null);
       return;
     }
     let disposed = false;
     let reconnectTimer: number | undefined;
     let socket: WebSocket | undefined;
     lastSeq.current = 0;
+    setProofPack(null);
 
     const connect = () => {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -131,6 +136,7 @@ export function useTraceForge() {
       setError(null);
       try {
         await operation();
+        setProofPack(null);
         if (selectedRunId) await refreshRun(selectedRunId);
         await refreshRuns();
       } catch (reason) {
@@ -198,10 +204,23 @@ export function useTraceForge() {
     }
   }, []);
 
+  const loadProofPack = useCallback(async (runId: string): Promise<ProofPack> => {
+    setError(null);
+    try {
+      const pack = await api.getProofPack(runId);
+      setProofPack(pack);
+      return pack;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      throw reason;
+    }
+  }, []);
+
   return {
     status,
     projects,
     provider,
+    proofPack,
     runs,
     run,
     events,
@@ -215,6 +234,7 @@ export function useTraceForge() {
     createProject,
     saveProvider,
     testProvider,
+    loadProofPack,
     listDirectories: api.listDirectories,
     answerQuestions: (answers: ClarificationAnswer[]) =>
       run && perform(() => api.answerQuestions(run.id, answers)),
