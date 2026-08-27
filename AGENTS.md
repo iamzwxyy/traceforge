@@ -11,7 +11,7 @@
 ## Engineering expectations
 
 - Python code targets 3.12 and must pass `uv run ruff check .`, `uv run mypy src`, and `uv run pytest`.
-- Frontend code must pass `pnpm --dir web lint`, `pnpm --dir web typecheck`, and `pnpm --dir web test -- --run`.
+- Frontend code must pass `pnpm --filter traceforge-web lint`, `pnpm --filter traceforge-web typecheck`, and `pnpm --filter traceforge-web test --run`.
 - Run the narrowest relevant tests while iterating, then the complete validation suite before claiming completion.
 - New behavior requires tests. Security boundaries require adversarial tests.
 - Keep commits focused and preserve the visible development history.
@@ -21,4 +21,3 @@
 - A fresh checkout can install and launch TraceForge using the documented commands.
 - The deterministic fake-provider flow covers clarification, plan approval, edits, checks, verification, and rollback without an API key.
 - The UI visibly distinguishes evidence from model-authored summaries and never exposes hidden chain-of-thought.
-

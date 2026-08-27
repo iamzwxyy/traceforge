@@ -82,3 +82,7 @@ TraceForge 是一个本地 Web 编程智能体，核心卖点是“任务完成�
 提交历史保持约十个主题明确的 commit：工程初始化、协议与状态、工具安全、Agent 循环、持久化回滚、Verifier、Web API、前端、测试评测、文档发布；不压缩或改写已推送历史。
 
 默认采用 MIT License。仓库提供详细 `README.md` 和架构说明；提交用 `README.txt` 严格控制在 1000 汉字以内。最终 ZIP 仅包含以学生真实姓名命名的 `README.txt` 和 MP4，真实姓名、GitHub 账号及运行模型 API 凭据作为发布阶段用户输入，任何凭据都不进入仓库、历史、README 或视频。
+
+## 6. 补充
+
+如需调试，可使用deepseek-v4-flash-vision-exp，apikey在deepseek apikey文件中，接口文档<https://api-docs.deepseek.com/>

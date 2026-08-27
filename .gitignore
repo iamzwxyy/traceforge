@@ -8,7 +8,8 @@
 htmlcov/
 __pycache__/
 *.py[cod]
-web/node_modules/
+node_modules/
+deepseek apikey
 web/coverage/
 web/playwright-report/
 web/test-results/
@@ -16,4 +17,3 @@ dist/
 build/
 *.egg-info/
 推免考核题目学生版.pdf
-

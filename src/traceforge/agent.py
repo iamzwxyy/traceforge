@@ -56,12 +56,18 @@ class _Control:
 
 
 _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
-    RunState.CREATED: {RunState.PLANNING, RunState.CANCELLED, RunState.FAILED},
+    RunState.CREATED: {
+        RunState.PLANNING,
+        RunState.CANCELLED,
+        RunState.FAILED,
+        RunState.INTERRUPTED,
+    },
     RunState.PLANNING: {
         RunState.AWAITING_CLARIFICATION,
         RunState.AWAITING_PLAN_APPROVAL,
         RunState.CANCELLED,
         RunState.FAILED,
+        RunState.INTERRUPTED,
     },
     RunState.AWAITING_CLARIFICATION: {
         RunState.PLANNING,
@@ -127,6 +133,7 @@ class AgentManager:
         self.broker = broker or EventBroker(storage)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._controls: dict[str, _Control] = {}
+        self._shutting_down = False
         self.storage.mark_active_runs_interrupted(settings.workspace)
 
     async def start_run(self, task: str, *, verifier_enabled: bool = True) -> RunRecord:
@@ -230,6 +237,16 @@ class AgentManager:
             await task
         return self.storage.get_run(run_id)
 
+    async def shutdown(self) -> None:
+        self._shutting_down = True
+        active = [(run_id, task) for run_id, task in self._tasks.items() if not task.done()]
+        for run_id, _task in active:
+            await self.tools.cancel(run_id)
+        for _run_id, task in active:
+            task.cancel()
+        if active:
+            await asyncio.gather(*(task for _, task in active), return_exceptions=True)
+
     def _spawn(self, run_id: str, *, resume: bool) -> None:
         task = asyncio.create_task(self._run(run_id, resume=resume), name=f"traceforge:{run_id}")
         self._tasks[run_id] = task
@@ -284,10 +301,14 @@ class AgentManager:
         except asyncio.CancelledError:
             current = self.storage.get_run(run_id)
             if not current.state.terminal:
-                await self._transition(current, RunState.CANCELLED)
-                await self.broker.emit(
-                    run_id, EventType.RUN_COMPLETED, {"state": RunState.CANCELLED.value}
-                )
+                if self._shutting_down:
+                    current.interrupted_from = current.state
+                    await self._transition(current, RunState.INTERRUPTED)
+                else:
+                    await self._transition(current, RunState.CANCELLED)
+                    await self.broker.emit(
+                        run_id, EventType.RUN_COMPLETED, {"state": RunState.CANCELLED.value}
+                    )
             raise
         except (ProviderError, ValidationError, ValueError, RuntimeError) as exc:
             current = self.storage.get_run(run_id)
