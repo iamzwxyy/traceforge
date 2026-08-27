@@ -99,8 +99,9 @@ The model proposes actions; TraceForge owns the state machine, message history, 
 permissions, local execution, persistence, context compaction, retries, and termination. It does
 not use an agent framework or provider-hosted file/code tools.
 
-See [Architecture](docs/architecture.md), [Security model](docs/security.md), and
-[Interview guide](docs/interview-guide.md) for the design rationale and failure semantics.
+See [Architecture](docs/architecture.md), [Security model](docs/security.md),
+[AIME UI benchmark](docs/ui-benchmark.md), and [Interview guide](docs/interview-guide.md) for the
+design rationale and failure semantics.
 
 ## Development
 

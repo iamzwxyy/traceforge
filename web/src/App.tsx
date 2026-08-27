@@ -3,6 +3,7 @@ import {
   ArrowRight,
   Check,
   CheckCircle2,
+  ChevronDown,
   Circle,
   ClipboardCheck,
   Code2,
@@ -36,7 +37,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import { isActiveState, parseDiff, presentState } from "./lib";
+import { buildActivityChapters, isActiveState, parseDiff, presentState } from "./lib";
 import type {
   ClarificationAnswer,
   DirectoryListing,
@@ -680,7 +681,6 @@ function RunStage({
   onRollback: () => void;
   onProof: () => void;
 }) {
-  const state = presentState(run.state);
   return (
     <div className="run-stage">
       <div className="run-header">
@@ -714,7 +714,7 @@ function RunStage({
           );
         })}
       </div>
-      <ActivityFeed events={events} stateLabel={state.label} />
+      <ActivityFeed events={events} state={run.state} />
       <div className="interaction-dock">
         {run.state === "awaiting_clarification" && run.clarification && (
           <ClarificationPanel request={run.clarification} onSubmit={onAnswer} />
@@ -737,20 +737,43 @@ function RunStage({
   );
 }
 
-function ActivityFeed({ events, stateLabel }: { events: RunEvent[]; stateLabel: string }) {
+function ActivityFeed({ events, state }: { events: RunEvent[]; state: RunState }) {
   const end = useRef<HTMLDivElement>(null);
-  const visible = events.filter((event) =>
-    ["message", "tool.completed", "state.changed", "error"].includes(event.type),
-  );
+  const chapters = useMemo(() => buildActivityChapters(events), [events]);
+  const latestId = chapters.at(-1)?.id ?? null;
+  const [expanded, setExpanded] = useState<string | null>(null);
+  useEffect(() => {
+    if (latestId) setExpanded(latestId);
+  }, [latestId]);
   useEffect(() => {
     end.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [events.length]);
   return (
     <div className="activity-feed">
-      {visible.length === 0 && (
-        <div className="thinking-row"><LoaderCircle className="spin" size={16} /><span>{stateLabel}…</span></div>
+      {chapters.length === 0 && (
+        <div className="thinking-row"><LoaderCircle className="spin" size={16} /><span>{presentState(state).label}…</span></div>
       )}
-      {visible.map((event) => <ActivityItem event={event} key={event.seq} />)}
+      {chapters.map((chapter, index) => {
+        const current = index === chapters.length - 1 && isActiveState(state);
+        const PhaseIcon = chapter.phase === "planning" ? ClipboardCheck : chapter.phase === "building" ? Hammer : ShieldCheck;
+        const toolCount = chapter.events.filter((event) => event.type === "tool.completed").length;
+        return (
+          <section className={`activity-chapter ${expanded === chapter.id ? "expanded" : ""}`} key={chapter.id}>
+            <button
+              className="chapter-heading"
+              type="button"
+              aria-expanded={expanded === chapter.id}
+              onClick={() => setExpanded((value) => value === chapter.id ? null : chapter.id)}
+            >
+              <span className={`chapter-icon ${current ? "live" : "complete"}`}>{current ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}</span>
+              <span className="chapter-title"><small>{chapter.phase}</small><strong>{chapter.label}</strong></span>
+              <span className="chapter-meta"><PhaseIcon size={12} /> {toolCount} tool {toolCount === 1 ? "action" : "actions"} · {chapter.events.length} events</span>
+              <ChevronDown className="chapter-chevron" size={14} />
+            </button>
+            {expanded === chapter.id && <div className="chapter-body">{chapter.events.map((event) => <ActivityItem event={event} key={event.seq} />)}</div>}
+          </section>
+        );
+      })}
       <div ref={end} />
     </div>
   );
@@ -766,25 +789,47 @@ function ActivityItem({ event }: { event: RunEvent }) {
     );
   }
   if (event.type === "tool.completed") {
-    const call = (event.payload.call ?? {}) as { name?: string; arguments?: Record<string, unknown> };
-    const result = (event.payload.result ?? {}) as { ok?: boolean; output?: string; error?: string; metadata?: Record<string, unknown> };
+    return <ToolActivityItem event={event} />;
+  }
+  if (event.type === "plan.gated") {
+    const decision = String(event.payload.decision ?? "assessed").replaceAll("_", " ");
+    const reasons = Array.isArray(event.payload.reasons) ? event.payload.reasons.map(String) : [];
     return (
-      <article className={`activity tool-card ${result.ok ? "ok" : "bad"}`}>
-        <div className="activity-icon"><TerminalSquare size={15} /></div>
-        <div className="tool-body">
-          <div className="tool-title"><code>{call.name ?? "tool"}</code><span>{result.ok ? "completed" : "failed"}</span></div>
-          <p className="tool-args">{formatArguments(call.arguments)}</p>
-          {(result.output || result.error) && <pre>{result.error ?? result.output}</pre>}
-        </div>
+      <article className="activity evidence-activity policy-activity">
+        <div className="activity-icon"><Zap size={15} /></div>
+        <div><span className="activity-label">DETERMINISTIC PLAN GATE</span><strong>{decision} · {String(event.payload.risk ?? "unknown")} risk</strong>{reasons.length > 0 && <p>{reasons.join(" · ")}</p>}</div>
+      </article>
+    );
+  }
+  if (event.type === "verification.completed") {
+    return (
+      <article className="activity evidence-activity verifier-activity">
+        <div className="activity-icon"><ShieldCheck size={15} /></div>
+        <div><span className="activity-label">INDEPENDENT VERDICT</span><strong>{String(event.payload.verdict ?? "inconclusive")}</strong><p>{String(event.payload.summary ?? "No summary recorded.")}</p></div>
       </article>
     );
   }
   if (event.type === "error") {
     return <Notice icon={<OctagonX size={17} />} title="Error" danger>{String(event.payload.message ?? "Unknown error")}</Notice>;
   }
-  const nextState = String(event.payload.state ?? "state change");
+  return null;
+}
+
+function ToolActivityItem({ event }: { event: RunEvent }) {
+  const call = (event.payload.call ?? {}) as { name?: string; arguments?: Record<string, unknown> };
+  const result = (event.payload.result ?? {}) as { ok?: boolean; output?: string; error?: string; metadata?: Record<string, unknown> };
+  const [expanded, setExpanded] = useState(!result.ok);
   return (
-    <div className="state-transition"><Circle size={8} fill="currentColor" /><span>{nextState.replaceAll("_", " ")}</span><time>{clockTime(event.created_at)}</time></div>
+    <article className={`activity tool-card ${result.ok ? "ok" : "bad"}`}>
+      <div className="activity-icon"><TerminalSquare size={15} /></div>
+      <div className="tool-body">
+        <button className="tool-summary" type="button" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
+          <span className="tool-summary-copy"><span className="tool-title"><code>{call.name ?? "tool"}</code><em>{result.ok ? "completed" : "failed"}</em></span><span className="tool-args">{formatArguments(call.arguments)}</span></span>
+          <ChevronDown className={`tool-chevron ${expanded ? "expanded" : ""}`} size={13} />
+        </button>
+        {expanded && (result.output || result.error) && <pre>{result.error ?? result.output}</pre>}
+      </div>
+    </article>
   );
 }
 

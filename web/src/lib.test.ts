@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeEvents, parseDiff, presentState } from "./lib";
+import { buildActivityChapters, mergeEvents, parseDiff, presentState } from "./lib";
 import type { RunEvent } from "./types";
 
 function event(seq: number): RunEvent {
@@ -27,5 +27,40 @@ describe("mission control helpers", () => {
   it("presents evidence-backed success distinctly", () => {
     expect(presentState("succeeded")).toEqual({ label: "Proven", tone: "success" });
   });
-});
 
+  it("groups persisted activity into progressive-disclosure chapters", () => {
+    const events: RunEvent[] = [
+      event(1),
+      { ...event(2), type: "state.changed", payload: { state: "executing" } },
+      { ...event(3), type: "tool.completed" },
+      { ...event(4), type: "state.changed", payload: { state: "verifying" } },
+      { ...event(5), type: "verification.completed" },
+    ];
+
+    const chapters = buildActivityChapters(events);
+
+    expect(chapters.map((chapter) => chapter.label)).toEqual([
+      "Planning & decisions",
+      "Build & checks",
+      "Independent verification",
+    ]);
+    expect(chapters.map((chapter) => chapter.events.map((item) => item.seq))).toEqual([
+      [1],
+      [3],
+      [5],
+    ]);
+  });
+
+  it("makes post-verifier execution a distinct repair chapter", () => {
+    const chapters = buildActivityChapters([
+      { ...event(1), type: "state.changed", payload: { state: "executing" } },
+      { ...event(2), type: "tool.completed" },
+      { ...event(3), type: "state.changed", payload: { state: "verifying" } },
+      { ...event(4), type: "verification.completed" },
+      { ...event(5), type: "state.changed", payload: { state: "executing" } },
+      { ...event(6), type: "tool.completed" },
+    ]);
+
+    expect(chapters.at(-1)?.label).toBe("Repair cycle 1");
+  });
+});

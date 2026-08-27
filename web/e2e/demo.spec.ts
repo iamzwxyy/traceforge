@@ -34,6 +34,12 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByText("4 passed", { exact: false }).first()).toBeVisible();
   await expect(page.getByText(/\d+(\.\d+)?k? \/ 64k ctx/)).toBeVisible();
   await expect(page.getByText("Live", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Planning & decisions/ }))
+    .toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByRole("button", { name: /Build & checks/ }))
+    .toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByRole("button", { name: /Independent verification/ }))
+    .toHaveAttribute("aria-expanded", "true");
   await page.getByRole("button", { name: "Proof Pack" }).click();
   await expect(page.getByRole("heading", { name: "Proof Pack" })).toBeVisible();
   await expect(page.getByText("proven", { exact: true })).toBeVisible();

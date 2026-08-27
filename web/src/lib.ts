@@ -49,3 +49,69 @@ export function isActiveState(state: RunState): boolean {
   return !["succeeded", "failed", "cancelled", "interrupted", "rolled_back"].includes(state);
 }
 
+export type ActivityPhase = "planning" | "building" | "verifying";
+
+export interface ActivityChapter {
+  id: string;
+  phase: ActivityPhase;
+  label: string;
+  events: RunEvent[];
+}
+
+const activityEventTypes = new Set([
+  "message",
+  "tool.completed",
+  "plan.gated",
+  "verification.completed",
+  "error",
+]);
+
+export function buildActivityChapters(events: RunEvent[]): ActivityChapter[] {
+  const chapters: ActivityChapter[] = [];
+  const occurrences: Record<ActivityPhase, number> = {
+    planning: 0,
+    building: 0,
+    verifying: 0,
+  };
+  let phase: ActivityPhase = "planning";
+  let current: ActivityChapter | null = null;
+
+  for (const event of events) {
+    if (event.type === "state.changed") {
+      const next = phaseForState(String(event.payload.state ?? ""));
+      if (next && next !== phase) {
+        phase = next;
+        current = null;
+      }
+      continue;
+    }
+    if (!activityEventTypes.has(event.type)) continue;
+    if (!current) {
+      occurrences[phase] += 1;
+      current = {
+        id: `${phase}-${event.seq}`,
+        phase,
+        label: chapterLabel(phase, occurrences[phase]),
+        events: [],
+      };
+      chapters.push(current);
+    }
+    current.events.push(event);
+  }
+  return chapters;
+}
+
+function phaseForState(state: string): ActivityPhase | null {
+  if (["created", "planning", "awaiting_clarification", "awaiting_plan_approval"].includes(state)) {
+    return "planning";
+  }
+  if (["executing", "awaiting_action_approval"].includes(state)) return "building";
+  if (state === "verifying") return "verifying";
+  return null;
+}
+
+function chapterLabel(phase: ActivityPhase, occurrence: number): string {
+  if (phase === "planning") return "Planning & decisions";
+  if (phase === "building") return occurrence === 1 ? "Build & checks" : `Repair cycle ${occurrence - 1}`;
+  return occurrence === 1 ? "Independent verification" : `Verification round ${occurrence}`;
+}
