@@ -35,6 +35,8 @@ from traceforge.models import (
     ApprovalRequest,
     ClarificationAnswer,
     ClarificationRequest,
+    ConversationTurn,
+    InteractionMode,
     PlanGate,
     ProjectRecord,
     ProofPack,
@@ -58,6 +60,7 @@ class CreateRunRequest(BaseModel):
 
     task: str = Field(min_length=1, max_length=20_000)
     verifier_enabled: bool = True
+    mode: InteractionMode = InteractionMode.AGENT
     project_id: str | None = None
     workspace: str | None = Field(default=None, max_length=4_096)
     create_direct_workspace: bool = False
@@ -121,6 +124,13 @@ class ActionDecisionRequest(BaseModel):
     approved: bool
 
 
+class FollowUpRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=1, max_length=20_000)
+    mode: InteractionMode = InteractionMode.AGENT
+
+
 class RunView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -129,6 +139,8 @@ class RunView(BaseModel):
     workspace: str
     project_id: str | None
     state: RunState
+    mode: InteractionMode
+    turns: list[ConversationTurn]
     verifier_enabled: bool
     plan: TaskPlan | None
     clarification: ClarificationRequest | None
@@ -354,6 +366,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 workspace,
                 verifier_enabled=body.verifier_enabled,
                 project_id=project_id,
+                mode=(InteractionMode.PLAN if settings.demo_mode else body.mode),
             )
         except Exception:
             if created_workspace is not None:
@@ -382,6 +395,21 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     async def get_proof_pack(run_id: str) -> ProofPack:
         return build_proof_pack(storage.get_run(run_id), storage)
 
+    @app.get("/api/runs/{run_id}/plan.md", response_class=PlainTextResponse)
+    async def download_plan(run_id: str) -> PlainTextResponse:
+        run = storage.get_run(run_id)
+        if run.plan is None:
+            raise HTTPException(status_code=404, detail="No plan has been recorded")
+        return PlainTextResponse(
+            run.plan.markdown,
+            media_type="text/markdown; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="traceforge-{run_id[:8]}-plan.md"'
+                )
+            },
+        )
+
     @app.get("/api/runs/{run_id}/proof-pack.md", response_class=PlainTextResponse)
     async def download_proof_pack(run_id: str) -> PlainTextResponse:
         pack = build_proof_pack(storage.get_run(run_id), storage)
@@ -399,6 +427,18 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     async def answer_questions(run_id: str, body: ClarificationAnswersRequest) -> dict[str, bool]:
         await runtime.manager_for_run(run_id).answer_clarification(run_id, body.answers)
         return {"accepted": True}
+
+    @app.post("/api/runs/{run_id}/turns", response_model=RunView)
+    async def follow_up(run_id: str, body: FollowUpRequest) -> RunView:
+        if settings.demo_mode:
+            raise ValueError(
+                "The fixed demo is a single-turn guided tour; use traceforge serve "
+                "for multi-turn tasks"
+            )
+        run = await runtime.manager_for_run(run_id).follow_up(
+            run_id, body.prompt, mode=body.mode
+        )
+        return RunView.from_record(run, context_limit=settings.context_limit)
 
     @app.post("/api/runs/{run_id}/plan-decision", status_code=status.HTTP_202_ACCEPTED)
     async def decide_plan(run_id: str, body: PlanDecision) -> dict[str, bool]:

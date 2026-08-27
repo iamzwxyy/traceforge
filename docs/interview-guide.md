@@ -4,12 +4,12 @@
 
 TraceForge is a local coding agent built without an agent framework. The model can propose tool
 calls, but the application owns every consequential decision: a state machine, structured
-clarification, plan approval, path and command policy, subprocess lifecycle, evidence freshness,
-persistence, recovery, rollback, and independent verification. Simple, explicitly scoped work can
-take a deterministic low-risk fast path; complex work still requires approval. The visual
-workbench exposes the same persisted evidence used for recovery and a downloadable Proof Pack, so
-the demo is not a decorative chat replay. The project's deliberate tradeoff is one reliable writer
-plus one read-only verifier instead of many parallel agents.
+clarification, Agent/Plan interaction mode, path and command policy, subprocess lifecycle, evidence
+freshness, persistence, recovery, rollback, and independent completion review. Agent mode is the
+low-friction default; optional Plan mode always pauses before implementation. The visual workbench
+keeps multi-turn conversation primary while exposing the same persisted Trace used for recovery and
+a downloadable Proof Pack. The project's deliberate tradeoff is one reliable writer plus one
+read-only verifier instead of many parallel agents.
 
 ## Two-minute video outline
 
@@ -43,13 +43,13 @@ configured model may be the same.
 check lacks fresh passing evidence. Mutations reset those checks. After `finish`, the verifier can
 still reject the result and trigger a bounded repair cycle.
 
-### Does automatic plan approval let the model bypass the user?
+### Does Agent mode let the model bypass the user?
 
-No. The model supplies structured facts, but deterministic application code assigns the gate.
-Automatic approval requires one named file, at most four ordinary steps/checks, routine local
-checks, no clarification, and no sensitive-area language, including in risk notes. Generic caveats
-do not make an inspect/fix/verify plan high risk. The plan stays visible. If the builder
-later targets an undeclared path, execution pauses for a separate action approval before writing.
+No. Agent mode skips only the plan-review click. The model still submits a structured scope and
+acceptance contract, and the application still enforces workspace paths, undeclared-file approval,
+command classification, sandboxing, and destructive-operation denial. Plan mode is available when
+the user wants to inspect the full Markdown plan first; permissions have the same meaning in both
+modes. Completion review is also separate and read-only.
 
 ### What does the Proof Pack hash prove?
 

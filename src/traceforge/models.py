@@ -36,6 +36,11 @@ class RunState(StrEnum):
         }
 
 
+class InteractionMode(StrEnum):
+    AGENT = "agent"
+    PLAN = "plan"
+
+
 class CheckStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -70,6 +75,8 @@ class EventType(StrEnum):
     RUN_RESUMED = "run.resumed"
     ERROR = "error"
     RUN_COMPLETED = "run.completed"
+    TURN_STARTED = "turn.started"
+    TURN_COMPLETED = "turn.completed"
     ROLLBACK_COMPLETED = "rollback.completed"
 
 
@@ -146,6 +153,8 @@ class TaskPlan(BaseModel):
     acceptance_checks: list[AcceptanceCheck] = Field(min_length=1, max_length=12)
     impacted_files: list[str] = Field(default_factory=list, max_length=24)
     risks: list[str] = Field(default_factory=list, max_length=10)
+    approach: str = Field(default="", max_length=4_000)
+    markdown: str = Field(default="", max_length=20_000)
 
     @model_validator(mode="after")
     def validate_scope(self) -> TaskPlan:
@@ -164,13 +173,16 @@ class TaskPlan(BaseModel):
         if len(normalized) != len(set(normalized)):
             raise ValueError("Impacted files must be unique")
         self.impacted_files = normalized
+        # The structured contract is authoritative. Materialize one canonical document so the
+        # downloadable plan cannot drift from the scope and checks enforced by the runtime.
+        self.markdown = _plan_markdown(self)
         return self
 
 
 class PlanGate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    decision: Literal["auto_approved", "approval_required"]
+    decision: Literal["auto_approved", "approval_required", "agent_continues"]
     risk: Literal["low", "medium", "high"]
     reasons: list[str] = Field(min_length=1, max_length=12)
     assessed_at: datetime = Field(default_factory=utc_now)
@@ -253,6 +265,18 @@ class ProviderConfig(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class ConversationTurn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(ge=1)
+    request: str = Field(min_length=1, max_length=20_000)
+    mode: InteractionMode = InteractionMode.AGENT
+    outcome: Literal["in_progress", "succeeded", "failed", "cancelled"] = "in_progress"
+    summary: str = Field(default="", max_length=4_000)
+    started_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+
 class ProofRollback(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -283,6 +307,8 @@ class ProofPack(BaseModel):
     task: str
     workspace: str
     project_id: str | None = None
+    mode: InteractionMode
+    turns: list[ConversationTurn] = Field(default_factory=list)
     state: RunState
     proof_status: Literal["in_progress", "proven", "checks_only", "not_proven"]
     plan: TaskPlan | None = None
@@ -312,6 +338,8 @@ class RunRecord(BaseModel):
     workspace: str
     project_id: str | None = None
     state: RunState = RunState.CREATED
+    mode: InteractionMode = InteractionMode.AGENT
+    turns: list[ConversationTurn] = Field(default_factory=list)
     verifier_enabled: bool = True
     plan: TaskPlan | None = None
     clarification: ClarificationRequest | None = None
@@ -326,3 +354,53 @@ class RunRecord(BaseModel):
     error: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+def _plan_markdown(plan: TaskPlan) -> str:
+    chinese = any("\u3400" <= character <= "\u9fff" for character in plan.summary)
+    labels = (
+        {
+            "title": "实施计划",
+            "goal": "目标",
+            "approach": "方案",
+            "steps": "步骤",
+            "changes": "预期变更",
+            "validation": "验收",
+            "risks": "风险",
+            "unknown_scope": "实施时确认文件范围。",
+            "no_risks": "未识别到常规回归风险之外的重大风险。",
+        }
+        if chinese
+        else {
+            "title": "Implementation plan",
+            "goal": "Goal",
+            "approach": "Approach",
+            "steps": "Steps",
+            "changes": "Expected changes",
+            "validation": "Validation",
+            "risks": "Risks",
+            "unknown_scope": "File scope will be confirmed during implementation.",
+            "no_risks": "No material risks identified beyond normal regression risk.",
+        }
+    )
+    lines = [f"# {labels['title']}", "", f"## {labels['goal']}", "", plan.summary]
+    if plan.approach.strip():
+        lines.extend(["", f"## {labels['approach']}", "", plan.approach.strip()])
+    lines.extend(["", f"## {labels['steps']}", ""])
+    for step in plan.steps:
+        detail = f" — {step.description}" if step.description else ""
+        lines.append(f"- [ ] **{step.title}**{detail}")
+    lines.extend(["", f"## {labels['changes']}", ""])
+    if plan.impacted_files:
+        lines.extend(f"- `{path}`" for path in plan.impacted_files)
+    else:
+        lines.append(f"- {labels['unknown_scope']}")
+    lines.extend(["", f"## {labels['validation']}", ""])
+    for check in plan.acceptance_checks:
+        command = f" — `{' '.join(check.command)}`" if check.command else ""
+        lines.append(f"- [ ] {check.label}{command}")
+    lines.extend(["", f"## {labels['risks']}", ""])
+    lines.extend(f"- {risk}" for risk in plan.risks)
+    if not plan.risks:
+        lines.append(f"- {labels['no_risks']}")
+    return "\n".join(lines)

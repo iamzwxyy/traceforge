@@ -15,7 +15,7 @@ flowchart TB
     API --> Runtime[AgentRuntime workspace router]
     Runtime --> Manager[AgentManager per active workspace]
     Manager --> Provider[ModelProvider]
-    Manager --> Gate[Deterministic plan gate]
+    Manager --> Gate[Interaction mode + scope assessment]
     Manager --> Tools[ToolRegistry]
     Manager --> Context[ContextManager]
     Tools --> Guard[Workspace guard + snapshots]
@@ -32,8 +32,8 @@ flowchart TB
   allowing independent workspaces to progress concurrently without overlapping writers.
 - `AgentManager` is the product core: phases, approvals, retries, evidence freshness, repair
   cycles, cancellation, resume, and completion.
-- `assess_plan_gate` is a deterministic policy projection over the task and structured plan; the
-  model cannot label its own work low-risk.
+- `assess_plan_gate` is a deterministic risk projection over the task and structured plan. The
+  selected interaction mode—not a model claim—decides whether implementation pauses for review.
 - `ToolRegistry` defines and executes the bounded local capability surface.
 - `CommandSandbox` probes an OS backend and constructs a per-command profile; it returns structured
   enforcement metadata even when execution is policy-only or explicitly bypassed.
@@ -50,8 +50,8 @@ stateDiagram-v2
     created --> planning
     planning --> awaiting_clarification
     awaiting_clarification --> planning
-    planning --> awaiting_plan_approval
-    planning --> executing: deterministic low-risk fast path
+    planning --> awaiting_plan_approval: Plan mode
+    planning --> executing: Agent mode
     awaiting_plan_approval --> planning: revise
     awaiting_plan_approval --> executing: approve
     executing --> awaiting_action_approval: unknown action
@@ -60,6 +60,9 @@ stateDiagram-v2
     verifying --> executing: findings and repair budget
     verifying --> succeeded: pass
     verifying --> failed: repair limit
+    succeeded --> created: follow-up turn
+    failed --> created: follow-up turn
+    cancelled --> created: follow-up turn
     created --> cancelled
     planning --> cancelled
     executing --> cancelled
@@ -68,7 +71,7 @@ stateDiagram-v2
     executing --> interrupted: process exit
     interrupted --> planning: resume before plan
     interrupted --> awaiting_plan_approval: resume at plan
-    interrupted --> executing: resume persisted fast path
+    interrupted --> executing: resume persisted Agent-mode plan
     interrupted --> executing: resume approved work
     succeeded --> rolled_back
     failed --> rolled_back
@@ -94,17 +97,18 @@ Malformed structured clarification or plan calls are returned as failed tool res
 field-level schema errors that omit invalid input values. They remain auditable and can be corrected
 within the same bounded planning phase instead of terminating the run.
 
-After validation, application code grades the plan. Automatic approval requires exactly one
-declared file, at most four steps and checks, no clarification, no sensitive-area language in task
-or risk notes, and only recognized local verification commands. Generic low-impact caveats do not
-disable the fast path. Every other plan enters the visible
-approval state. The decision and reasons are persisted as a `PlanGate`; a restart preserves an
-already-recorded fast-path decision. Any later file mutation outside `impacted_files` is a separate
-action approval, so automatic plan approval does not silently broaden the scope.
+After validation, application code grades risk and records the reasons, but interaction mode owns
+the pause semantics. Agent mode persists `agent_continues` and moves directly to implementation;
+Plan mode persists `approval_required` and always waits, even for a one-file low-risk task. The
+structured fields are materialized as one canonical Markdown document containing goal, approach,
+steps, expected files, validation, and risks; `GET /api/runs/{id}/plan.md` downloads that exact
+contract. A restart preserves the recorded decision. Any later file mutation outside
+`impacted_files` is a separate action approval in either mode, so skipping a plan-review click does
+not broaden technical permissions.
 
 ### Building
 
-The builder receives the original task and approved plan. It can call six local file/process tools
+The builder receives the current turn, earlier turn summaries, and recorded plan. It can call six local file/process tools
 plus the structured `update_plan` and `finish` controls. File mutations invalidate prior command
 evidence. Exact acceptance commands and known read-only commands enter the OS sandbox when its
 probe succeeds. Non-writing, non-interactive focused Pytest variants from the same launcher family
@@ -122,8 +126,8 @@ The loop has three independent brakes:
 
 ### Verifying
 
-The verifier receives the original task, approved plan, current diff, and recent persisted tool
-events. Its available local tools are read-only. Invalid structured reports are returned as tool
+The verifier receives the current request, earlier turn summaries, recorded plan, current diff,
+and recent persisted tool events. Its available local tools are read-only. Invalid structured reports are returned as tool
 errors for correction. Mixed read-and-submit turns must finish the reads and submit one verdict in
 a later turn, keeping Chat Completions tool-call/result ordering valid.
 
@@ -165,12 +169,19 @@ window, and only when history is long enough, it retains the first two messages,
 and inserts an evidence-oriented summary of the middle. Tool names and bounded results are kept;
 hidden reasoning is neither requested nor displayed.
 
+A run is also a durable conversation. `ConversationTurn` records the request, selected Agent/Plan
+mode, outcome, completion summary, and timestamps. A terminal successful, failed, or cancelled run
+can transition back to `created` for a follow-up. The next planner receives the last six completed
+turn requests and summaries while keeping the same run id, project, workspace snapshots, event
+ledger, and rollback boundary. Model protocol messages reset per turn so stale tool-call state is
+not mixed into a new request.
+
 ## Persistence and recovery
 
 SQLite uses WAL mode and six tables:
 
-- `runs`: public state, optional project association, internal messages, plan and deterministic
-  gate, approval state, and interrupted origin;
+- `runs`: public state, optional project association, current interaction mode, conversation turns,
+  internal messages, plan and scope assessment, approval state, and interrupted origin;
 - `events`: per-run monotonically increasing sequence and JSON payload;
 - `snapshots`: original bytes, mode, original hash, and last agent-written hash per path.
 - `projects`: reusable display names and canonical local root directories;
@@ -204,9 +215,9 @@ post-agent user change.
 ## HTTP and event surface
 
 The same-origin service defaults to `127.0.0.1`. REST manages direct-task directories, projects,
-provider references, connection probes, and run controls; it returns current state/diff/events and
-resolves plan or action decisions. JSON and Markdown Proof Pack routes expose the evidence
-projection. WebSocket pushes the persisted event stream. Origins are restricted to localhost, and
+provider references, connection probes, and run controls; it returns current state/diff/events,
+adds follow-up turns, downloads Markdown plans, and resolves plan or action decisions. JSON and
+Markdown Proof Pack routes expose the evidence projection. WebSocket pushes the persisted event stream. Origins are restricted to localhost, and
 responses include CSP, frame denial, referrer, and MIME-sniffing headers. The React production
 build is part of the Python wheel.
 

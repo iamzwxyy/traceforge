@@ -17,8 +17,8 @@ records its own retry decisions. Exhausting a retryable failure pauses rather th
 an interrupted run has no live worker, so the user may repair provider settings and then resume.
 
 `run.resumed` is emitted before resumed work continues. Its strategy is application-selected:
-clarification and plan approvals return to their human gate, a persisted low-risk decision resumes
-the fast path, and previously approved execution resumes only after an explicit inspect-first
+clarification and Plan-mode approvals return to their human gate, a persisted Agent auto-continue
+decision resumes without inventing a click, and previously approved execution resumes only after an explicit inspect-first
 instruction. `repair.started` records the bounded cycle number and the verifier finding that caused
 it. Both events enter the same append-only sequence hashed by the Proof Pack.
 

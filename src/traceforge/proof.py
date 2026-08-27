@@ -41,6 +41,8 @@ def build_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
         "task": run.task,
         "workspace": run.workspace,
         "project_id": run.project_id,
+        "mode": run.mode.value,
+        "turns": [turn.model_dump(mode="json") for turn in run.turns],
         "state": run.state.value,
         "proof_status": proof_status,
         "plan": run.plan.model_dump(mode="json") if run.plan else None,
@@ -80,28 +82,37 @@ def proof_pack_markdown(pack: ProofPack) -> str:
         f"- Diff source: `{pack.diff_source}`",
         f"- Generated: {pack.generated_at.isoformat()}",
         "",
-        "## Request",
-        "",
-        pack.task,
+        "## Conversation",
         "",
         f"Workspace: `{pack.workspace}`",
     ]
     if pack.project_id:
         lines.append(f"Project ID: `{pack.project_id}`")
-    lines.extend(["", "## Plan and gate", ""])
+    lines.append("")
+    if pack.turns:
+        for turn in pack.turns:
+            lines.extend(
+                [
+                    f"### Turn {turn.index} · {turn.mode.value}",
+                    "",
+                    turn.request,
+                    "",
+                    f"Outcome: **{turn.outcome}**",
+                    turn.summary or "No summary recorded.",
+                    "",
+                ]
+            )
+    else:
+        lines.extend([pack.task, ""])
+    lines.extend(["## Plan and gate", ""])
     if pack.plan:
-        lines.append(pack.plan.summary)
-        lines.append("")
+        lines.extend([pack.plan.markdown, ""])
         if pack.plan_gate:
             lines.append(
                 f"Gate: **{pack.plan_gate.decision}** · risk **{pack.plan_gate.risk}**"
             )
             lines.extend(f"- {reason}" for reason in pack.plan_gate.reasons)
             lines.append("")
-        lines.extend(
-            f"{index}. **{step.title}** — {step.description or step.status}"
-            for index, step in enumerate(pack.plan.steps, start=1)
-        )
     else:
         lines.append("No plan has been recorded yet.")
     lines.extend(["", "## Changed files", ""])
@@ -132,7 +143,7 @@ def proof_pack_markdown(pack: ProofPack) -> str:
         )
     else:
         lines.append("No acceptance evidence yet.")
-    lines.extend(["", "## Independent verification", ""])
+    lines.extend(["", "## Independent read-only completion review", ""])
     if pack.verification:
         lines.append(f"Verdict: **{pack.verification.verdict.value}**")
         lines.append("")

@@ -46,16 +46,11 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import ReactMarkdown from "react-markdown";
-import {
-  buildActivityChapters,
-  isActiveState,
-  parseDiff,
-  presentState,
-  shouldSubmitPrompt,
-} from "./lib";
+import { isActiveState, parseDiff, presentState, shouldSubmitPrompt } from "./lib";
 import type {
   ClarificationAnswer,
   DirectoryListing,
+  InteractionMode,
   PlanGate,
   Project,
   ProofPack,
@@ -255,8 +250,8 @@ export default function App() {
               providerReady={Boolean(forge.provider?.api_key_configured)}
               onOpenSettings={() => setShowSettings(true)}
               onCancel={() => setShowComposer(false)}
-              onSubmit={async (task, verifier, target) => {
-                await forge.createRun(task, verifier, target);
+              onSubmit={async (task, mode, target) => {
+                await forge.createRun(task, mode, target);
                 setShowComposer(false);
               }}
               canCancel={Boolean(forge.run)}
@@ -265,6 +260,7 @@ export default function App() {
             <RunStage
               run={forge.run}
               events={forge.events}
+              followUpEnabled={forge.status?.mode !== "demo"}
               onAnswer={(answers) => void forge.answerQuestions(answers)}
               onPlan={(decision, feedback) => void forge.decidePlan(decision, feedback)}
               onAction={(approved) => void forge.decideAction(approved)}
@@ -274,6 +270,9 @@ export default function App() {
               onProof={() => {
                 setShowProof(true);
                 void forge.loadProofPack(forge.run!.id);
+              }}
+              onFollowUp={async (prompt, mode) => {
+                await forge.followUp(prompt, mode);
               }}
             />
           )}
@@ -594,12 +593,12 @@ function TaskComposer({
   demoMode: boolean;
   providerReady: boolean;
   onOpenSettings: () => void;
-  onSubmit: (task: string, verifier: boolean, target: RunTarget) => Promise<void>;
+  onSubmit: (task: string, mode: InteractionMode, target: RunTarget) => Promise<void>;
   onCancel: () => void;
   canCancel: boolean;
 }) {
   const [task, setTask] = useState(suggestedTask);
-  const [verifier, setVerifier] = useState(true);
+  const [planMode, setPlanMode] = useState(demoMode);
   const [submitting, setSubmitting] = useState(false);
   const targetLabel = project ? project.name : demoMode ? "固定演示" : "直接任务";
   return (
@@ -625,7 +624,7 @@ function TaskComposer({
             : demoMode
               ? {}
               : { create_direct_workspace: true };
-          void onSubmit(task.trim(), verifier, target)
+          void onSubmit(task.trim(), planMode ? "plan" : "agent", target)
             .catch(() => undefined)
             .finally(() => setSubmitting(false));
         }}
@@ -665,11 +664,15 @@ function TaskComposer({
           rows={6}
         />
         <div className="composer-actions">
-          <label className="toggle-row">
-            <input type="checkbox" checked={verifier} onChange={(event) => setVerifier(event.target.checked)} />
+          <label className="toggle-row plan-mode-toggle">
+            <input type="checkbox" checked={planMode} onChange={(event) => setPlanMode(event.target.checked)} disabled={demoMode} />
             <span className="toggle" />
-            <span><strong>独立验证</strong><small>检查通过后进行只读审查</small></span>
+            <span><strong>计划模式</strong><small>先生成完整方案，确认后再实施</small></span>
           </label>
+          <div className="composer-safeguards" aria-label="任务保障">
+            <span><ShieldCheck size={13} /><strong>工作区内自动</strong> · 越界询问</span>
+            <span><CheckCircle2 size={13} /><strong>完成后复核</strong> · 独立只读审查</span>
+          </div>
           <div className="button-row">
             {canCancel && <button className="button ghost" type="button" onClick={onCancel}>取消</button>}
             <button
@@ -973,9 +976,12 @@ function RunStage({
   onResume,
   onRollback,
   onProof,
+  onFollowUp,
+  followUpEnabled,
 }: {
   run: Run;
   events: RunEvent[];
+  followUpEnabled: boolean;
   onAnswer: (answers: ClarificationAnswer[]) => void;
   onPlan: (decision: "approve" | "revise", feedback?: string) => void;
   onAction: (approved: boolean) => void;
@@ -983,6 +989,7 @@ function RunStage({
   onResume: () => void;
   onRollback: () => void;
   onProof: () => void;
+  onFollowUp: (prompt: string, mode: InteractionMode) => Promise<void>;
 }) {
   const [confirmRollback, setConfirmRollback] = useState(false);
   return (
@@ -991,8 +998,9 @@ function RunStage({
         <div>
           <div className="run-header-meta">
             <StateBadge state={run.state} />
-            {run.plan_gate && <PlanGateBadge gate={run.plan_gate} />}
-            <span>运行 {run.id.slice(0, 8).toUpperCase()}</span>
+            {run.mode === "plan" && run.plan_gate && <PlanGateBadge gate={run.plan_gate} />}
+            <span>{run.mode === "plan" ? "计划模式" : "普通 Agent"} · 第 {Math.max(run.turns.length, 1)} 轮</span>
+            <span>任务 {run.id.slice(0, 8).toUpperCase()}</span>
           </div>
           <h2>{run.task}</h2>
         </div>
@@ -1008,23 +1016,13 @@ function RunStage({
           )}
         </div>
       </div>
-      <div className="phase-ribbon">
-        {(["计划", "执行", "验证", "证据"] as const).map((label, index) => {
-          const current = phaseIndex(run.state);
-          return (
-            <div className={index < current ? "done" : index === current ? "current" : ""} key={label}>
-              <span>{index < current ? <Check size={12} /> : index + 1}</span>{label}
-            </div>
-          );
-        })}
-      </div>
-      <ActivityFeed events={events} state={run.state} />
+      <ActivityFeed run={run} events={events} />
       <div className="interaction-dock">
         {run.state === "awaiting_clarification" && run.clarification && (
           <ClarificationPanel request={run.clarification} onSubmit={onAnswer} />
         )}
         {run.state === "awaiting_plan_approval" && run.plan && (
-          <PlanPanel plan={run.plan} gate={run.plan_gate} onDecision={onPlan} />
+          <PlanPanel runId={run.id} plan={run.plan} gate={run.plan_gate} onDecision={onPlan} />
         )}
         {run.state === "awaiting_action_approval" && run.pending_approval && (
           <ApprovalPanel approval={run.pending_approval} onDecision={onAction} />
@@ -1043,6 +1041,9 @@ function RunStage({
         )}
         {run.error && <Notice icon={<OctagonX size={18} />} title={run.state === "interrupted" ? "暂停原因" : "停止原因"} danger={run.state !== "interrupted"}>{systemMessageLabel(run.error)}</Notice>}
         {run.state === "succeeded" && <EvidenceBoard run={run} onProof={onProof} />}
+        {followUpEnabled && ["succeeded", "failed", "cancelled"].includes(run.state) && (
+          <FollowUpComposer onSubmit={onFollowUp} />
+        )}
       </div>
       {confirmRollback && (
         <RollbackDialog
@@ -1084,43 +1085,55 @@ function RollbackDialog({ onClose, onConfirm }: { onClose: () => void; onConfirm
   );
 }
 
-function ActivityFeed({ events, state }: { events: RunEvent[]; state: RunState }) {
+function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
   const end = useRef<HTMLDivElement>(null);
-  const chapters = useMemo(() => buildActivityChapters(events), [events]);
-  const latestId = chapters.at(-1)?.id ?? null;
-  const [expanded, setExpanded] = useState<string | null>(null);
-  useEffect(() => {
-    if (latestId) setExpanded(latestId);
-  }, [latestId]);
+  const conversation = events.filter((event) =>
+    ["turn.started", "turn.completed", "message"].includes(event.type)
+  );
+  const trace = events.filter((event) =>
+    [
+      "tool.completed",
+      "plan.gated",
+      "verification.completed",
+      "repair.started",
+      "model.retry",
+      "run.resumed",
+      "error",
+    ].includes(event.type)
+  );
+  const hasPersistedTurn = conversation.some((event) => event.type === "turn.started");
   useEffect(() => {
     end.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [events.length]);
   return (
     <div className="activity-feed">
-      {chapters.length === 0 && (
-        <div className="thinking-row"><LoaderCircle className="spin" size={16} /><span>{presentState(state).label}…</span></div>
+      {!hasPersistedTurn && (
+        <article className="conversation-turn user-turn">
+          <span>你</span><p>{run.task}</p>
+        </article>
       )}
-      {chapters.map((chapter, index) => {
-        const current = index === chapters.length - 1 && isActiveState(state);
-        const PhaseIcon = chapter.phase === "planning" ? ClipboardCheck : chapter.phase === "building" ? Hammer : ShieldCheck;
-        const toolCount = chapter.events.filter((event) => event.type === "tool.completed").length;
-        return (
-          <section className={`activity-chapter ${expanded === chapter.id ? "expanded" : ""}`} key={chapter.id}>
-            <button
-              className="chapter-heading"
-              type="button"
-              aria-expanded={expanded === chapter.id}
-              onClick={() => setExpanded((value) => value === chapter.id ? null : chapter.id)}
-            >
-              <span className={`chapter-icon ${current ? "live" : "complete"}`}>{current ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}</span>
-              <span className="chapter-title"><small>{activityPhaseLabel(chapter.phase)}</small><strong>{chapter.label}</strong></span>
-              <span className="chapter-meta"><PhaseIcon size={12} /> {toolCount} 个工具动作 · {chapter.events.length} 条事件</span>
-              <ChevronDown className="chapter-chevron" size={14} />
-            </button>
-            {expanded === chapter.id && <div className="chapter-body">{chapter.events.map((event) => <ActivityItem event={event} key={event.seq} />)}</div>}
-          </section>
-        );
+      {conversation.map((event) => {
+        if (event.type === "turn.started") {
+          return <article className="conversation-turn user-turn" key={event.seq}><span>你 · 第 {String(event.payload.index ?? "?")} 轮</span><p>{String(event.payload.request ?? "")}</p></article>;
+        }
+        if (event.type === "turn.completed") {
+          return <article className={`conversation-turn assistant-turn ${String(event.payload.outcome ?? "")}`} key={event.seq}><span>TraceForge</span><ReactMarkdown>{String(event.payload.summary ?? "本轮已结束。")}</ReactMarkdown></article>;
+        }
+        return <article className="conversation-turn assistant-turn" key={event.seq}><span>TraceForge</span><ReactMarkdown>{String(event.payload.content ?? "")}</ReactMarkdown></article>;
       })}
+      {conversation.length === 0 && isActiveState(run.state) && (
+        <div className="thinking-row"><LoaderCircle className="spin" size={16} /><span>{presentState(run.state).label}…</span></div>
+      )}
+      {trace.length > 0 && (
+        <details className="trace-details">
+          <summary>
+            {isActiveState(run.state) ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}
+            <span><strong>{isActiveState(run.state) ? presentState(run.state).label : "查看工作记录"}</strong><small>{trace.length} 条 Trace · 计划、工具、验证均可审计</small></span>
+            <ChevronDown size={14} />
+          </summary>
+          <div className="trace-body">{trace.map((event) => <ActivityItem event={event} key={event.seq} />)}</div>
+        </details>
+      )}
       <div ref={end} />
     </div>
   );
@@ -1141,10 +1154,11 @@ function ActivityItem({ event }: { event: RunEvent }) {
   if (event.type === "plan.gated") {
     const decision = String(event.payload.decision ?? "assessed");
     const reasons = Array.isArray(event.payload.reasons) ? event.payload.reasons.map(String) : [];
+    const agentContinues = decision === "agent_continues";
     return (
       <article className="activity evidence-activity policy-activity">
         <div className="activity-icon"><Zap size={15} /></div>
-        <div><span className="activity-label">确定性计划门</span><strong>{planDecisionLabel(decision)} · {riskLabel(String(event.payload.risk ?? "unknown"))}</strong>{reasons.length > 0 && <p>{reasons.map(planGateReasonLabel).join(" · ")}</p>}</div>
+        <div><span className="activity-label">{agentContinues ? "Agent 工作边界" : "计划模式检查点"}</span><strong>{planDecisionLabel(decision)} · {riskLabel(String(event.payload.risk ?? "unknown"))}</strong>{reasons.length > 0 && <p>{reasons.map(planGateReasonLabel).join(" · ")}</p>}</div>
       </article>
     );
   }
@@ -1152,7 +1166,7 @@ function ActivityItem({ event }: { event: RunEvent }) {
     return (
       <article className="activity evidence-activity verifier-activity">
         <div className="activity-icon"><ShieldCheck size={15} /></div>
-        <div><span className="activity-label">独立验证结论</span><strong>{verdictLabel(String(event.payload.verdict ?? "inconclusive"))}</strong><p>{String(event.payload.summary ?? "没有记录摘要。")}</p></div>
+        <div><span className="activity-label">完成后复核</span><strong>{verdictLabel(String(event.payload.verdict ?? "inconclusive"))}</strong><p>{String(event.payload.summary ?? "没有记录摘要。")}</p></div>
       </article>
     );
   }
@@ -1169,7 +1183,7 @@ function ActivityItem({ event }: { event: RunEvent }) {
     return (
       <article className="activity evidence-activity repair-activity">
         <div className="activity-icon"><Wrench size={15} /></div>
-        <div><span className="activity-label">有界修复</span><strong>第 {String(event.payload.cycle ?? "?")} / {String(event.payload.limit ?? "?")} 轮</strong><p>{String(event.payload.summary ?? "独立验证要求进行修复。")}</p></div>
+        <div><span className="activity-label">有界修复</span><strong>第 {String(event.payload.cycle ?? "?")} / {String(event.payload.limit ?? "?")} 轮</strong><p>{String(event.payload.summary ?? "完成后复核要求进行修复。")}</p></div>
       </article>
     );
   }
@@ -1254,19 +1268,16 @@ function ClarificationPanel({ request, onSubmit }: { request: NonNullable<Run["c
   );
 }
 
-function PlanPanel({ plan, gate, onDecision }: { plan: TaskPlan; gate: PlanGate | null; onDecision: (decision: "approve" | "revise", feedback?: string) => void }) {
+function PlanPanel({ runId, plan, gate, onDecision }: { runId: string; plan: TaskPlan; gate: PlanGate | null; onDecision: (decision: "approve" | "revise", feedback?: string) => void }) {
   const [revising, setRevising] = useState(false);
   const [feedback, setFeedback] = useState("");
   return (
     <div className="decision-panel plan-panel">
       <div className="decision-heading"><ClipboardCheck size={19} /><div><p>计划审批</p><h3>{plan.summary}</h3></div></div>
       {gate && <PlanGateSummary gate={gate} />}
-      <ol className="plan-steps">{plan.steps.map((step) => <li key={step.id}><span>{step.id}</span><div><strong>{step.title}</strong>{step.description && <small>{step.description}</small>}</div></li>)}</ol>
-      {plan.impacted_files.length > 0 && <div className="impact-files"><span>计划修改的文件</span>{plan.impacted_files.map((path) => <code key={path}>{path}</code>)}</div>}
-      <div className="plan-checks"><p>完成契约</p>{plan.acceptance_checks.map((check) => <div key={check.id}><ShieldCheck size={14} /><span>{check.label}</span>{check.command && <code>{check.command.join(" ")}</code>}</div>)}</div>
-      {plan.risks.length > 0 && <div className="risk-strip"><AlertTriangle size={15} /><span>{plan.risks.join(" · ")}</span></div>}
+      <div className="plan-document"><ReactMarkdown>{plan.markdown}</ReactMarkdown></div>
       {revising && <textarea className="revision-input" autoFocus placeholder="这份计划需要怎样调整？" value={feedback} onChange={(event) => setFeedback(event.target.value)} />}
-      <div className="decision-actions"><span className="muted">尚未修改任何文件。</span><div className="button-row">{revising ? <><button className="button ghost" type="button" onClick={() => setRevising(false)}>返回</button><button className="button" type="button" disabled={!feedback.trim()} onClick={() => onDecision("revise", feedback.trim())}>提交修改意见</button></> : <><button className="button ghost" type="button" onClick={() => setRevising(true)}>调整计划</button><button className="button primary" type="button" onClick={() => onDecision("approve")}><Check size={15} /> 批准并执行</button></>}</div></div>
+      <div className="decision-actions"><a className="button ghost" href={`/api/runs/${runId}/plan.md`} download><Download size={14} /> 下载 Markdown</a><div className="button-row">{revising ? <><button className="button ghost" type="button" onClick={() => setRevising(false)}>返回</button><button className="button" type="button" disabled={!feedback.trim()} onClick={() => onDecision("revise", feedback.trim())}>提交修改意见</button></> : <><button className="button ghost" type="button" onClick={() => setRevising(true)}>调整计划</button><button className="button primary" type="button" onClick={() => onDecision("approve")}><Check size={15} /> 批准并执行</button></>}</div></div>
     </div>
   );
 }
@@ -1289,6 +1300,57 @@ function EvidenceBoard({ run, onProof }: { run: Run; onProof: () => void }) {
       <div><p className="eyebrow">完成证据</p><h3>工作已被证明，而不只是宣称完成</h3><p>{run.verification?.summary}</p></div>
       <div className="evidence-actions"><div className="evidence-stats"><div><strong>{run.plan?.acceptance_checks.filter((check) => check.status === "passed").length ?? 0}</strong><span>项检查通过</span></div><div><strong>{run.step_count}</strong><span>个工具步骤</span></div><div><strong>{run.repair_cycles}</strong><span>轮修复</span></div></div><button className="button" type="button" onClick={onProof}><Fingerprint size={14} /> 证据包</button></div>
     </div>
+  );
+}
+
+function FollowUpComposer({ onSubmit }: { onSubmit: (prompt: string, mode: InteractionMode) => Promise<void> }) {
+  const [prompt, setPrompt] = useState("");
+  const [planMode, setPlanMode] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  return (
+    <form
+      className="follow-up-composer"
+      onSubmit={(event) => {
+        event.preventDefault();
+        const request = prompt.trim();
+        if (!request || submitting) return;
+        setSubmitting(true);
+        void onSubmit(request, planMode ? "plan" : "agent")
+          .then(() => setPrompt(""))
+          .catch(() => undefined)
+          .finally(() => setSubmitting(false));
+      }}
+    >
+      <textarea
+        value={prompt}
+        onChange={(event) => setPrompt(event.target.value)}
+        onKeyDown={(event) => {
+          if (shouldSubmitPrompt({
+            key: event.key,
+            shiftKey: event.shiftKey,
+            isComposing: event.nativeEvent.isComposing,
+          }) && !submitting) {
+            event.preventDefault();
+            event.currentTarget.form?.requestSubmit();
+          }
+        }}
+        placeholder="继续提出修改，TraceForge 会保留同一任务的上下文与证据…"
+        rows={3}
+        aria-label="继续此任务"
+      />
+      <div className="follow-up-actions">
+        <label className="toggle-row">
+          <input type="checkbox" checked={planMode} onChange={(event) => setPlanMode(event.target.checked)} />
+          <span className="toggle" />
+          <span><strong>计划模式</strong><small>本轮先审计划再执行</small></span>
+        </label>
+        <span className="follow-up-hint">Enter 发送 · Shift+Enter 换行</span>
+        <button className="button primary" type="submit" disabled={!prompt.trim() || submitting}>
+          {submitting ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}
+          继续任务
+        </button>
+      </div>
+    </form>
   );
 }
 
@@ -1353,15 +1415,22 @@ function DiffView({ diff }: { diff: string }) {
 
 function ChecksView({ run }: { run: Run }) {
   if (!run.plan) return <div className="inspector-empty"><ClipboardCheck size={26} /><p>规划完成后会显示检查项。</p></div>;
-  return <div className="checks-view">{run.plan_gate && <PlanGateSummary gate={run.plan_gate} />}<div className="section-kicker">可见计划</div><ol className="plan-steps inspector-plan">{run.plan.steps.map((step) => <li key={step.id}><span>{step.status === "completed" ? <Check size={11} /> : step.id}</span><div><strong>{step.title}</strong>{step.description && <small>{step.description}</small>}</div></li>)}</ol>{run.plan.impacted_files.length > 0 && <div className="impact-files"><span>计划修改的文件</span>{run.plan.impacted_files.map((path) => <code key={path}>{path}</code>)}</div>}<div className="section-kicker contract-kicker">验收契约</div>{run.plan.acceptance_checks.map((check) => <article className={`check-row ${check.status}`} key={check.id}><div className="check-icon">{check.status === "passed" ? <Check size={14} /> : check.status === "failed" ? <X size={14} /> : <Circle size={10} />}</div><div><strong>{check.label}</strong>{check.command && <code>{check.command.join(" ")}</code>}{check.evidence && <pre>{check.evidence}</pre>}</div><span>{checkStatusLabel(check.status)}</span></article>)}</div>;
+  return <div className="checks-view">{run.plan_gate && <PlanGateSummary gate={run.plan_gate} />}<div className="section-heading"><div className="section-kicker">Markdown 计划</div><a href={`/api/runs/${run.id}/plan.md`} download title="下载计划"><Download size={13} /> 下载</a></div><div className="plan-document compact"><ReactMarkdown>{run.plan.markdown}</ReactMarkdown></div><div className="section-kicker contract-kicker">实时验收证据</div>{run.plan.acceptance_checks.map((check) => <article className={`check-row ${check.status}`} key={check.id}><div className="check-icon">{check.status === "passed" ? <Check size={14} /> : check.status === "failed" ? <X size={14} /> : <Circle size={10} />}</div><div><strong>{check.label}</strong>{check.command && <code>{check.command.join(" ")}</code>}{check.evidence && <pre>{check.evidence}</pre>}</div><span>{checkStatusLabel(check.status)}</span></article>)}</div>;
 }
 
 function PlanGateBadge({ gate }: { gate: PlanGate }) {
-  return <span className={`plan-gate-badge ${gate.decision === "auto_approved" ? "fast" : "reviewed"}`}>{gate.decision === "auto_approved" ? <Zap size={10} /> : <ShieldCheck size={10} />}{gate.decision === "auto_approved" ? "快速路径" : riskLabel(gate.risk)}</span>;
+  const automatic = gate.decision !== "approval_required";
+  return <span className={`plan-gate-badge ${automatic ? "fast" : "reviewed"}`}>{automatic ? <Zap size={10} /> : <ShieldCheck size={10} />}{gate.decision === "agent_continues" ? "Agent 自动" : gate.decision === "auto_approved" ? "快速路径" : riskLabel(gate.risk)}</span>;
 }
 
 function PlanGateSummary({ gate }: { gate: PlanGate }) {
-  return <div className={`plan-gate-summary ${gate.decision === "auto_approved" ? "fast" : "review"}`}><div>{gate.decision === "auto_approved" ? <Zap size={15} /> : <ShieldCheck size={15} />}<span><strong>{gate.decision === "auto_approved" ? "低风险快速路径" : "需要审批计划"}</strong><small>确定性评估 · {riskLabel(gate.risk)}</small></span></div><ul>{gate.reasons.map((reason) => <li key={reason}>{planGateReasonLabel(reason)}</li>)}</ul></div>;
+  const automatic = gate.decision !== "approval_required";
+  const title = gate.decision === "agent_continues"
+    ? "普通 Agent 已自动继续"
+    : gate.decision === "auto_approved"
+      ? "低风险快速路径"
+      : "计划模式等待确认";
+  return <div className={`plan-gate-summary ${automatic ? "fast" : "review"}`}><div>{automatic ? <Zap size={15} /> : <ShieldCheck size={15} />}<span><strong>{title}</strong><small>工作边界评估 · {riskLabel(gate.risk)}</small></span></div><ul>{gate.reasons.map((reason) => <li key={reason}>{planGateReasonLabel(reason)}</li>)}</ul></div>;
 }
 
 function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; runId: string; onClose: () => void }) {
@@ -1372,7 +1441,7 @@ function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; run
         <div className="modal-heading"><div><p className="eyebrow">可审计完成记录</p><h2 id="proof-title">证据包</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭证据包"><X size={17} /></button></div>
         {!pack ? <div className="proof-loading"><LoaderCircle className="spin" size={18} /> 正在汇总持久化证据…</div> : <>
           <div className={`proof-verdict ${pack.proof_status}`}><div className="evidence-seal"><Fingerprint size={22} /></div><div><span>证明状态</span><strong>{proofStatusLabel(pack.proof_status)}</strong><small>{pack.verification?.summary ?? "仍在汇总证据。"}</small></div><div><span>新鲜检查</span><strong>{pack.checks_fresh ? "是" : "否"}</strong></div></div>
-          <div className="proof-grid"><article><span>计划门</span><strong>{pack.plan_gate ? planDecisionLabel(pack.plan_gate.decision) : "未评估"}</strong><small>{pack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>变更范围</span><strong>{pack.changed_files.length} 个文件</strong><small>{pack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(pack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(pack.command_sandbox.status)}</strong><small>{pack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {pack.command_sandbox.sandboxed_commands} 个已强制隔离 · {pack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(pack.rollback.status)}</strong><small>{pack.rollback.conflicts.length ? `保留 ${pack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>{pack.event_count} 条事件</strong><small>{pack.step_count} 个工具步骤 · {pack.repair_cycles} 轮修复</small></article></div>
+          <div className="proof-grid"><article><span>工作边界</span><strong>{pack.plan_gate ? planDecisionLabel(pack.plan_gate.decision) : "未评估"}</strong><small>{pack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>变更范围</span><strong>{pack.changed_files.length} 个文件</strong><small>{pack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(pack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(pack.command_sandbox.status)}</strong><small>{pack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {pack.command_sandbox.sandboxed_commands} 个已强制隔离 · {pack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(pack.rollback.status)}</strong><small>{pack.rollback.conflicts.length ? `保留 ${pack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>{pack.event_count} 条事件</strong><small>{pack.step_count} 个工具步骤 · {pack.repair_cycles} 轮修复</small></article></div>
           <div className="proof-section"><div className="section-kicker">原始任务</div><p>{pack.task}</p></div>
           <div className="proof-section"><div className="section-kicker">验收证据</div>{pack.plan?.acceptance_checks.map((check) => <div className="proof-check" key={check.id}><CheckCircle2 size={14} /><span><strong>{check.label}</strong><small>{check.evidence || check.command?.join(" ") || "等待证据"}</small></span><em>{checkStatusLabel(check.status)}</em></div>) ?? <p className="muted">尚无完成契约。</p>}</div>
           <div className="digest-card"><Fingerprint size={15} /><span><small>稳定证据 SHA-256</small><code>{pack.evidence_sha256}</code></span></div>
@@ -1385,8 +1454,8 @@ function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; run
 
 function VerifierView({ run }: { run: Run }) {
   const report = run.verification;
-  if (!report) return <div className="inspector-empty"><ShieldCheck size={26} /><p>{run.verifier_enabled ? "检查通过后会开始独立审查。" : "本次运行未启用独立验证。"}</p></div>;
-  return <div className="verifier-view"><div className={`verdict ${report.verdict}`}><ShieldCheck size={22} /><div><span>独立验证结论</span><strong>{verdictLabel(report.verdict)}</strong></div></div><p>{report.summary}</p>{report.findings.map((finding) => <article className="finding" key={`${finding.severity}-${finding.title}`}><span>{severityLabel(finding.severity)}</span><strong>{finding.title}</strong><p>{finding.evidence}</p>{finding.suggested_fix && <small>建议修复：{finding.suggested_fix}</small>}</article>)}</div>;
+  if (!report) return <div className="inspector-empty"><ShieldCheck size={26} /><p>{run.verifier_enabled ? "实现和检查完成后，将自动进行独立只读复核。" : "本次运行未启用完成后复核。"}</p></div>;
+  return <div className="verifier-view"><div className={`verdict ${report.verdict}`}><ShieldCheck size={22} /><div><span>完成后复核</span><strong>{verdictLabel(report.verdict)}</strong></div></div><p>{report.summary}</p>{report.findings.map((finding) => <article className="finding" key={`${finding.severity}-${finding.title}`}><span>{severityLabel(finding.severity)}</span><strong>{finding.title}</strong><p>{finding.evidence}</p>{finding.suggested_fix && <small>建议修复：{finding.suggested_fix}</small>}</article>)}</div>;
 }
 
 function StateBadge({ state }: { state: RunState }) {
@@ -1398,13 +1467,6 @@ function Notice({ icon, title, children, danger = false }: { icon: React.ReactNo
   return <div className={`notice ${danger ? "danger" : ""}`}><div>{icon}</div><div><strong>{title}</strong><p>{children}</p></div></div>;
 }
 
-function phaseIndex(state: RunState): number {
-  if (["created", "planning", "awaiting_clarification", "awaiting_plan_approval"].includes(state)) return 0;
-  if (["executing", "awaiting_action_approval"].includes(state)) return 1;
-  if (state === "verifying") return 2;
-  return 3;
-}
-
 function formatArguments(value?: Record<string, unknown>): string {
   if (!value) return "";
   if (Array.isArray(value.argv)) return value.argv.map(String).join(" ");
@@ -1414,10 +1476,6 @@ function formatArguments(value?: Record<string, unknown>): string {
 
 function labelFromMap(value: string, labels: Record<string, string>): string {
   return labels[value.replaceAll(" ", "_")] ?? value.replaceAll("_", " ");
-}
-
-function activityPhaseLabel(phase: "planning" | "building" | "verifying"): string {
-  return labelFromMap(phase, { planning: "规划", building: "执行", verifying: "验证" });
 }
 
 function agentPhaseLabel(phase: string): string {
@@ -1436,6 +1494,7 @@ function planDecisionLabel(decision: string): string {
     assessed: "已评估",
     auto_approved: "自动通过",
     approval_required: "需要审批",
+    agent_continues: "Agent 自动继续",
   });
 }
 
@@ -1575,6 +1634,8 @@ function rollbackStatusLabel(status: string): string {
 
 function planGateReasonLabel(reason: string): string {
   const exact: Record<string, string> = {
+    "Agent mode continues without a plan approval pause": "普通 Agent 不因计划审批而暂停",
+    "Plan mode pauses for review before implementation": "计划模式会在实施前等待确认",
     "Material choices were clarified with the user": "已与用户澄清关键选择",
     "The plan must name exactly one impacted file for automatic approval": "仅明确影响一个文件时才能自动批准",
     "The task touches a sensitive or high-impact engineering area": "任务涉及敏感或高影响工程领域",

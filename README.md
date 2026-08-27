@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/iamzwxyy/traceforge/actions/workflows/ci.yml/badge.svg)](https://github.com/iamzwxyy/traceforge/actions/workflows/ci.yml)
 
-TraceForge is a local coding agent that makes completion evidence visible. It turns a request
-into a risk-assessed plan, works through a bounded set of native tools, runs explicit acceptance
-checks, and asks an independent read-only verifier to judge the result.
+TraceForge is a local coding agent that makes completion evidence visible. It keeps a coding task
+as a multi-turn conversation, works through a bounded set of native tools, runs explicit acceptance
+checks, and asks an independent read-only completion reviewer to judge the result.
 
 The project is intentionally focused: no pet, plugin market, hosted execution, or IDE clone.
 Its differentiator is a defensible engineering loop with useful human control.
@@ -15,18 +15,22 @@ Its differentiator is a defensible engineering loop with useful human control.
 
 - **Material clarification, not guesswork.** Complex requests can pause for one to three
   questions, each with mutually exclusive options and a recommended choice.
-- **Risk-adaptive human control.** Every plan remains visible. Only an explicitly scoped,
-  single-file, low-risk change with routine local checks takes the deterministic fast path;
-  ambiguity, sensitive areas, larger scope, or unusual commands require approval.
+- **Agent by default, Plan when requested.** Normal tasks inspect, plan internally, implement, and
+  verify without a plan-approval ceremony. Plan mode is an explicit composer toggle that always
+  pauses on a complete downloadable Markdown plan before implementation.
+- **Permission boundaries remain independent.** Routine work inside the workspace proceeds; an
+  undeclared file, unknown command, or dangerous operation still asks or is denied regardless of
+  whether Plan mode is enabled.
 - **Plan as a completion contract.** Planned files, builder progress, check status, exact commands,
   and evidence stay visible. A write outside the declared file scope pauses for action approval.
-- **Independent verification.** The verifier cannot write files or run commands. A rejection
+- **Independent completion review.** The reviewer cannot write files or run commands. A rejection
   returns concrete findings to the builder for at most two repair cycles.
 - **Downloadable Proof Pack.** One auditable Markdown artifact joins the persisted final diff,
   fresh checks, verifier verdict, conflict-aware rollback state, event ledger, and SHA-256
   integrity fingerprints.
-- **Evidence-first UI.** Timeline, unified diff, check output, verdict, approvals, Stop, Resume,
-  and Rollback are available in one local web workbench.
+- **Conversation without losing the Trace.** Follow-up prompts continue the same task and preserve
+  prior turn summaries, workspace, and evidence. The main feed reads like a coding conversation;
+  the exact plan, tools, checks, and review stay one click away in a collapsed Trace and inspector.
 - **Low-friction workspaces.** A direct task automatically receives an isolated folder under the
   configured default root. Projects use macOS's native folder picker when available and keep
   their runs nested under a collapsible folder. Neither mode uploads files.
@@ -79,9 +83,13 @@ the API or UI. Advanced users may instead reference an existing one-line owner-o
 file.
 
 Click **新建任务** to enter only the request; press Enter to submit or Shift+Enter for a newline.
-TraceForge creates a unique task directory beneath
+The optional **计划模式** toggle is off by default. Leave it off for the normal Agent flow, or
+turn it on when you want to review and download the plan before any implementation. TraceForge
+creates a unique task directory beneath
 the `--workspace` default root. Click **添加项目** to select a reusable project root, then use the
-plus button beside that folder for project-scoped tasks. Direct runs stay at the top level.
+plus button beside that folder for project-scoped tasks. Direct runs stay at the top level. After a
+turn finishes, use the bottom composer to continue in the same task; each follow-up can choose its
+own Agent or Plan mode.
 
 Environment variables remain available as a non-persisted fallback:
 
@@ -101,14 +109,15 @@ complete a native function call, so a successful HTTP response alone is not trea
 ```mermaid
 flowchart LR
     A[Task] --> B[Inspect and clarify]
-    B --> C[Visible plan + deterministic risk gate]
-    C -->|low-risk fast path| D[Builder and native tools]
-    C -->|review required| H[Human approval]
+    B --> C[Complete Markdown plan]
+    C -->|Agent mode| D[Builder and native tools]
+    C -->|Plan mode| H[Human plan review]
     H --> D
     D --> E[Acceptance checks]
-    E --> F[Read-only verifier]
+    E --> F[Read-only completion review]
     F -->|pass| G[Evidence board + Proof Pack]
     F -->|findings, max 2| D
+    G -->|follow-up| B
     D -. snapshots .-> I[Conflict-aware rollback]
 ```
 
@@ -151,7 +160,7 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
 ```
 
-The current suite has 118 backend tests at 86.47% coverage (with a hard 85% gate), eight frontend
+The current suite has 122 backend tests at 86.77% coverage (with a hard 85% gate), eight frontend
 unit tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.

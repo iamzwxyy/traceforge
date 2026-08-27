@@ -21,7 +21,7 @@ from traceforge.agent import PlanDecision
 from traceforge.config import Settings
 from traceforge.demo import DEMO_TASK
 from traceforge.events import EventBroker
-from traceforge.models import ClarificationAnswer, ProviderConfig, RunState
+from traceforge.models import ClarificationAnswer, InteractionMode, ProviderConfig, RunState
 from traceforge.proof import build_proof_pack
 from traceforge.runtime import AgentRuntime, validate_credential_file
 from traceforge.storage import Storage
@@ -38,7 +38,8 @@ class Scenario:
     title: str
     fixture: Path
     task: str
-    expected_gate: Literal["auto_approved", "approval_required"]
+    mode: InteractionMode
+    expected_gate: Literal["agent_continues", "approval_required"]
     required_files: tuple[str, ...]
     allowed_files: tuple[str, ...] | None
     baseline_pytest_exit: int
@@ -48,14 +49,15 @@ class Scenario:
 SCENARIOS = (
     Scenario(
         id="single-file-fast-path",
-        title="Single-file repair on the visible fast path",
+        title="Single-file repair in default Agent mode",
         fixture=ROOT / "evaluation/fixtures/duration-parser",
         task=(
             "Fix the boolean-input bug described in README.md. Preserve normalize_seconds's "
             "public signature and all existing integer behavior. Only modify duration_parser.py; "
             "do not edit tests. Run the full test suite and finish only when it passes."
         ),
-        expected_gate="auto_approved",
+        mode=InteractionMode.AGENT,
+        expected_gate="agent_continues",
         required_files=("duration_parser.py",),
         allowed_files=("duration_parser.py",),
         baseline_pytest_exit=1,
@@ -76,6 +78,7 @@ SCENARIOS = (
         title="Multi-file repair behind plan review",
         fixture=ROOT / "demo/tenant-cache-api",
         task=DEMO_TASK,
+        mode=InteractionMode.PLAN,
         expected_gate="approval_required",
         required_files=("src/tenant_cache_api/cache.py",),
         allowed_files=None,
@@ -215,7 +218,7 @@ async def _drive_run(
     started = time.perf_counter()
 
     try:
-        run = await runtime.start_run(scenario.task, workspace)
+        run = await runtime.start_run(scenario.task, workspace, mode=scenario.mode)
         manager = runtime.manager_for_run(run.id)
         async with asyncio.timeout(timeout_seconds):
             while True:

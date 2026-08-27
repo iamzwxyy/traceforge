@@ -40,20 +40,25 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await page.getByRole("button", { name: "继续" }).click();
 
   await expect(page.getByRole("button", { name: "批准并执行" })).toBeVisible();
+  await expect(page.locator(".plan-document")).toContainText("实施计划");
+  await expect(page.getByRole("link", { name: "下载 Markdown" }))
+    .toHaveAttribute("href", /plan\.md$/);
   await page.getByRole("button", { name: "批准并执行" }).click();
 
   await expect(page.getByRole("heading", { name: "工作已被证明，而不只是宣称完成" }))
     .toBeVisible({ timeout: 15_000 });
+  await expect(page.getByLabel("继续此任务")).toHaveCount(0);
   await expectNoWcagViolations(page, "completed run");
   await expect(page.getByText("4 passed", { exact: false }).first()).toBeVisible();
   await expect(page.getByText(/\d+(\.\d+)?k? \/ 64k 上下文/)).toBeVisible();
   await expect(page.getByText("实时", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: /规划与决策/ }))
-    .toHaveAttribute("aria-expanded", "false");
-  await expect(page.getByRole("button", { name: /执行与检查/ }))
-    .toHaveAttribute("aria-expanded", "false");
-  await expect(page.getByRole("button", { name: /独立验证/ }))
-    .toHaveAttribute("aria-expanded", "true");
+  const trace = page.locator(".trace-details");
+  await expect(trace).toBeVisible();
+  await expect(trace).not.toHaveAttribute("open", "");
+  await expect(trace.locator("summary")).toContainText("查看工作记录");
+  await trace.locator("summary").click();
+  await expect(trace).toHaveAttribute("open", "");
+  await expect(trace).toContainText("完成后复核");
 
   await page.reload();
   await expect(page.getByRole("heading", { name: "工作已被证明，而不只是宣称完成" }))

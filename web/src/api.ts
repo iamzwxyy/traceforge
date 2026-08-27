@@ -3,6 +3,7 @@ import type {
   ClarificationAnswer,
   DirectoryChoice,
   DirectoryListing,
+  InteractionMode,
   Project,
   ProofPack,
   ProviderConfig,
@@ -38,10 +39,15 @@ export const api = {
     request<RunEvent[]>(`/api/runs/${runId}/events?after_seq=${afterSeq}`),
   getDiff: (runId: string) => request<{ diff: string }>(`/api/runs/${runId}/diff`),
   getProofPack: (runId: string) => request<ProofPack>(`/api/runs/${runId}/proof-pack`),
-  createRun: (task: string, verifierEnabled: boolean, target: RunTarget) =>
+  createRun: (task: string, mode: InteractionMode, target: RunTarget) =>
     request<Run>("/api/runs", {
       method: "POST",
-      body: JSON.stringify({ task, verifier_enabled: verifierEnabled, ...target }),
+      body: JSON.stringify({ task, verifier_enabled: true, mode, ...target }),
+    }),
+  followUp: (runId: string, prompt: string, mode: InteractionMode) =>
+    request<Run>(`/api/runs/${runId}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ prompt, mode }),
     }),
   listProjects: () => request<Project[]>("/api/projects"),
   createProject: (name: string, root: string, createDirectory: boolean) =>

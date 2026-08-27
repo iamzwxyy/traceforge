@@ -26,18 +26,21 @@ files. This reduces accidental disclosure to the model but is not a general secr
 
 ## Plan and mutation policy
 
-The model proposes a structured plan, but application code assigns the plan gate. The fast path is
-limited to an explicit single-file scope, at most four steps and checks, no clarification, no
-sensitive-area language in the task, plan, or risk notes, and routine local verification commands.
-Generic implementation caveats do not turn a normal inspect/fix/verify plan into high risk. The plan
-and policy reasons remain visible even when no click is required. Unknown scope, multiple files, credentials,
-permissions, migrations, dependencies, deployment, deletion, or other high-impact language forces
-human plan approval.
+Plan mode is an interaction choice, not a permission level. In the default Agent mode, the model
+still submits a structured plan before mutation, but the application records its risk assessment
+and proceeds without a plan-approval click. In Plan mode, every valid plan pauses for human review,
+even when it names one routine file. The canonical Markdown document and policy reasons remain
+visible in both modes. Selecting Agent mode cannot turn a denied command into an allowed command or
+expand the workspace boundary.
 
 After planning, each `create_file` and every file in an `apply_patch` is compared with the declared
 scope. An unexpected path pauses for a one-time action decision before any bytes are written. This
 scope check remains an application policy even when an OS sandbox is active; it answers “was this
 planned?” while the sandbox answers “what can this process technically reach?”
+
+Completion review is a third, separate concept. After fresh checks, the verifier receives evidence
+through a read-only tool surface and cannot mutate files or execute commands. Its pass/fail decision
+does not grant runtime permissions; a rejection only returns bounded findings to the builder.
 
 ## Command policy
 
@@ -140,8 +143,8 @@ interface expands the trust boundary and should only be done behind controls cho
 - A benign repository may contain secrets in ordinary source files that the user asked the model
   to inspect.
 - SQLite data remains until the platform data directory is removed.
-- The risk gate is deliberately conservative but still syntactic; human approval and planned file
-  scope do not establish semantic safety.
+- The risk assessment is deliberately conservative but still syntactic; Plan mode approval and
+  planned file scope do not establish semantic safety.
 - Proof Pack hashes are not signatures or remote attestations.
 - Provider behavior and availability are external dependencies; retries do not guarantee service.
 

@@ -10,6 +10,7 @@ from traceforge.config import Settings
 from traceforge.models import (
     ClarificationAnswer,
     EventType,
+    InteractionMode,
     PlanGate,
     RunRecord,
     RunState,
@@ -128,7 +129,9 @@ async def test_full_clarify_build_verify_flow(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Create result.txt after clarifying the format")
+    run = await manager.start_run(
+        "Create result.txt after clarifying the format", mode=InteractionMode.PLAN
+    )
 
     await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
     await manager.answer_clarification(
@@ -150,7 +153,7 @@ async def test_full_clarify_build_verify_flow(
 
 
 @pytest.mark.asyncio
-async def test_low_risk_single_file_plan_is_auto_approved_but_stays_visible(
+async def test_agent_mode_continues_without_plan_approval_but_stays_visible(
     settings: Settings, storage: Storage
 ) -> None:
     provider = ScriptedProvider(
@@ -200,7 +203,7 @@ async def test_low_risk_single_file_plan_is_auto_approved_but_stays_visible(
     assert completed.state is RunState.SUCCEEDED, completed.error
     assert completed.plan is not None
     assert completed.plan_gate is not None
-    assert completed.plan_gate.decision == "auto_approved"
+    assert completed.plan_gate.decision == "agent_continues"
     state_events = [
         event.payload["state"]
         for event in storage.get_events(run.id)
@@ -208,6 +211,113 @@ async def test_low_risk_single_file_plan_is_auto_approved_but_stays_visible(
     ]
     assert RunState.AWAITING_PLAN_APPROVAL.value not in state_events
     assert EventType.PLAN_GATED in [event.type for event in storage.get_events(run.id)]
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_always_pauses_for_review_even_when_low_risk(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments={
+                            "summary": "Review one note",
+                            "approach": "Inspect the existing note and preserve its format.",
+                            "steps": [{"id": "review", "title": "Review the note"}],
+                            "acceptance_checks": [
+                                {"id": "checked", "label": "The note is reviewed"}
+                            ],
+                            "impacted_files": ["note.txt"],
+                        },
+                    )
+                ]
+            )
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run(
+        "Review note.txt", verifier_enabled=False, mode=InteractionMode.PLAN
+    )
+
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.plan_gate is not None
+    assert waiting.plan_gate.decision == "approval_required"
+    assert waiting.plan is not None
+    assert "# Implementation plan" in waiting.plan.markdown
+    assert "## Approach" in waiting.plan.markdown
+    assert "## Validation" in waiting.plan.markdown
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_follow_up_continues_the_same_task_with_prior_turn_context(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan-1", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-1",
+                        name="finish",
+                        arguments={"summary": "Reviewed the first request"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan-2", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-2",
+                        name="finish",
+                        arguments={"summary": "Applied the follow-up review"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    first = await manager.start_run("Review the current behavior", verifier_enabled=False)
+    first_completed = await manager.wait(first.id)
+    assert first_completed.state is RunState.SUCCEEDED
+
+    continued = await manager.follow_up(
+        first.id, "Now focus on the edge case", mode=InteractionMode.AGENT
+    )
+    assert continued.id == first.id
+    second_completed = await manager.wait(first.id)
+
+    assert second_completed.state is RunState.SUCCEEDED
+    assert second_completed.task == "Review the current behavior"
+    assert [turn.request for turn in second_completed.turns] == [
+        "Review the current behavior",
+        "Now focus on the edge case",
+    ]
+    assert [turn.outcome for turn in second_completed.turns] == [
+        "succeeded",
+        "succeeded",
+    ]
+    second_planner_context = str(provider.requests[2][0][1]["content"])
+    assert "Earlier turns in this same task" in second_planner_context
+    assert "Reviewed the first request" in second_planner_context
+    event_types = [event.type for event in storage.get_events(first.id)]
+    assert event_types.count(EventType.TURN_STARTED) == 2
+    assert event_types.count(EventType.TURN_COMPLETED) == 2
 
 
 @pytest.mark.asyncio
@@ -389,7 +499,11 @@ async def test_unknown_command_waits_for_explicit_approval(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Inspect the Python environment", verifier_enabled=False)
+    run = await manager.start_run(
+        "Inspect the Python environment",
+        verifier_enabled=False,
+        mode=InteractionMode.PLAN,
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
@@ -459,7 +573,9 @@ async def test_builder_reuses_successful_planning_inspection(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Review context.txt", verifier_enabled=False)
+    run = await manager.start_run(
+        "Review context.txt", verifier_enabled=False, mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 
@@ -500,7 +616,9 @@ async def test_plan_revision_then_completion(settings: Settings, storage: Storag
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Review", verifier_enabled=False)
+    run = await manager.start_run(
+        "Review", verifier_enabled=False, mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
 
     await manager.decide_plan(
@@ -577,7 +695,7 @@ async def test_verifier_failure_triggers_one_repair_cycle(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Create a final value")
+    run = await manager.start_run("Create a final value", mode=InteractionMode.PLAN)
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 
@@ -673,7 +791,9 @@ async def test_repair_cannot_reuse_a_passing_check_from_before_the_edit(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Create a final value with current evidence")
+    run = await manager.start_run(
+        "Create a final value with current evidence", mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 
@@ -723,7 +843,7 @@ async def test_verifier_failure_at_repair_limit_fails_run(
         ]
     )
     manager = AgentManager(limited, storage, provider)
-    run = await manager.start_run("Prove the result")
+    run = await manager.start_run("Prove the result", mode=InteractionMode.PLAN)
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 
@@ -752,7 +872,9 @@ async def test_three_identical_tool_failures_stop_builder(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Try a missing tool", verifier_enabled=False)
+    run = await manager.start_run(
+        "Try a missing tool", verifier_enabled=False, mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 
@@ -793,7 +915,9 @@ async def test_approved_unknown_command_runs_once(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Run Python", verifier_enabled=False)
+    run = await manager.start_run(
+        "Run Python", verifier_enabled=False, mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
@@ -820,7 +944,9 @@ async def test_shutdown_resume_plan_then_rollback(
             tool_calls=[ToolCall(id="plan", name="submit_plan", arguments=_review_plan())]
         )
     ]))
-    run = await first.start_run("Resume me", verifier_enabled=False)
+    run = await first.start_run(
+        "Resume me", verifier_enabled=False, mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await first.shutdown()
     interrupted = storage.get_run(run.id)
@@ -925,7 +1051,7 @@ async def test_transient_model_outage_pauses_and_resumes_without_losing_run(
     assert completed.state is RunState.SUCCEEDED, completed.error
     assert completed.error is None
     assert completed.plan_gate is not None
-    assert completed.plan_gate.decision == "auto_approved"
+    assert completed.plan_gate.decision == "agent_continues"
 
 
 @pytest.mark.asyncio
@@ -1080,7 +1206,7 @@ async def test_cancel_waiting_run(settings: Settings, storage: Storage) -> None:
             )
         ]),
     )
-    run = await manager.start_run("Cancel me")
+    run = await manager.start_run("Cancel me", mode=InteractionMode.PLAN)
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
 
     cancelled = await manager.cancel(run.id)
@@ -1159,7 +1285,7 @@ async def test_verifier_reads_evidence_before_structured_verdict(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Review evidence")
+    run = await manager.start_run("Review evidence", mode=InteractionMode.PLAN)
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 
@@ -1204,6 +1330,8 @@ async def test_public_actions_reject_invalid_run_states(
         state=RunState.EXECUTING,
     )
     storage.create_run(active)
+    with pytest.raises(InvalidRunAction, match="current turn"):
+        await manager.follow_up("active", "Continue")
     with pytest.raises(RunConflictError, match="active"):
         await manager.start_run("Another")
     with pytest.raises(InvalidRunAction, match="Cancel"):
@@ -1249,7 +1377,7 @@ async def test_verifier_recovers_from_invalid_structured_report(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Recover verifier output")
+    run = await manager.start_run("Recover verifier output", mode=InteractionMode.PLAN)
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 

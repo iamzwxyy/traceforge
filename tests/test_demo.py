@@ -9,7 +9,7 @@ import pytest
 from traceforge.agent import AgentManager, PlanDecision
 from traceforge.config import Settings
 from traceforge.demo import DEMO_TASK, scripted_demo_provider
-from traceforge.models import ClarificationAnswer, RunState, Verdict
+from traceforge.models import ClarificationAnswer, InteractionMode, RunState, Verdict
 from traceforge.storage import Storage
 
 
@@ -36,7 +36,7 @@ async def test_scripted_demo_completes_with_real_test_evidence(tmp_path: Path) -
     manager = AgentManager(settings, storage, scripted_demo_provider())
 
     try:
-        run = await manager.start_run(DEMO_TASK)
+        run = await manager.start_run(DEMO_TASK, mode=InteractionMode.PLAN)
         await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
         await manager.answer_clarification(
             run.id,

@@ -64,7 +64,7 @@ describe("mission control helpers", () => {
     expect(chapters.map((chapter) => chapter.label)).toEqual([
       "规划与决策",
       "执行与检查",
-      "独立验证",
+      "完成后复核",
     ]);
     expect(chapters.map((chapter) => chapter.events.map((item) => item.seq))).toEqual([
       [1],

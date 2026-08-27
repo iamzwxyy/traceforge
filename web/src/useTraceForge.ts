@@ -4,6 +4,7 @@ import { mergeEvents, preferNewerRun } from "./lib";
 import type {
   AppStatus,
   ClarificationAnswer,
+  InteractionMode,
   Project,
   ProofPack,
   ProviderConfig,
@@ -28,6 +29,8 @@ const refreshEventTypes = new Set([
   "repair.started",
   "run.resumed",
   "run.completed",
+  "turn.started",
+  "turn.completed",
   "rollback.completed",
 ]);
 
@@ -165,10 +168,10 @@ export function useTraceForge() {
   );
 
   const createRun = useCallback(
-    async (task: string, verifierEnabled: boolean, target: RunTarget) => {
+    async (task: string, mode: InteractionMode, target: RunTarget) => {
       setError(null);
       try {
-        const created = await api.createRun(task, verifierEnabled, target);
+        const created = await api.createRun(task, mode, target);
         setRuns((current) => [created, ...current]);
         selectRun(created.id);
         setStatus(await api.status());
@@ -258,6 +261,8 @@ export function useTraceForge() {
     selectedRunId,
     selectRun,
     createRun,
+    followUp: (prompt: string, mode: InteractionMode) =>
+      run && perform(() => api.followUp(run.id, prompt, mode)),
     createProject,
     saveProvider,
     testProvider,

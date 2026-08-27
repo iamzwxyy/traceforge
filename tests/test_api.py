@@ -62,7 +62,12 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
         assert isinstance(status_payload["sandbox"]["enforced"], bool)
         assert status_payload["sandbox"]["detail"]
         response = client.post(
-            "/api/runs", json={"task": "Observe this workspace", "verifier_enabled": False}
+            "/api/runs",
+            json={
+                "task": "Observe this workspace",
+                "verifier_enabled": False,
+                "mode": "plan",
+            },
         )
         assert response.status_code == 201
         run_id = response.json()["id"]
@@ -77,6 +82,12 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
         completed = _wait_for_state(client, run_id, "succeeded")
         assert completed["verification"]["verdict"] == "inconclusive"
 
+        plan_download = client.get(f"/api/runs/{run_id}/plan.md")
+        assert plan_download.status_code == 200
+        assert "attachment;" in plan_download.headers["content-disposition"]
+        assert "# Implementation plan" in plan_download.text
+        assert "## Validation" in plan_download.text
+
         events = client.get(f"/api/runs/{run_id}/events").json()
         assert events[-1]["type"] == "run.completed"
 
@@ -89,10 +100,63 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
         assert "TraceForge Proof Pack" in downloaded.text
 
 
+def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
+    settings: Settings,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            _plan_response(),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-1",
+                        name="finish",
+                        arguments={"summary": "Observed the first request"},
+                    )
+                ]
+            ),
+            _plan_response(),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-2",
+                        name="finish",
+                        arguments={"summary": "Observed the follow-up"},
+                    )
+                ]
+            ),
+        ]
+    )
+    app = create_app(settings, provider=provider)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={"task": "Observe this workspace", "verifier_enabled": False},
+        )
+        assert created.status_code == 201
+        run_id = created.json()["id"]
+        assert created.json()["mode"] == "agent"
+        first = _wait_for_state(client, run_id, "succeeded")
+        assert first["plan_gate"]["decision"] == "agent_continues"
+        assert len(first["turns"]) == 1
+
+        follow_up = client.post(
+            f"/api/runs/{run_id}/turns",
+            json={"prompt": "Check the edge case too"},
+        )
+        assert follow_up.status_code == 200
+        assert follow_up.json()["id"] == run_id
+        second = _wait_for_state(client, run_id, "succeeded")
+        assert len(second["turns"]) == 2
+        assert second["turns"][1]["request"] == "Check the edge case too"
+        assert all(turn["outcome"] == "succeeded" for turn in second["turns"])
+
+
 def test_api_rejects_second_active_run(settings: Settings) -> None:
     app = create_app(settings, provider=ScriptedProvider([_plan_response()]))
     with TestClient(app) as client:
-        first = client.post("/api/runs", json={"task": "First"})
+        first = client.post("/api/runs", json={"task": "First", "mode": "plan"})
         assert first.status_code == 201
         run_id = first.json()["id"]
         _wait_for_state(client, run_id, "awaiting_plan_approval")
@@ -105,7 +169,7 @@ def test_api_rejects_second_active_run(settings: Settings) -> None:
 def test_websocket_replays_persisted_events(settings: Settings) -> None:
     app = create_app(settings, provider=ScriptedProvider([_plan_response()]))
     with TestClient(app) as client:
-        response = client.post("/api/runs", json={"task": "Observe"})
+        response = client.post("/api/runs", json={"task": "Observe", "mode": "plan"})
         run_id = response.json()["id"]
         _wait_for_state(client, run_id, "awaiting_plan_approval")
 
@@ -150,7 +214,7 @@ def test_projects_direct_tasks_and_directory_browser(settings: Settings, tmp_pat
 
         direct = client.post(
             "/api/runs",
-            json={"task": "Direct", "workspace": str(direct_root)},
+            json={"task": "Direct", "workspace": str(direct_root), "mode": "plan"},
         )
         assert direct.status_code == 201
         direct_run = _wait_for_state(client, direct.json()["id"], "awaiting_plan_approval")
@@ -159,7 +223,11 @@ def test_projects_direct_tasks_and_directory_browser(settings: Settings, tmp_pat
 
         project = client.post(
             "/api/runs",
-            json={"task": "Project", "project_id": opened.json()["id"]},
+            json={
+                "task": "Project",
+                "project_id": opened.json()["id"],
+                "mode": "plan",
+            },
         )
         assert project.status_code == 201
         project_run = _wait_for_state(client, project.json()["id"], "awaiting_plan_approval")
@@ -174,7 +242,7 @@ def test_direct_task_allocates_an_isolated_workspace(settings: Settings) -> None
     with TestClient(app) as client:
         created = client.post(
             "/api/runs",
-            json={"task": "Direct", "create_direct_workspace": True},
+            json={"task": "Direct", "create_direct_workspace": True, "mode": "plan"},
         )
 
         assert created.status_code == 201
@@ -406,7 +474,11 @@ def test_api_allows_provider_repair_then_resume_after_transient_outage(
     with TestClient(app) as client:
         created = client.post(
             "/api/runs",
-            json={"task": "Recover this run", "verifier_enabled": False},
+            json={
+                "task": "Recover this run",
+                "verifier_enabled": False,
+                "mode": "plan",
+            },
         )
         run_id = created.json()["id"]
         interrupted = _wait_for_state(client, run_id, "interrupted")

@@ -15,7 +15,7 @@ def test_real_model_evaluator_lists_pinned_scenarios() -> None:
     )
 
     assert result.stdout.splitlines() == [
-        "single-file-fast-path\tSingle-file repair on the visible fast path",
+        "single-file-fast-path\tSingle-file repair in default Agent mode",
         "multi-file-review-path\tMulti-file repair behind plan review",
     ]
 

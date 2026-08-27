@@ -6,9 +6,9 @@ TraceForge 不应复刻 Codex 或 DeepSeek Harness 的完整产品面。课程�
 
 TraceForge 自己的主线应保持鲜明：**每次改动都能给出“计划 → 差异 → 新鲜检查 → 独立验证 → 可冲突回滚”的证据闭环**。这个能力比宠物、庞大插件市场或多智能体动画更能体现工程质量，也更适合作为答辩时可现场验证的亮点。产品上可将它命名为 **Proof Pack（交付证据包）**。
 
-截至 2026-08-27，Phase A、自适应计划门、Proof Pack、证据章节、故障恢复、OS 沙箱与
-固定质量语料均已落地；两条真实 DeepSeek 代表任务也已脚本化并通过。当前工作重点转为
-可用性细节、完整回归和现场演示稳定性，而不是继续扩张功能面。
+截至 2026-08-27，Phase A、默认 Agent / 可选计划模式、同任务多轮、Proof Pack、对话 +
+折叠 Trace、故障恢复、OS 沙箱与固定质量语料均已落地；两条真实 DeepSeek 代表任务也已
+脚本化并通过。当前工作重点转为可用性细节、完整回归和现场演示稳定性，而不是继续扩张功能面。
 
 ## 对标范围
 
@@ -27,7 +27,7 @@ TraceForge 自己的主线应保持鲜明：**每次改动都能给出“计划 
 | 执行生命周期 | Codex 使用 Thread → Turn → Item，并流式发布 item/turn 事件；DeepSeek 将一次 turn 拆成多次 model step，持久事件承担恢复和投影 | Run 状态机清晰，规划、执行、验证、恢复均有显式状态；但 `messages_json` 仍是可变主记录 | 保留简单 Run 模型；补充更细的 step/item 事件和稳定投影，不为 v1 重写成完整事件溯源系统 |
 | 工具调度 | DeepSeek 以“可并发调用 + 独占屏障”调度，执行可重叠但结果按模型顺序提交；Codex 用读写锁让并发工具共享读锁、独占工具占写锁 | 同一模型响应中的工具逐个执行，稳定但浪费只读检查时间 | 仅并发 `list_files`、`read_file`、`search_text`；写文件、命令、计划更新和完成动作都是屏障；结果仍按原 tool-call 顺序进入历史 |
 | 上下文管理 | Codex 规范化 call/output 配对、截断工具输出并做可恢复 compaction；DeepSeek 把 runtime context 和 compaction 作为可持久替换事件 | 固定保留头部/尾部并生成确定性中段摘要，简单但长期任务会丢失关键因果 | 先做两级压缩：裁剪旧工具大输出，再生成结构化摘要；计划、文件改动、检查证据和未解决风险进入不可丢的 evidence ledger |
-| 审批与隔离 | Codex 明确区分 sandbox 与 approval：一个是技术边界，一个是越界时的人类决策；DeepSeek 对审批失败关闭，并统一清理子进程环境中的凭据变量 | 路径/argv 策略、凭据清理、自适应计划门已落地；macOS Seatbelt / Linux Bubblewrap 独立适配，失败显式降级；每条命令保留 enforced/bypassed/policy-only 证据 | 保持三层边界和准确文案；不宣称抵御任意恶意本地代码，不把审批包装成技术隔离 |
+| 审批与隔离 | Codex 明确区分 plan mode、sandbox 与 approval：规划交互、技术边界和越界决策是三件事；DeepSeek 对审批失败关闭，并统一清理子进程环境中的凭据变量 | 默认 Agent、可选计划模式、路径/argv 策略、凭据清理均已分层；macOS Seatbelt / Linux Bubblewrap 独立适配，失败显式降级；完成后只读复核另成一层 | 保持各层边界和准确文案；不宣称抵御任意恶意本地代码，不把计划模式或复核包装成权限 |
 | 项目与任务 | Codex 的 Project 是独立实体，Thread 可选 `project_id`；DeepSeek Workspace 使用规范路径对应稳定 ID，同时允许未分组 session | 已支持可空 `project_id`、直接任务、最近目录和可复用项目根目录，多工作区运行时按规范路径隔离 | 保持 Project 只是分组与稳定根目录，不引入远程 host、工作树 handoff 等平台复杂度 |
 | 观测与测试 | DeepSeek 要求用户/模型可见变更同时有可无 key 回放快照，并用真实 API E2E 验证 provider；Codex 对 turn/item/tool/compaction 都有事件和历史投影 | 已有持久事件、断线续传、fake provider 全闭环、故障注入、固定质量语料、真实 DeepSeek 双场景、独立 verifier 与可下载 Proof Pack | 保留确定性 CI 与低频真实模型双层证据；真实 API 不进入日常 CI，避免密钥、成本和模型漂移造成不稳定 |
 
@@ -96,18 +96,18 @@ TraceForge 已具备 fake-provider 闭环、固定产品质量语料和两条真
 1. 三个只读工具有界并发，写/命令/控制工具作为屏障，保证结果顺序。
 2. Evidence ledger 与两级上下文压缩。
 3. assembled transcript golden tests；真实模型代表场景脚本标准化。
-4. 自适应计划门（已完成）：复杂或有风险的任务需要明确批准；仅显式单文件、例行检查的低风险任务自动进入，计划始终可见，越界写入再次审批。
+4. Agent / Plan 双模式（已完成）：普通 Agent 默认继续；计划模式始终在实施前等待确认；两者都保留完整 Markdown 计划，越界写入和未知命令仍单独审批。
 
 ### Phase C：答辩亮点
 
-1. Proof Pack（已完成）：一页展示需求、计划门、持久化最终 diff、执行命令、新鲜度、独立 verdict、回滚状态与完整性摘要。
+1. Proof Pack（已完成）：一页展示需求、规范 Markdown 计划、动作审批、持久化最终 diff、执行命令、新鲜度、完成后只读复核 verdict、回滚状态与完整性摘要。
 2. Evidence Timeline：每个结论可以追到原始工具事件，模型总结与机器证据采用不同视觉语言。
 3. Failure Lab：内置一个会触发旧测试失效、verifier 退回修复、最终通过的样例；再展示冲突感知回滚拒绝覆盖用户修改。
 4. OS 沙箱适配层（已完成）：macOS 使用 Seatbelt，Linux 探测非 setuid Bubblewrap；
    不可用时显式降级为 policy-only，用户单次越界批准记录为 bypass，并进入 Proof Pack。
 
-## 需要产品决策的三个问题
+## 已确定的产品决策
 
-1. 计划审批采用“所有任务强制”还是“风险自适应”。推荐风险自适应，但复杂改动仍强制审批。
-2. OS 沙箱是 Phase A 的硬目标，还是 Phase C 的加分项。推荐先完成凭据清理与准确状态，再把 OS 强制隔离作为加分项，避免为赶沙箱牺牲项目/任务主流程。
-3. 下一轮先实现项目/直接任务与 provider 自检，还是先实现并发工具与上下文升级。推荐先做前者，让真实用户能顺畅开始任务，再补内部性能与长任务稳定性。
+1. 计划审批不再按风险隐式切换：普通 Agent 默认不暂停，计划模式由用户显式开启并始终暂停。
+2. OS 沙箱、动作审批、计划模式、完成后只读复核分别表达，不共用一个含糊的“安全开关”。
+3. 项目/直接任务、provider 自检和同任务多轮优先于并发多 Agent、插件市场等平台扩张。

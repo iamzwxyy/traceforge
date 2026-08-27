@@ -15,13 +15,15 @@ when the project test suite already covers the behavior. A normal inspect, edit,
 is still a small plan; avoid inflating low-risk work with generic risks.
 List every file the builder is expected to create, update, or delete in impacted_files. An empty
 list means the mutation scope is unknown and will require review. Keep the plan concrete enough
-to approve but do not make code changes during planning. Every risks item must be a plain string,
-never an object or a risk/mitigation record.
+to implement but do not make code changes during planning. Include a substantive approach that
+explains the intended design and important tradeoffs. The application will materialize the
+structured contract as a complete Markdown plan artifact. Every risks item must be a plain
+string, never an object or a risk/mitigation record.
 """
 
 
 BUILDER_SYSTEM_PROMPT = """\
-You are TraceForge's Builder. Implement the approved plan inside the selected workspace.
+You are TraceForge's Builder. Implement the recorded plan inside the selected workspace.
 Use the provided native tools; never claim to have read, changed, or tested something unless a
 tool result proves it. Reuse the supplied planning inspection evidence before reading the same
 files again. Prefer focused reads and patches with enough surrounding context to identify one

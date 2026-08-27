@@ -17,7 +17,10 @@ from traceforge.models import (
     CheckStatus,
     ClarificationAnswer,
     ClarificationRequest,
+    ConversationTurn,
     EventType,
+    InteractionMode,
+    PlanGate,
     RunEvent,
     RunRecord,
     RunState,
@@ -26,6 +29,7 @@ from traceforge.models import (
     ToolResult,
     Verdict,
     VerificationReport,
+    utc_now,
 )
 from traceforge.planning import assess_plan_gate
 from traceforge.prompts import BUILDER_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT
@@ -124,9 +128,9 @@ _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
         RunState.CANCELLED,
         RunState.ROLLED_BACK,
     },
-    RunState.SUCCEEDED: {RunState.ROLLED_BACK},
-    RunState.FAILED: {RunState.ROLLED_BACK},
-    RunState.CANCELLED: {RunState.ROLLED_BACK},
+    RunState.SUCCEEDED: {RunState.CREATED, RunState.ROLLED_BACK},
+    RunState.FAILED: {RunState.CREATED, RunState.ROLLED_BACK},
+    RunState.CANCELLED: {RunState.CREATED, RunState.ROLLED_BACK},
     RunState.ROLLED_BACK: set(),
 }
 
@@ -158,6 +162,7 @@ class AgentManager:
         *,
         verifier_enabled: bool = True,
         project_id: str | None = None,
+        mode: InteractionMode = InteractionMode.AGENT,
     ) -> RunRecord:
         clean_task = task.strip()
         if not clean_task:
@@ -169,7 +174,9 @@ class AgentManager:
             task=clean_task,
             workspace=str(self.settings.workspace),
             project_id=project_id,
+            mode=mode,
             verifier_enabled=verifier_enabled,
+            turns=[ConversationTurn(index=1, request=clean_task, mode=mode)],
         )
         self.storage.create_run(run)
         self._controls[run.id] = _Control()
@@ -178,8 +185,50 @@ class AgentManager:
             EventType.STATE_CHANGED,
             {"state": run.state.value, "previous": None},
         )
+        await self.broker.emit(
+            run.id,
+            EventType.TURN_STARTED,
+            {"index": 1, "request": clean_task, "mode": mode.value},
+        )
         self._spawn(run.id, resume=False)
         return run
+
+    async def follow_up(
+        self, run_id: str, prompt: str, *, mode: InteractionMode = InteractionMode.AGENT
+    ) -> RunRecord:
+        clean_prompt = prompt.strip()
+        if not clean_prompt:
+            raise ValueError("Follow-up prompt must not be empty")
+        run = self.storage.get_run(run_id)
+        if run.state not in {RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED}:
+            raise InvalidRunAction("Follow-up is available after the current turn stops")
+        if self.storage.has_active_run(self.settings.workspace):
+            raise RunConflictError("This workspace already has an active or interrupted run")
+        if run_id in self._tasks and not self._tasks[run_id].done():
+            raise RunConflictError("Run is already active")
+
+        index = len(run.turns) + 1
+        run.mode = mode
+        run.turns.append(ConversationTurn(index=index, request=clean_prompt, mode=mode))
+        run.plan = None
+        run.plan_gate = None
+        run.plan_approved = False
+        run.clarification = None
+        run.pending_approval = None
+        run.verification = None
+        run.messages = []
+        run.step_count = 0
+        run.repair_cycles = 0
+        run.error = None
+        self._controls[run.id] = _Control()
+        await self._transition(run, RunState.CREATED)
+        await self.broker.emit(
+            run.id,
+            EventType.TURN_STARTED,
+            {"index": index, "request": clean_prompt, "mode": mode.value},
+        )
+        self._spawn(run.id, resume=False)
+        return self.storage.get_run(run.id)
 
     async def answer_clarification(
         self, run_id: str, answers: list[ClarificationAnswer]
@@ -233,6 +282,7 @@ class AgentManager:
                 pass
         elif run.state is RunState.INTERRUPTED:
             await self._transition(run, RunState.CANCELLED)
+            await self._close_turn(run, "cancelled", "The user stopped this turn.")
         return self.storage.get_run(run_id)
 
     async def resume(self, run_id: str) -> RunRecord:
@@ -343,6 +393,9 @@ class AgentManager:
                     await self._transition(current, RunState.INTERRUPTED)
                 else:
                     await self._transition(current, RunState.CANCELLED)
+                    await self._close_turn(
+                        current, "cancelled", "The user stopped this turn."
+                    )
                     await self.broker.emit(
                         run_id, EventType.RUN_COMPLETED, {"state": RunState.CANCELLED.value}
                     )
@@ -382,7 +435,8 @@ class AgentManager:
         elif run.plan is not None and not run.plan_approved:
             strategy = (
                 "persisted_fast_path"
-                if run.plan_gate and run.plan_gate.decision == "auto_approved"
+                if run.plan_gate
+                and run.plan_gate.decision in {"auto_approved", "agent_continues"}
                 else "await_plan_approval"
             )
         elif run.plan_approved:
@@ -406,7 +460,10 @@ class AgentManager:
             run.clarification = None
             await self._transition(run, RunState.PLANNING)
         elif run.plan is not None and not run.plan_approved:
-            if run.plan_gate and run.plan_gate.decision == "auto_approved":
+            if run.plan_gate and run.plan_gate.decision in {
+                "auto_approved",
+                "agent_continues",
+            }:
                 run.plan_approved = True
                 run.messages = self._builder_messages(run, run.plan)
                 await self._transition(run, RunState.EXECUTING)
@@ -433,10 +490,14 @@ class AgentManager:
             await self._transition(run, RunState.PLANNING)
 
     async def _planning_phase(self, run: RunRecord) -> None:
+        request = self._current_request(run)
         if not run.messages or run.messages[0].get("content") != PLANNER_SYSTEM_PROMPT:
             run.messages = [
                 {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-                {"role": "user", "content": run.task},
+                {
+                    "role": "user",
+                    "content": self._conversation_context(run, request),
+                },
             ]
         if run.state is not RunState.PLANNING:
             await self._transition(run, RunState.PLANNING)
@@ -490,7 +551,7 @@ class AgentManager:
                         )
                         continue
                     try:
-                        request = ClarificationRequest(
+                        clarification = ClarificationRequest(
                             questions=call.arguments.get("questions", []),
                             round=round_number,
                         )
@@ -502,7 +563,7 @@ class AgentManager:
                             error=exc,
                         )
                         continue
-                    run.clarification = request
+                    run.clarification = clarification
                     self.storage.save_run(run)
                     await self._transition(run, RunState.AWAITING_CLARIFICATION)
                     answers = await self._await_clarification(run)
@@ -522,18 +583,36 @@ class AgentManager:
                         )
                         continue
                     run.plan = plan
-                    run.plan_gate = assess_plan_gate(
-                        run.task,
+                    assessed_gate = assess_plan_gate(
+                        request,
                         plan,
                         clarification_rounds=self._clarification_round(run.id),
                     )
+                    if run.mode is InteractionMode.AGENT:
+                        run.plan_gate = PlanGate(
+                            decision="agent_continues",
+                            risk=assessed_gate.risk,
+                            reasons=[
+                                "Agent mode continues without a plan approval pause",
+                                *assessed_gate.reasons,
+                            ],
+                        )
+                    else:
+                        run.plan_gate = PlanGate(
+                            decision="approval_required",
+                            risk=assessed_gate.risk,
+                            reasons=[
+                                "Plan mode pauses for review before implementation",
+                                *assessed_gate.reasons,
+                            ],
+                        )
                     self.storage.save_run(run)
                     await self.broker.emit(
                         run.id,
                         EventType.PLAN_GATED,
                         run.plan_gate.model_dump(mode="json"),
                     )
-                    if run.plan_gate.decision == "auto_approved":
+                    if run.mode is InteractionMode.AGENT:
                         await self.broker.emit(
                             run.id, EventType.PLAN_UPDATED, plan.model_dump(mode="json")
                         )
@@ -590,6 +669,7 @@ class AgentManager:
                             "Command checks need fresh passing evidence: " + ", ".join(missing),
                         )
                         continue
+                    self._set_turn_summary(run, str(call.arguments.get("summary", "")).strip())
                     self._append_tool_result(
                         run,
                         ToolResult(
@@ -674,8 +754,12 @@ class AgentManager:
     ) -> list[dict[str, Any]]:
         evidence = self._planning_evidence(run.messages)
         task_context = (
-            f"Original task:\n{run.task}\n\nApproved plan:\n{plan.model_dump_json()}"
+            f"Current request:\n{self._current_request(run)}\n\n"
+            f"Plan:\n{plan.markdown}\n\nStructured contract:\n{plan.model_dump_json()}"
         )
+        previous = self._previous_turns_context(run)
+        if previous:
+            task_context = previous + "\n\n" + task_context
         if evidence:
             task_context += (
                 "\n\nPlanning inspection evidence (reuse this before reading the same files "
@@ -737,7 +821,8 @@ class AgentManager:
             )
         assert run.plan is not None
         evidence = {
-            "task": run.task,
+            "task": self._current_request(run),
+            "conversation": self._previous_turns_context(run),
             "plan": run.plan.model_dump(mode="json"),
             "diff": self.workspace.diff(run.id)[:60_000],
             "tool_events": [
@@ -853,6 +938,11 @@ class AgentManager:
                 step.status = "completed"
         self.storage.save_run(run)
         await self._transition(run, RunState.SUCCEEDED)
+        await self._close_turn(
+            run,
+            "succeeded",
+            self._active_turn(run).summary or report.summary,
+        )
         await self.broker.emit(
             run.id,
             EventType.RUN_COMPLETED,
@@ -868,6 +958,7 @@ class AgentManager:
         self.storage.save_run(run)
         await self.broker.emit(run.id, EventType.ERROR, {"message": error})
         await self._transition(run, RunState.FAILED)
+        await self._close_turn(run, "failed", error)
         await self.broker.emit(
             run.id,
             EventType.RUN_COMPLETED,
@@ -1233,11 +1324,71 @@ class AgentManager:
         except KeyError as exc:
             raise InvalidRunAction(f"Run is not active: {run_id}") from exc
 
-    def _clarification_round(self, run_id: str) -> int:
-        return sum(
-            event.type is EventType.CLARIFICATION_REQUESTED
-            for event in self.storage.get_events(run_id)
+    @staticmethod
+    def _active_turn(run: RunRecord) -> ConversationTurn:
+        if run.turns:
+            return run.turns[-1]
+        turn = ConversationTurn(index=1, request=run.task, mode=run.mode)
+        run.turns.append(turn)
+        return turn
+
+    def _current_request(self, run: RunRecord) -> str:
+        return self._active_turn(run).request
+
+    @staticmethod
+    def _previous_turns_context(run: RunRecord) -> str:
+        completed = [turn for turn in run.turns[:-1] if turn.outcome != "in_progress"]
+        if not completed:
+            return ""
+        lines = ["Earlier turns in this same task:"]
+        for turn in completed[-6:]:
+            lines.append(
+                f"- Turn {turn.index}: {turn.request}\n"
+                f"  Outcome: {turn.outcome}. Summary: {turn.summary or '(no summary)'}"
+            )
+        return "\n".join(lines)
+
+    def _conversation_context(self, run: RunRecord, request: str) -> str:
+        previous = self._previous_turns_context(run)
+        current = f"Current request:\n{request}"
+        return f"{previous}\n\n{current}" if previous else current
+
+    def _set_turn_summary(self, run: RunRecord, summary: str) -> None:
+        if summary:
+            self._active_turn(run).summary = self._redact(summary)[:4_000]
+            self.storage.save_run(run)
+
+    async def _close_turn(
+        self,
+        run: RunRecord,
+        outcome: Literal["succeeded", "failed", "cancelled"],
+        summary: str,
+    ) -> None:
+        turn = self._active_turn(run)
+        if turn.outcome != "in_progress":
+            return
+        turn.outcome = outcome
+        turn.summary = self._redact(summary)[:4_000]
+        turn.completed_at = utc_now()
+        self.storage.save_run(run)
+        await self.broker.emit(
+            run.id,
+            EventType.TURN_COMPLETED,
+            {
+                "index": turn.index,
+                "outcome": outcome,
+                "summary": turn.summary,
+            },
         )
+
+    def _clarification_round(self, run_id: str) -> int:
+        count = 0
+        for event in reversed(self.storage.get_events(run_id)):
+            if event.type is EventType.TURN_STARTED:
+                break
+            if event.type is EventType.CLARIFICATION_REQUESTED:
+                count += 1
+        return count
 
     @staticmethod
     def _missing_command_checks(plan: TaskPlan | None) -> list[str]:

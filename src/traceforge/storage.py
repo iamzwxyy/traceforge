@@ -14,6 +14,7 @@ from traceforge.models import (
     ApprovalRequest,
     ClarificationRequest,
     EventType,
+    InteractionMode,
     PlanGate,
     ProjectRecord,
     ProviderConfig,
@@ -64,6 +65,8 @@ class Storage:
                     workspace TEXT NOT NULL,
                     project_id TEXT,
                     state TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'agent',
+                    turns_json TEXT NOT NULL DEFAULT '[]',
                     verifier_enabled INTEGER NOT NULL,
                     plan_json TEXT,
                     clarification_json TEXT,
@@ -137,6 +140,8 @@ class Storage:
                 "interrupted_from": "TEXT",
                 "project_id": "TEXT",
                 "plan_gate_json": "TEXT",
+                "mode": "TEXT NOT NULL DEFAULT 'agent'",
+                "turns_json": "TEXT NOT NULL DEFAULT '[]'",
             }
             for column, declaration in migrations.items():
                 if column not in columns:
@@ -215,11 +220,12 @@ class Storage:
             self._connection.execute(
                 """
                 INSERT INTO runs (
-                    id, task, workspace, project_id, state, verifier_enabled, plan_json,
+                    id, task, workspace, project_id, state, mode, turns_json,
+                    verifier_enabled, plan_json,
                     clarification_json, pending_approval_json, verification_json,
                     plan_gate_json, messages_json, plan_approved, interrupted_from,
                     step_count, repair_cycles, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._run_values(run),
             )
@@ -231,7 +237,8 @@ class Storage:
             cursor = self._connection.execute(
                 """
                 UPDATE runs SET
-                    task = ?, workspace = ?, project_id = ?, state = ?, verifier_enabled = ?,
+                    task = ?, workspace = ?, project_id = ?, state = ?, mode = ?,
+                    turns_json = ?, verifier_enabled = ?,
                     plan_json = ?, clarification_json = ?, pending_approval_json = ?,
                     verification_json = ?, plan_gate_json = ?, messages_json = ?,
                     plan_approved = ?, interrupted_from = ?, step_count = ?,
@@ -512,6 +519,8 @@ class Storage:
             run.workspace,
             run.project_id,
             run.state.value,
+            run.mode.value,
+            json.dumps([turn.model_dump(mode="json") for turn in run.turns], ensure_ascii=False),
             int(run.verifier_enabled),
             _dump_model(run.plan),
             _dump_model(run.clarification),
@@ -536,6 +545,8 @@ class Storage:
             workspace=row["workspace"],
             project_id=row["project_id"],
             state=RunState(row["state"]),
+            mode=InteractionMode(row["mode"]),
+            turns=json.loads(row["turns_json"]),
             verifier_enabled=bool(row["verifier_enabled"]),
             plan=_load_model(TaskPlan, row["plan_json"]),
             clarification=_load_model(ClarificationRequest, row["clarification_json"]),

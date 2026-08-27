@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from traceforge.agent import AgentManager, RunConflictError
 from traceforge.config import Settings
 from traceforge.events import EventBroker
-from traceforge.models import ProviderConfig, RunRecord
+from traceforge.models import InteractionMode, ProviderConfig, RunRecord
 from traceforge.provider import ModelProvider, OpenAICompatibleProvider, ProviderError
 from traceforge.storage import Storage
 
@@ -155,12 +155,14 @@ class AgentRuntime:
         *,
         verifier_enabled: bool = True,
         project_id: str | None = None,
+        mode: InteractionMode = InteractionMode.AGENT,
     ) -> RunRecord:
         manager = self.manager_for_workspace(workspace)
         return await manager.start_run(
             task,
             verifier_enabled=verifier_enabled,
             project_id=project_id,
+            mode=mode,
         )
 
     def manager_for_run(self, run_id: str) -> AgentManager:

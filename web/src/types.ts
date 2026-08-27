@@ -13,6 +13,7 @@ export type RunState =
   | "rolled_back";
 
 export type CheckStatus = "pending" | "running" | "passed" | "failed" | "waived";
+export type InteractionMode = "agent" | "plan";
 
 export interface QuestionOption {
   id: string;
@@ -54,10 +55,12 @@ export interface TaskPlan {
   acceptance_checks: AcceptanceCheck[];
   impacted_files: string[];
   risks: string[];
+  approach: string;
+  markdown: string;
 }
 
 export interface PlanGate {
-  decision: "auto_approved" | "approval_required";
+  decision: "auto_approved" | "approval_required" | "agent_continues";
   risk: "low" | "medium" | "high";
   reasons: string[];
   assessed_at: string;
@@ -97,6 +100,8 @@ export interface Run {
   workspace: string;
   project_id: string | null;
   state: RunState;
+  mode: InteractionMode;
+  turns: ConversationTurn[];
   verifier_enabled: boolean;
   plan: TaskPlan | null;
   clarification: ClarificationRequest | null;
@@ -110,6 +115,16 @@ export interface Run {
   error: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface ConversationTurn {
+  index: number;
+  request: string;
+  mode: InteractionMode;
+  outcome: "in_progress" | "succeeded" | "failed" | "cancelled";
+  summary: string;
+  started_at: string;
+  completed_at: string | null;
 }
 
 export interface RunEvent {
@@ -211,6 +226,8 @@ export interface ProofPack {
   task: string;
   workspace: string;
   project_id: string | null;
+  mode: InteractionMode;
+  turns: ConversationTurn[];
   state: RunState;
   proof_status: "in_progress" | "proven" | "checks_only" | "not_proven";
   plan: TaskPlan | null;

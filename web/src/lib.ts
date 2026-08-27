@@ -142,5 +142,5 @@ function chapterLabel(phase: ActivityPhase, occurrence: number, firstEvent: RunE
   }
   if (phase === "planning") return "规划与决策";
   if (phase === "building") return occurrence === 1 ? "执行与检查" : `修复轮次 ${occurrence - 1}`;
-  return occurrence === 1 ? "独立验证" : `验证轮次 ${occurrence}`;
+  return occurrence === 1 ? "完成后复核" : `复核轮次 ${occurrence}`;
 }

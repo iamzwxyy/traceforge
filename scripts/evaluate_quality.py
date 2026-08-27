@@ -54,13 +54,17 @@ SCENARIOS = (
     ),
     Scenario(
         id="human-control",
-        title="Risk-adaptive human control",
+        title="Mode-aware human control",
         claim=(
-            "Low-risk work stays visible while scope drift and unknown execution require a "
-            "decision."
+            "Agent mode proceeds without a plan pause, Plan mode waits for review, and scope "
+            "drift or unknown execution still requires a decision."
         ),
         tests=(
-            "tests/test_agent.py::test_low_risk_single_file_plan_is_auto_approved_but_stays_visible",
+            (
+                "tests/test_agent.py::"
+                "test_agent_mode_continues_without_plan_approval_but_stays_visible"
+            ),
+            "tests/test_agent.py::test_plan_mode_always_pauses_for_review_even_when_low_risk",
             "tests/test_agent.py::test_fast_path_scope_drift_requires_action_approval",
             "tests/test_agent.py::test_unknown_command_waits_for_explicit_approval",
         ),

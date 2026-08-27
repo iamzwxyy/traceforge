@@ -113,7 +113,7 @@ def test_proof_pack_aggregates_stable_completion_evidence(
     assert first.command_sandbox.sandboxed_commands == 1
     assert "TraceForge Proof Pack" in markdown
     assert first.evidence_sha256 in markdown
-    assert "Independent verification" in markdown
+    assert "Independent read-only completion review" in markdown
     assert "## Command sandbox" in markdown
 
 

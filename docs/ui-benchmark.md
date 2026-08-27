@@ -13,7 +13,7 @@ visual identity.
 | --- | --- | --- |
 | One dominant **New task** action beside persistent history | The next action and the way back are both obvious | Put rectangular New Task/Add Project actions above history; choose scope from the sidebar rather than inside the composer |
 | A large, centered task composer with model/context controls nearby | Configuration is available without competing with the request | Keep the focused composer and provider readiness callout |
-| Long executions grouped into collapsible stages | Hundreds of tool rows do not bury the outcome | Adopt evidence chapters for Planning, Build/Repair, and Verification |
+| Long executions keep detail behind progressive disclosure | Hundreds of tool rows do not bury the outcome | Keep the conversation primary and place plan/tool/review evidence in one collapsed Trace |
 | Rich final response followed by artifact actions | Result and handoff are adjacent | Keep the evidence board and make Proof Pack the delivery action |
 | Sticky “waiting for your next instruction” context | The system's current mode remains legible | Use explicit state, approval, and connection badges rather than a chat composer during execution |
 
@@ -32,8 +32,8 @@ general-purpose product navigation.
 
 - Resource, skill, trigger, template, and marketplace navigation would dilute a course project whose
   differentiator is trustworthy local execution.
-- A generic follow-up chat box is less useful than explicit Stop, Resume, approval, verification,
-  and rollback controls for a bounded coding run.
+- A follow-up composer is useful only when it retains the same coding-task context and does not
+  replace explicit Stop, Resume, approval, completion-review, and rollback controls.
 - Raw operational detail should not remain expanded by default. TraceForge keeps exact persisted
   evidence available, but uses progressive disclosure and continues credential redaction.
 - A light general-product aesthetic is not itself the insight. TraceForge keeps its compact dark
@@ -42,16 +42,16 @@ general-purpose product navigation.
 
 ## Chosen changes
 
-The main run feed becomes a progressive-disclosure projection over the persisted event ledger:
+The initial chapter UI improved scan cost, but still made the internal pipeline feel like the
+product. The refined run feed now uses two layers:
 
-1. Planning and decisions.
-2. Build, followed by a separate repair chapter whenever verification returns findings.
-3. Independent verification rounds.
+1. A multi-turn conversation containing requests, concise Agent updates, and final summaries.
+2. One collapsed Trace containing exact plans, tools, checks, repair rounds, and completion review.
 
-Only the newest chapter opens automatically. Completed chapters remain one click away, individual
-tool output is collapsed again inside each chapter, and the right-side Timeline still exposes every
-event in exact sequence. This reduces scan cost without deleting evidence or inventing a second
-source of truth.
+The right-side Timeline still exposes every event in exact sequence, while the Plan view renders
+the complete downloadable Markdown contract. This reduces process ceremony without deleting
+evidence or inventing a second source of truth. A terminal task exposes a follow-up composer that
+keeps the same run, workspace, and evidence history; Plan mode remains an optional per-turn switch.
 
 The task-entry surface now follows the same principle: direct runs remain top-level, projects are
 collapsible folders, and the project plus button determines the composer workspace. At narrow

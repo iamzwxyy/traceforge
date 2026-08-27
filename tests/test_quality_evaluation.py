@@ -15,7 +15,7 @@ def test_quality_evaluator_lists_fixed_corpus() -> None:
 
     assert result.stdout.splitlines() == [
         "complete-loop\tComplete evidence loop",
-        "human-control\tRisk-adaptive human control",
+        "human-control\tMode-aware human control",
         "truthful-repair\tTruthful repair and termination",
         "recovery-rollback\tRecovery without duplicated side effects",
         "command-isolation\tCommand isolation with auditable escape",
