@@ -78,6 +78,7 @@ class Storage:
                     interrupted_from TEXT,
                     step_count INTEGER NOT NULL DEFAULT 0,
                     repair_cycles INTEGER NOT NULL DEFAULT 0,
+                    context_limit INTEGER NOT NULL DEFAULT 64000,
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -119,6 +120,7 @@ class Storage:
                     model TEXT NOT NULL,
                     base_url TEXT,
                     credential_file TEXT,
+                    context_window INTEGER,
                     updated_at TEXT NOT NULL
                 );
 
@@ -142,12 +144,23 @@ class Storage:
                 "plan_gate_json": "TEXT",
                 "mode": "TEXT NOT NULL DEFAULT 'agent'",
                 "turns_json": "TEXT NOT NULL DEFAULT '[]'",
+                "context_limit": "INTEGER NOT NULL DEFAULT 64000",
             }
             for column, declaration in migrations.items():
                 if column not in columns:
                     self._connection.execute(
                         f"ALTER TABLE runs ADD COLUMN {column} {declaration}"
                     )
+            provider_columns = {
+                row["name"]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(provider_config)"
+                ).fetchall()
+            }
+            if "context_window" not in provider_columns:
+                self._connection.execute(
+                    "ALTER TABLE provider_config ADD COLUMN context_window INTEGER"
+                )
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_runs_project_updated "
                 "ON runs(project_id, updated_at DESC)"
@@ -224,8 +237,8 @@ class Storage:
                     verifier_enabled, plan_json,
                     clarification_json, pending_approval_json, verification_json,
                     plan_gate_json, messages_json, plan_approved, interrupted_from,
-                    step_count, repair_cycles, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    step_count, repair_cycles, context_limit, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._run_values(run),
             )
@@ -242,7 +255,7 @@ class Storage:
                     plan_json = ?, clarification_json = ?, pending_approval_json = ?,
                     verification_json = ?, plan_gate_json = ?, messages_json = ?,
                     plan_approved = ?, interrupted_from = ?, step_count = ?,
-                    repair_cycles = ?, error = ?, created_at = ?, updated_at = ?
+                    repair_cycles = ?, context_limit = ?, error = ?, created_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (*values[1:], values[0]),
@@ -374,6 +387,7 @@ class Storage:
             model=row["model"],
             base_url=row["base_url"],
             credential_file=row["credential_file"],
+            context_window=row["context_window"],
             updated_at=datetime.fromisoformat(row["updated_at"]).astimezone(UTC),
         )
 
@@ -382,18 +396,22 @@ class Storage:
         with self._lock, self._connection:
             self._connection.execute(
                 """
-                INSERT INTO provider_config(id, model, base_url, credential_file, updated_at)
-                VALUES (1, ?, ?, ?, ?)
+                INSERT INTO provider_config(
+                    id, model, base_url, credential_file, context_window, updated_at
+                )
+                VALUES (1, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     model = excluded.model,
                     base_url = excluded.base_url,
                     credential_file = excluded.credential_file,
+                    context_window = excluded.context_window,
                     updated_at = excluded.updated_at
                 """,
                 (
                     config.model,
                     config.base_url,
                     config.credential_file,
+                    config.context_window,
                     config.updated_at.isoformat(),
                 ),
             )
@@ -532,6 +550,7 @@ class Storage:
             run.interrupted_from.value if run.interrupted_from else None,
             run.step_count,
             run.repair_cycles,
+            run.context_limit,
             run.error,
             run.created_at.isoformat(),
             run.updated_at.isoformat(),
@@ -560,6 +579,7 @@ class Storage:
             ),
             step_count=row["step_count"],
             repair_cycles=row["repair_cycles"],
+            context_limit=row["context_limit"],
             error=row["error"],
             created_at=datetime.fromisoformat(row["created_at"]).astimezone(UTC),
             updated_at=datetime.fromisoformat(row["updated_at"]).astimezone(UTC),

@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from fastapi import (
@@ -31,6 +31,7 @@ from traceforge.agent import InvalidRunAction, PlanDecision, RunConflictError
 from traceforge.config import Settings
 from traceforge.context import ContextManager
 from traceforge.events import EventBroker
+from traceforge.model_context import resolve_model_context
 from traceforge.models import (
     ApprovalRequest,
     ClarificationAnswer,
@@ -94,6 +95,7 @@ class UpdateProviderRequest(BaseModel):
     base_url: str | None = Field(default=None, max_length=2_000)
     credential_file: str | None = Field(default=None, max_length=4_096)
     api_key: SecretStr | None = Field(default=None, max_length=16 * 1024)
+    context_window: int | None = Field(default=None, ge=1, le=10_000_000)
 
     @model_validator(mode="after")
     def validate_credential_source(self) -> UpdateProviderRequest:
@@ -111,6 +113,9 @@ class ProviderConfigView(BaseModel):
     credential_file: str | None
     credential_env: str = "OPENAI_API_KEY"
     api_key_configured: bool
+    context_window: int | None
+    resolved_context_window: int
+    context_window_source: Literal["configured", "catalog", "fallback"]
     updated_at: datetime
 
 
@@ -158,10 +163,11 @@ class RunView(BaseModel):
     updated_at: datetime
 
     @classmethod
-    def from_record(cls, run: RunRecord, *, context_limit: int) -> RunView:
+    def from_record(cls, run: RunRecord) -> RunView:
         public = run.model_dump(exclude={"messages", "plan_approved", "interrupted_from"})
-        public["context_tokens"] = ContextManager(context_limit).estimated_tokens(run.messages)
-        public["context_limit"] = context_limit
+        public["context_tokens"] = ContextManager(run.context_limit).estimated_tokens(
+            run.messages
+        )
         return cls.model_validate(public)
 
 
@@ -238,6 +244,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     @app.get("/api/status")
     async def get_status() -> dict[str, Any]:
         config = runtime.provider_config
+        model_context = runtime.model_context
         last_workspace = str(_preferred_directory(storage, fallback=settings.workspace))
         return {
             "version": __version__,
@@ -250,7 +257,8 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             "mode": "demo" if settings.demo_mode else "standard",
             "sandbox": sandbox_status(settings.workspace).as_dict(),
             "limits": {
-                "context": settings.context_limit,
+                "context": model_context.context_window,
+                "context_source": model_context.source,
                 "steps": settings.max_steps,
                 "repair_cycles": settings.max_repair_cycles,
             },
@@ -258,6 +266,12 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     def provider_view(config: ProviderConfig | None = None) -> ProviderConfigView:
         selected = config or runtime.provider_config
+        model_context = resolve_model_context(
+            selected.model,
+            base_url=selected.base_url,
+            configured_window=selected.context_window,
+            fallback_window=settings.context_limit,
+        )
         if selected.credential_file:
             source = "file"
         elif settings.api_key:
@@ -270,6 +284,9 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             credential_source=source,
             credential_file=selected.credential_file,
             api_key_configured=runtime.credential_configured(selected),
+            context_window=selected.context_window,
+            resolved_context_window=model_context.context_window,
+            context_window_source=model_context.source,
             updated_at=selected.updated_at,
         )
 
@@ -284,6 +301,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 model=body.model,
                 base_url=body.base_url,
                 credential_file=body.credential_file,
+                context_window=body.context_window,
             ),
             api_key=(body.api_key.get_secret_value() if body.api_key is not None else None),
         )
@@ -337,7 +355,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         records = storage.list_runs(project_id=project_id)
         if direct_only:
             records = [run for run in records if run.project_id is None]
-        return [RunView.from_record(run, context_limit=settings.context_limit) for run in records]
+        return [RunView.from_record(run) for run in records]
 
     @app.post("/api/runs", response_model=RunView, status_code=status.HTTP_201_CREATED)
     async def create_run(body: CreateRunRequest) -> RunView:
@@ -375,11 +393,11 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             if created_workspace is not None:
                 _remove_empty_directory(created_workspace)
             raise
-        return RunView.from_record(run, context_limit=settings.context_limit)
+        return RunView.from_record(run)
 
     @app.get("/api/runs/{run_id}", response_model=RunView)
     async def get_run(run_id: str) -> RunView:
-        return RunView.from_record(storage.get_run(run_id), context_limit=settings.context_limit)
+        return RunView.from_record(storage.get_run(run_id))
 
     @app.get("/api/runs/{run_id}/events", response_model=list[RunEvent])
     async def get_events(
@@ -441,7 +459,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         run = await runtime.manager_for_run(run_id).follow_up(
             run_id, body.prompt, mode=body.mode
         )
-        return RunView.from_record(run, context_limit=settings.context_limit)
+        return RunView.from_record(run)
 
     @app.post("/api/runs/{run_id}/plan-decision", status_code=status.HTTP_202_ACCEPTED)
     async def decide_plan(run_id: str, body: PlanDecision) -> dict[str, bool]:
@@ -464,15 +482,13 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     @app.post("/api/runs/{run_id}/cancel", response_model=RunView)
     async def cancel_run(run_id: str) -> RunView:
         return RunView.from_record(
-            await runtime.manager_for_run(run_id).cancel(run_id),
-            context_limit=settings.context_limit,
+            await runtime.manager_for_run(run_id).cancel(run_id)
         )
 
     @app.post("/api/runs/{run_id}/resume", response_model=RunView)
     async def resume_run(run_id: str) -> RunView:
         return RunView.from_record(
-            await runtime.manager_for_run(run_id).resume(run_id),
-            context_limit=settings.context_limit,
+            await runtime.manager_for_run(run_id).resume(run_id)
         )
 
     @app.post("/api/runs/{run_id}/rollback")

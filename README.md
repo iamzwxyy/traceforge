@@ -41,6 +41,10 @@ Its differentiator is a defensible engineering loop with useful human control.
 - **Recoverable execution.** Runs and events survive in SQLite. Bounded, visible model retries
   pause safely on a persistent transient outage; connection settings can be repaired before
   resuming. File snapshots support conflict-aware rollback without overwriting later user edits.
+- **Model-aware context limits.** Each run snapshots the capacity resolved from an explicit user
+  override, an exact official-endpoint model entry, or a conservative fallback. Compaction counts
+  tool schemas, keeps tool requests paired with their results, and never assigns a large window
+  from a fuzzy model-name match.
 
 ## Try the complete demo
 
@@ -89,7 +93,9 @@ Open <http://127.0.0.1:8765>, then use the settings button to choose the model, 
 URL, and API key. TraceForge atomically writes the key to an owner-only (`0600`) file in its local
 data directory; SQLite saves only that file's absolute path, and the value is never returned by
 the API or UI. Advanced users may instead reference an existing one-line owner-only credential
-file.
+file or set a model's documented context window. Leaving the context field empty uses an exact
+catalog entry only for a recognized model on its official endpoint; all other routes use the
+configurable conservative fallback. The resolved value and its source remain visible in settings.
 
 Click **新建任务** to enter only the request; press Enter to submit or Shift+Enter for a newline.
 The optional **计划模式** toggle is off by default. Leave it off for the normal Agent flow, or
@@ -107,7 +113,7 @@ Environment variables remain available as a non-persisted fallback:
 | `OPENAI_API_KEY` | no | Fallback provider credential; never returned by the API or UI |
 | `OPENAI_MODEL` | no | Defaults to `gpt-5.6-sol` |
 | `OPENAI_BASE_URL` | no | OpenAI-compatible endpoint |
-| `TRACEFORGE_CONTEXT_LIMIT` | no | Token-window estimate; defaults to 64,000 |
+| `TRACEFORGE_CONTEXT_LIMIT` | no | Conservative token-window fallback for unrecognized routes; defaults to 64,000 |
 | `TRACEFORGE_MODEL_TIMEOUT` | no | Per-attempt model timeout in seconds; defaults to 180 |
 | `TRACEFORGE_WORKSPACE_ROOT` | no | Advanced override for the direct-task root |
 

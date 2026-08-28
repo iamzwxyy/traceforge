@@ -262,6 +262,7 @@ class ProviderConfig(BaseModel):
     model: str = Field(min_length=1, max_length=200)
     base_url: str | None = Field(default=None, max_length=2_000)
     credential_file: str | None = Field(default=None, max_length=4_096)
+    context_window: int | None = Field(default=None, ge=1, le=10_000_000)
     updated_at: datetime = Field(default_factory=utc_now)
 
 
@@ -351,6 +352,7 @@ class RunRecord(BaseModel):
     interrupted_from: RunState | None = None
     step_count: int = 0
     repair_cycles: int = 0
+    context_limit: int = Field(default=64_000, ge=1, le=10_000_000)
     error: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

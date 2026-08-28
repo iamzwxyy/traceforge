@@ -103,6 +103,32 @@ def test_workspace_manager_resolves_credential_file_without_persisting_value(
     assert "file-only-test-value" not in saved.model_dump_json()
 
 
+def test_workspace_manager_uses_resolved_model_context(
+    settings, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, int] = {}
+
+    class CapturingProvider:
+        def __init__(self, provider_settings) -> None:
+            captured["context_limit"] = provider_settings.context_limit
+
+    monkeypatch.setattr(runtime_module, "OpenAICompatibleProvider", CapturingProvider)
+    storage.save_provider_config(
+        ProviderConfig(
+            model="deepseek-v4-pro",
+            base_url="https://api.deepseek.com/v1",
+            context_window=None,
+        )
+    )
+    runtime = AgentRuntime(settings, storage, EventBroker(storage))
+
+    manager = runtime.manager_for_workspace(settings.workspace)
+
+    assert captured["context_limit"] == 1_000_000
+    assert manager.settings.context_limit == 1_000_000
+    assert runtime.model_context.source == "catalog"
+
+
 @pytest.mark.asyncio
 async def test_provider_config_can_change_while_runs_are_interrupted(
     settings, storage: Storage

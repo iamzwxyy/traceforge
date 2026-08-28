@@ -885,14 +885,26 @@ function ProviderDialog({
   const [baseUrl, setBaseUrl] = useState(provider.base_url ?? "");
   const [apiKey, setApiKey] = useState("");
   const [credentialFile, setCredentialFile] = useState(provider.credential_file ?? "");
+  const [contextWindow, setContextWindow] = useState(
+    provider.context_window?.toString() ?? "",
+  );
   const [working, setWorking] = useState<"save" | "test" | null>(null);
   const [probe, setProbe] = useState<ProviderProbe | null>(null);
   const { dialogRef, onDialogKeyDown } = useDialogFocus(onClose);
 
+  const parsedContextWindow = contextWindow.trim()
+    ? Number(contextWindow.trim())
+    : null;
+  const contextWindowValid = parsedContextWindow === null || (
+    Number.isInteger(parsedContextWindow)
+    && parsedContextWindow >= 1
+    && parsedContextWindow <= 10_000_000
+  );
   const config: ProviderUpdate = {
     model: model.trim(),
     base_url: baseUrl.trim() || null,
     credential_file: apiKey.trim() ? null : credentialFile.trim() || null,
+    context_window: contextWindowValid ? parsedContextWindow : null,
     ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
   };
 
@@ -918,11 +930,29 @@ function ProviderDialog({
           <small>只写入本机仅当前用户可读的私密文件；页面、数据库与运行记录都不会保存或回显 Key。</small>
         </label>
         <details className="advanced-settings">
-          <summary>高级：使用已有凭证文件</summary>
+          <summary>高级设置</summary>
           <label className="field-label">
             <span>凭证文件路径</span>
             <input value={credentialFile} onChange={(event) => setCredentialFile(event.target.value)} placeholder="/absolute/path/to/owner-only-key-file" disabled={Boolean(apiKey.trim())} />
             <small>文件必须只有一行，并使用仅所有者权限（chmod 600）。输入 API Key 时会忽略此路径。</small>
+          </label>
+          <label className="field-label">
+            <span>上下文窗口（token，可选）</span>
+            <input
+              type="number"
+              min={1}
+              max={10_000_000}
+              step={1}
+              value={contextWindow}
+              onChange={(event) => setContextWindow(event.target.value)}
+              placeholder="留空自动识别"
+              aria-invalid={!contextWindowValid}
+            />
+            <small>
+              {contextWindowValid
+                ? `当前采用 ${provider.resolved_context_window.toLocaleString()} token（${contextWindowSourceLabel(provider.context_window_source)}）。留空时只精确识别已知模型，其他模型使用保守回退。`
+                : "请输入 1–10,000,000 之间的整数。"}
+            </small>
           </label>
         </details>
         {probe && (
@@ -937,7 +967,7 @@ function ProviderDialog({
             <button
               className="button"
               type="button"
-              disabled={!config.model || Boolean(working)}
+              disabled={!config.model || !contextWindowValid || Boolean(working)}
               onClick={() => {
                 setWorking("test");
                 setProbe(null);
@@ -953,7 +983,7 @@ function ProviderDialog({
             <button
               className="button primary"
               type="button"
-              disabled={!config.model || Boolean(working)}
+              disabled={!config.model || !contextWindowValid || Boolean(working)}
               onClick={() => {
                 setWorking("save");
                 void onSave(config)
@@ -1546,6 +1576,14 @@ function providerErrorLabel(category: string): string {
     server: "服务端临时错误",
     provider_contract: "服务响应异常",
     provider: "模型服务异常",
+  });
+}
+
+function contextWindowSourceLabel(source: ProviderConfig["context_window_source"]): string {
+  return labelFromMap(source, {
+    configured: "手动设置",
+    catalog: "精确模型目录",
+    fallback: "保守回退",
   });
 }
 

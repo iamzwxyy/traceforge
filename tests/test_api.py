@@ -61,6 +61,8 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
         assert status_payload["sandbox"]["backend"] in {"seatbelt", "bubblewrap", "none"}
         assert isinstance(status_payload["sandbox"]["enforced"], bool)
         assert status_payload["sandbox"]["detail"]
+        assert status_payload["limits"]["context"] == settings.context_limit
+        assert status_payload["limits"]["context_source"] == "fallback"
         response = client.post(
             "/api/runs",
             json={
@@ -429,7 +431,22 @@ def test_provider_config_uses_a_file_reference_without_returning_secret(
         assert payload["credential_source"] == "file"
         assert payload["credential_file"] == str(credential.resolve())
         assert payload["api_key_configured"] is True
+        assert payload["context_window"] is None
+        assert payload["resolved_context_window"] == 1_000_000
+        assert payload["context_window_source"] == "catalog"
         assert "credential-value" not in updated.text
+
+        created = client.post(
+            "/api/runs",
+            json={
+                "task": "Inspect with the resolved context snapshot",
+                "verifier_enabled": False,
+                "mode": "agent",
+                "create_direct_workspace": True,
+            },
+        )
+        assert created.status_code == 201
+        assert created.json()["context_limit"] == 1_000_000
 
         tested = client.post("/api/provider/test")
         assert tested.status_code == 200
@@ -449,6 +466,7 @@ def test_provider_config_stores_direct_api_key_in_owner_only_file(
                 "model": "direct-key-model",
                 "base_url": "https://provider.example/v1",
                 "credential_file": None,
+                "context_window": 240_000,
                 "api_key": secret,
             },
         )
@@ -458,6 +476,9 @@ def test_provider_config_stores_direct_api_key_in_owner_only_file(
         credential = Path(payload["credential_file"])
         assert payload["credential_source"] == "file"
         assert payload["api_key_configured"] is True
+        assert payload["context_window"] == 240_000
+        assert payload["resolved_context_window"] == 240_000
+        assert payload["context_window_source"] == "configured"
         assert "api_key" not in payload
         assert secret not in updated.text
         assert credential.parent == settings.data_dir.resolve()

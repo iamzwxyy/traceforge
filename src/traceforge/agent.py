@@ -176,6 +176,7 @@ class AgentManager:
             project_id=project_id,
             mode=mode,
             verifier_enabled=verifier_enabled,
+            context_limit=self.settings.context_limit,
             turns=[ConversationTurn(index=1, request=clean_task, mode=mode)],
         )
         self.storage.create_run(run)
@@ -219,6 +220,7 @@ class AgentManager:
         run.messages = []
         run.step_count = 0
         run.repair_cycles = 0
+        run.context_limit = self.settings.context_limit
         run.error = None
         self._controls[run.id] = _Control()
         await self._transition(run, RunState.CREATED)
@@ -849,7 +851,7 @@ class AgentManager:
             ),
         ]
         for _ in range(8):
-            prepared, _ = self.context.prepare(messages)
+            prepared, _ = self.context.prepare(messages, verifier_tools)
             response = await self._request_model(run, prepared, verifier_tools)
             messages.append(response.as_assistant_message())
             if response.content:
@@ -1030,7 +1032,7 @@ class AgentManager:
     async def _complete_model(
         self, run: RunRecord, tools: list[dict[str, Any]]
     ) -> ModelResponse:
-        prepared, compacted = self.context.prepare(run.messages)
+        prepared, compacted = self.context.prepare(run.messages, tools)
         if compacted:
             run.messages = prepared
             self.storage.save_run(run)

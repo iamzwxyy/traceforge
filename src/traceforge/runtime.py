@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from traceforge.agent import AgentManager, RunConflictError
 from traceforge.config import Settings
 from traceforge.events import EventBroker
+from traceforge.model_context import ResolvedModelContext, resolve_model_context
 from traceforge.models import InteractionMode, ProviderConfig, RunRecord
 from traceforge.provider import ModelProvider, OpenAICompatibleProvider, ProviderError
 from traceforge.storage import Storage
@@ -138,6 +139,16 @@ class AgentRuntime:
             ProviderConfig(model=self.settings.model, base_url=self.settings.base_url)
         )
 
+    @property
+    def model_context(self) -> ResolvedModelContext:
+        config = self.provider_config
+        return resolve_model_context(
+            config.model,
+            base_url=config.base_url,
+            configured_window=config.context_window,
+            fallback_window=self.settings.context_limit,
+        )
+
     def credential_configured(self, config: ProviderConfig | None = None) -> bool:
         selected = config or self.provider_config
         if selected.credential_file:
@@ -174,6 +185,12 @@ class AgentRuntime:
         if manager is not None:
             return manager
         config = self.provider_config
+        model_context = resolve_model_context(
+            config.model,
+            base_url=config.base_url,
+            configured_window=config.context_window,
+            fallback_window=self.settings.context_limit,
+        )
         if self.provider_override is None:
             api_key = _read_api_key(self.settings, config)
             run_settings = replace(
@@ -183,6 +200,7 @@ class AgentRuntime:
                 model=config.model,
                 base_url=config.base_url,
                 credential_file=(Path(config.credential_file) if config.credential_file else None),
+                context_limit=model_context.context_window,
             )
             provider: ModelProvider = OpenAICompatibleProvider(run_settings)
         else:
@@ -192,6 +210,7 @@ class AgentRuntime:
                 model=config.model,
                 base_url=config.base_url,
                 credential_file=(Path(config.credential_file) if config.credential_file else None),
+                context_limit=model_context.context_window,
             )
             provider = self.provider_override
         manager = AgentManager(run_settings, self.storage, provider, broker=self.broker)

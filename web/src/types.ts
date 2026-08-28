@@ -151,6 +151,7 @@ export interface AppStatus {
   };
   limits: {
     context: number;
+    context_source: "configured" | "catalog" | "fallback";
     steps: number;
     repair_cycles: number;
   };
@@ -172,6 +173,9 @@ export interface ProviderConfig {
   credential_file: string | null;
   credential_env: string;
   api_key_configured: boolean;
+  context_window: number | null;
+  resolved_context_window: number;
+  context_window_source: "configured" | "catalog" | "fallback";
   updated_at: string;
 }
 
@@ -179,6 +183,7 @@ export interface ProviderUpdate {
   model: string;
   base_url: string | null;
   credential_file: string | null;
+  context_window: number | null;
   api_key?: string;
 }
 

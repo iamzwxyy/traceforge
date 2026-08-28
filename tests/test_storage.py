@@ -97,6 +97,7 @@ def test_projects_provider_config_and_preferences(
         model="deepseek-tool-model",
         base_url="https://provider.example/v1",
         credential_file=str(tmp_path / "credential"),
+        context_window=240_000,
     )
     storage.save_provider_config(provider)
 
@@ -105,9 +106,12 @@ def test_projects_provider_config_and_preferences(
     assert storage.list_runs(project_id=project.id)[0].project_id == project.id
     assert storage.list_runs()[0].id == "project-run"
     assert storage.get_preference("last_workspace") == project.root
-    assert storage.get_provider_config(
+    saved_provider = storage.get_provider_config(
         ProviderConfig(model=settings.model, base_url=settings.base_url)
-    ).model == "deepseek-tool-model"
+    )
+    assert saved_provider.model == "deepseek-tool-model"
+    assert saved_provider.context_window == 240_000
+    assert storage.get_run("project-run").context_limit == 64_000
 
     with pytest.raises(ValueError, match="already uses"):
         storage.create_project(
