@@ -241,7 +241,7 @@ code, pre { font-family: var(--mono); }
 .run-header { min-height: 92px; padding: 17px 22px 15px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid var(--line-soft); }
 .run-header > div:first-child { min-width: 0; flex: 1; }
 .run-header > .button-row { flex: 0 0 auto; }
-.run-header-meta { display: flex; align-items: center; gap: 8px; color: var(--faint); font: 10px var(--mono); letter-spacing: 0.06em; }
+.run-header-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--faint); font: 10px var(--mono); letter-spacing: 0.06em; }
 .plan-gate-badge { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 4px; border: 1px solid rgba(112, 167, 255, 0.25); border-radius: 999px; color: #a9c9ff; background: rgba(112, 167, 255, 0.08); font: 700 10px var(--mono); text-transform: uppercase; }
 .plan-gate-badge.fast { color: var(--accent); border-color: rgba(62, 214, 157, 0.25); background: var(--accent-soft); }
 .approval-mode-badge { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 4px; color: #b8c7da; border: 1px solid #2d394a; border-radius: 999px; background: rgba(18, 25, 35, 0.9); font: 700 10px var(--mono); text-transform: uppercase; }
@@ -249,6 +249,7 @@ code, pre { font-family: var(--mono); }
 .approval-mode-badge.full_access { color: var(--amber); border-color: rgba(240, 182, 91, 0.28); background: rgba(240, 182, 91, 0.08); }
 .reasoning-effort-badge { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 4px; color: #a9c9ff; border: 1px solid rgba(112, 167, 255, 0.25); border-radius: 999px; background: rgba(112, 167, 255, 0.08); font: 700 10px var(--mono); text-transform: uppercase; }
 .reasoning-effort-badge.high, .reasoning-effort-badge.xhigh, .reasoning-effort-badge.max { color: var(--amber); border-color: rgba(240, 182, 91, 0.28); background: rgba(240, 182, 91, 0.08); }
+.workspace-rules-badge { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 4px; color: #b8c7da; border: 1px solid #2d394a; border-radius: 999px; background: rgba(18, 25, 35, 0.9); font: 700 10px var(--mono); text-transform: uppercase; }
 .run-header h2 { max-width: 780px; margin: 9px 0 0; overflow: hidden; color: #e7edf5; font-size: 18px; line-height: 1.4; font-weight: 580; text-overflow: ellipsis; white-space: nowrap; }
 .state-badge { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: #121923; font: 700 10px var(--mono); text-transform: uppercase; }
 .state-badge.active { color: #a9c9ff; border-color: rgba(112, 167, 255, 0.25); background: rgba(112, 167, 255, 0.08); }
@@ -327,6 +328,7 @@ code, pre { font-family: var(--mono); }
 .policy-activity .activity-icon { color: #a9c9ff; border-color: rgba(112, 167, 255, 0.22); background: rgba(112, 167, 255, 0.08); }
 .verifier-activity .activity-icon { color: var(--accent); border-color: rgba(62, 214, 157, 0.22); background: var(--accent-soft); }
 .recovery-activity .activity-icon { color: #a9c9ff; border-color: rgba(112, 167, 255, 0.22); background: rgba(112, 167, 255, 0.08); }
+.workspace-rules-activity .activity-icon { color: #aebdce; border-color: rgba(174, 189, 206, 0.2); background: rgba(174, 189, 206, 0.06); }
 .repair-activity .activity-icon { color: var(--amber); border-color: rgba(235, 177, 74, 0.24); background: rgba(235, 177, 74, 0.08); }
 .thinking-row { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
 .spin { animation: spin 1.1s linear infinite; }
@@ -439,7 +441,7 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 13px; font-weight: 600; 
 .timeline-marker.bad { border-color: var(--red); }
 .timeline-row > div { min-width: 0; display: flex; flex-direction: column; }
 .timeline-row strong { color: #b8c3d0; font: 700 11px var(--mono); }
-.timeline-row small { margin-top: 2px; color: #617087; font: 10px var(--mono); }
+.timeline-row small { margin-top: 2px; color: #8291a6; font: 10px var(--mono); }
 .timeline-row p { margin: 5px 0 0; overflow: hidden; color: #8291a6; font-size: 11px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
 .diff-view { min-width: max-content; margin: 0; padding: 12px 0 30px; color: #a1acbb; background: #090d13; font-size: 11px; line-height: 1.6; }
 .diff-view > span { min-height: 15px; display: block; white-space: pre; }

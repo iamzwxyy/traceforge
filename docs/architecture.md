@@ -19,6 +19,8 @@ flowchart TB
     Manager --> Gate[Interaction mode + scope assessment]
     Manager --> Tools[ToolRegistry]
     Manager --> Context[ContextManager]
+    Manager --> Rules[Root AGENTS.md snapshot loader]
+    Rules --> DB
     Tools --> Guard[Workspace guard + snapshots]
     Tools --> Process[argv subprocess runner]
     Process --> Sandbox[Seatbelt / Bubblewrap / explicit policy-only]
@@ -40,6 +42,9 @@ flowchart TB
 - `assess_plan_gate` is a deterministic risk projection over the task and structured plan. The
   selected interaction mode—not a model claim—decides whether implementation pauses for review.
 - `ToolRegistry` defines and executes the bounded local capability surface.
+- `WorkspaceInstructionLoader` safely captures the exact root `AGENTS.md` into a private,
+  turn-indexed snapshot before a new turn exists. The model sees it as a separate user-role
+  guidance message; public projections receive only a manifest.
 - `ToolRegistry.assess` produces an invariant base decision; `resolve_permission` applies the
   persisted per-turn `ApprovalMode` without ever upgrading a hard denial.
 - `CommandSandbox` probes an OS backend and constructs a per-command profile; it returns structured
@@ -338,10 +343,31 @@ sequence entry under a generic user-facing model-call label.
 TraceForge resolves a context window for each route using a validated user override, an exact
 official-endpoint/model catalog entry, or a conservative fallback, and snapshots that value on the
 run. It estimates tokens deterministically from serialized UTF-8 bytes, including the current tool
-schemas. At 80% pressure it retains the first two messages, selects a recent tail within 16% of the
-window, and inserts a bounded evidence-oriented summary of the middle. Assistant tool calls remain
-paired with their following tool results. Provider-private reasoning replay is never summarized or
+schemas. At 80% pressure it retains the fixed system message and direct request—or the first three
+messages when workspace guidance sits between them—selects a recent tail within 16% of the window,
+and inserts a bounded evidence-oriented summary of the middle. Assistant tool calls remain paired
+with their following tool results. Provider-private reasoning replay is never summarized or
 projected to the UI and is scrubbed when the turn terminates.
+
+Workspace guidance has its own deterministic context boundary. For v1, only an exact
+workspace-root `AGENTS.md` is eligible. Its complete rendered message is capped at 32 KiB and is
+inserted after the fixed system message but before the direct current request. That three-message
+prefix is protected during compaction, then the private guidance message is removed again before
+conversation history is persisted. Planner, Builder, and Verifier therefore use the same snapshot
+without turning project prose into a system instruction. The framing states that safety remains
+highest, the current request outranks conflicting project defaults, and guidance cannot grant
+permissions or expand the workspace. The first statement is model-facing precedence rather than a
+local semantic proof; the latter boundaries are enforced by tool policy.
+
+Every new run and follow-up captures a fresh snapshot—an explicit empty snapshot when no file
+exists—and commits it in the same SQLite transaction as the turn and its first events. Resume binds
+the active tools to that exact stored hash and never rereads the filesystem. Any native edit or
+command checks the current turn's persisted hash against the manager's in-memory binding before a
+baseline, write, or process starts. Legacy interrupted turns without a snapshot are not resumable;
+their user can stop the interrupted turn before following up, or start a new task instead.
+The snapshot freezes automatic discovery and injection only. Root or nested `AGENTS.md` files remain
+ordinary readable/editable workspace files; reading later disk content does not replace the marked
+current-turn guidance snapshot.
 
 A run is also a durable conversation. `ConversationTurn` records the request, selected Agent/Plan
 mode, selected action-permission mode, selected reasoning effort, outcome, completion summary,
@@ -355,6 +381,19 @@ Answer, failure, and cancellation close the active turn and publish `state.chang
 `turn.completed`, and `run.completed` with the RunRecord in one guarded SQLite transaction. Success
 adds its Proof Pack to that same boundary. A write fault therefore rolls every terminal projection
 back to the prior non-terminal state instead of leaving a terminal run with an in-progress turn.
+One deliberately destructive recovery handles an interrupted row whose formerly ordinary context
+matches a newly selected provider credential. Because the normal serializer must reject that row,
+the storage layer atomically abandons every active decision, clears model-facing subjects and
+history, writes one neutral cancelled turn, and emits the same terminal event boundary with no
+provider or tool call. Workspace file snapshots and the immutable workspace-instruction snapshot
+remain untouched. The run is terminal before the old row bytes are checkpointed from SQLite WAL, so
+a busy external reader leaves a cleanup marker for startup rather than keeping the workspace active.
+Resume preflight evaluates the persisted row together with the exact sealed-guidance insertion, so
+a compact-JSON credential assembled only between those messages is rejected synchronously while the
+run remains interrupted. Provider credentials shorter than 12 UTF-8 bytes, or equal to an
+unavoidable recovery-protocol representation, are rejected before a manager can register them.
+After destructive recovery, the next follow-up uses `max(turn.index) + 1`; retained snapshot rows
+therefore cannot collide even when the neutral projection keeps a later turn number.
 
 Rollback intentionally ends that snapshot lineage. A follow-up from `rolled_back` creates one
 successor run UUID recorded in `run_lineage`; exact retries return the same successor and a
@@ -373,6 +412,9 @@ SQLite uses WAL mode. Its core tables include:
   internal messages, plan and scope assessment, approval state, and interrupted origin;
 - `events`: per-run monotonically increasing sequence and JSON payload;
 - `snapshots`: original bytes, mode, original hash, and last agent-written hash per path;
+- `workspace_instruction_snapshots`: insert-only private root-rule content, provenance, and semantic
+  hash keyed by run and turn; this persistence path never directly copies the prose into `runs` or
+  rule-manifest events, although a provider may independently quote model-visible rules;
 - `decision_requests`: request subject/payload hashes, pending/accepted/consumed/abandoned/uncertain
   status, and the approved-action execution-start boundary;
 - `run_lineage`: the one-to-one rolled-back parent → successor relationship;
@@ -388,7 +430,9 @@ SQLite uses WAL mode. Its core tables include:
 Startup migrations add compatible columns to early v0.1 databases. The credential-boundary
 migration abandons every pre-boundary pending/accepted action decision and clears its pending
 subject plus replay messages, so an old approval cannot become executable after restart. Historical
-events and immutable Proof Packs are not rewritten because their hashes are evidence; public reads
+databases abandon every pending or accepted clarification, plan, or action decision whose turn
+predates immutable workspace-guidance snapshots. Historical events and immutable Proof Packs are not rewritten because
+their hashes are evidence; public reads
 still redact the currently registered key and standard token shapes. WebSocket clients request
 events after their last sequence; the server replays persisted rows before subscribing to new
 ones. One workspace permits one active or interrupted run to avoid overlapping writes; different

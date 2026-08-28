@@ -54,6 +54,7 @@ import {
   effectiveAssistantOutputStatus,
   inferProviderPreset,
   isActiveState,
+  latestWorkspaceInstructionManifest,
   parseDiff,
   presentState,
   proofPackTurnIndex,
@@ -65,6 +66,8 @@ import {
   shouldSubmitPrompt,
   supportedReasoningEffort,
   taskTitle,
+  workspaceInstructionManifest,
+  workspaceInstructionErrorLabel,
   type ProviderPreset,
 } from "./lib";
 import type {
@@ -85,6 +88,7 @@ import type {
   RunState,
   RunTarget,
   TaskPlan,
+  WorkspaceInstructionManifest,
 } from "./types";
 import { useTraceForge, type ProofLoadState } from "./useTraceForge";
 
@@ -1817,6 +1821,7 @@ function RunStage({
   const proofTurnIndexes = availableProofTurnIndexes(run);
   const latestProofTurnIndex = proofTurnIndexes.at(-1) ?? null;
   const currentTurnIndex = run.turns.at(-1)?.index ?? 1;
+  const workspaceRules = latestWorkspaceInstructionManifest(events, currentTurnIndex);
   const currentProofTurnIndex = run.state === "succeeded"
     && proofTurnIndexes.includes(currentTurnIndex)
     ? currentTurnIndex
@@ -1834,7 +1839,8 @@ function RunStage({
             {run.mode === "plan" && run.plan_gate && <PlanGateBadge gate={run.plan_gate} />}
             <ApprovalModeBadge mode={run.approval_mode} />
             <ReasoningEffortBadge effort={run.reasoning_effort} />
-            <span>{run.mode === "plan" ? "计划模式" : "普通 Agent"} · 第 {Math.max(run.turns.length, 1)} 轮</span>
+            {workspaceRules && <WorkspaceRulesBadge manifest={workspaceRules} />}
+            <span>{run.mode === "plan" ? "计划模式" : "普通 Agent"} · 第 {currentTurnIndex} 轮</span>
             <span>任务 {run.id.slice(0, 8).toUpperCase()}</span>
             {run.parent_run_id && (
               <span title={`回滚前任务 ${run.parent_run_id}`}>续自回滚任务 {run.parent_run_id.slice(0, 8).toUpperCase()}</span>
@@ -1936,7 +1942,7 @@ function RunStage({
         )}
         {followUpEnabled && ["answered", "succeeded", "failed", "cancelled", "rolled_back"].includes(run.state) && !(run.state === "rolled_back" && run.successor_run_id) && (
           <FollowUpComposer
-            key={`${run.id}:${run.turns.length}`}
+            key={`${run.id}:${currentTurnIndex}`}
             provider={provider}
             providerReady={providerReady}
             draft={followUpDraft}
@@ -2033,9 +2039,10 @@ function ActivityFeed({
   const progressSequences = new Set(
     projectProgressEvents(events).map((event) => event.seq),
   );
-  const trace = events.filter((event) =>
-    [
+  const trace = events.filter((event) => {
+    const included = [
       "message",
+      "workspace.instructions.resolved",
       "tool.completed",
       "plan.gated",
       "verification.completed",
@@ -2044,8 +2051,13 @@ function ActivityFeed({
       "run.resumed",
       "assistant.output.aborted",
       "error",
-    ].includes(event.type) && (event.type !== "message" || progressSequences.has(event.seq))
-  );
+    ].includes(event.type);
+    if (!included || (event.type === "message" && !progressSequences.has(event.seq))) {
+      return false;
+    }
+    return event.type !== "workspace.instructions.resolved"
+      || workspaceInstructionManifest(event) !== null;
+  });
   const hasPersistedTurn = conversation.some((event) => event.type === "turn.started");
   const hasAssistantOutput = conversation.some((event) => event.type !== "turn.started");
   const conversationVersion = conversation.map((event) => [
@@ -2255,6 +2267,21 @@ function ActivityItem({ event }: { event: RunEvent }) {
   }
   if (event.type === "tool.completed") {
     return <ToolActivityItem event={event} />;
+  }
+  if (event.type === "workspace.instructions.resolved") {
+    const manifest = workspaceInstructionManifest(event);
+    if (!manifest) return null;
+    const source = manifest.sources[0];
+    return (
+      <article className="activity evidence-activity workspace-rules-activity">
+        <div className="activity-icon"><ClipboardCheck size={15} /></div>
+        <div>
+          <span className="activity-label">工作区规则 · 第 {manifest.turn_index} 轮</span>
+          <strong>{source.path} · 已载入</strong>
+          <p>{manifest.total_bytes} B · SHA-256 {source.content_sha256.slice(0, 12)}… · 仅作为项目指引，不改变权限或沙箱</p>
+        </div>
+      </article>
+    );
   }
   if (event.type === "plan.gated") {
     const decision = String(event.payload.decision ?? "assessed");
@@ -2868,6 +2895,20 @@ function ReasoningEffortBadge({ effort }: { effort: ReasoningEffort }) {
   );
 }
 
+function WorkspaceRulesBadge({ manifest }: { manifest: WorkspaceInstructionManifest }) {
+  const count = manifest.sources.length;
+  const description = `已载入 ${count} 份工作区规则；仅作为模型上下文，不改变权限或沙箱`;
+  return (
+    <span
+      className="workspace-rules-badge"
+      title={description}
+      aria-label={description}
+    >
+      <ClipboardCheck size={10} />规则 {count}
+    </span>
+  );
+}
+
 function PlanGateSummary({ gate }: { gate: PlanGate }) {
   const automatic = gate.decision !== "approval_required";
   const title = gate.decision === "agent_continues"
@@ -3155,6 +3196,8 @@ function sandboxDetailLabel(detail: string): string {
 function systemMessageLabel(message: string): string {
   const reasoningLabel = reasoningErrorLabel(message);
   if (reasoningLabel) return reasoningLabel;
+  const workspaceRuleLabel = workspaceInstructionErrorLabel(message);
+  if (workspaceRuleLabel) return workspaceRuleLabel;
   const exact: Record<string, string> = {
     "Scripted provider is ready.": "脚本化模型服务已就绪。",
     "Connection and native tool calling verified.": "连接和原生工具调用已验证。",
@@ -3174,6 +3217,13 @@ function systemMessageLabel(message: string): string {
     "The local file manager could not open this workspace": "本地文件管理器无法打开此工作目录",
     "The recorded workspace path no longer points to its original directory": "任务记录的工作目录已被替换，已拒绝打开",
     "Provider-private replay state could not be stored safely": "模型返回的私有推理状态无法安全保存，任务已停止且未保留该内容。",
+    "The root AGENTS.md must not be a symbolic link.": "根目录 AGENTS.md 不能是符号链接。",
+    "The root AGENTS.md must be a regular file.": "根目录 AGENTS.md 必须是普通文件。",
+    "The root AGENTS.md must contain valid UTF-8 text.": "根目录 AGENTS.md 必须是有效的 UTF-8 文本。",
+    "The root AGENTS.md must not contain NUL bytes.": "根目录 AGENTS.md 不能包含 NUL 字节。",
+    "The root AGENTS.md contains credential-like text and was rejected.": "根目录 AGENTS.md 含有疑似凭证文本，已拒绝载入。",
+    "The root AGENTS.md exceeds the 32 KiB workspace-instruction budget.": "根目录 AGENTS.md 超过 32 KiB 工作区规则预算。",
+    "The root AGENTS.md plus its safety framing exceeds the 32 KiB workspace-instruction budget.": "根目录 AGENTS.md 连同安全边界文本超过 32 KiB 工作区规则预算。",
   };
   if (exact[message]) return exact[message];
   const prefixes: Array<[string, string]> = [
@@ -3253,6 +3303,11 @@ function eventSummary(event: RunEvent): string {
     return `→ ${known ? presentState(state as RunState).label : state}`;
   }
   if (event.type === "message") return String(event.payload.content ?? "").slice(0, 100);
+  if (event.type === "workspace.instructions.resolved") {
+    const manifest = workspaceInstructionManifest(event);
+    if (!manifest) return "工作区规则清单格式无效";
+    return `第 ${manifest.turn_index} 轮 · AGENTS.md · 已载入 · ${manifest.total_bytes} B · 仅作为项目指引`;
+  }
   if (event.type === "tool.completed") {
     const call = event.payload.call as { name?: string } | undefined;
     return call?.name ?? "工具结果";
@@ -3285,7 +3340,9 @@ function eventSummary(event: RunEvent): string {
 }
 
 function eventTypeLabel(type: string): string {
-  return type === "model.requested" ? "模型调用" : type;
+  if (type === "model.requested") return "模型调用";
+  if (type === "workspace.instructions.resolved") return "工作区规则";
+  return type;
 }
 
 function relativeTime(value: string): string {

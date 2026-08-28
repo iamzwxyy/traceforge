@@ -14,6 +14,7 @@ from traceforge.models import (
     RunRecord,
     TaskPlan,
     ToolCall,
+    WorkspaceInstructionSnapshot,
 )
 from traceforge.sandbox import SandboxStatus
 from traceforge.storage import Storage
@@ -27,6 +28,19 @@ def _plan(command: list[str]) -> TaskPlan:
         steps=[PlanStep(id="fix", title="Fix")],
         acceptance_checks=[AcceptanceCheck(id="test", label="Tests", command=command)],
     )
+
+
+def _persisted_registry(
+    storage: Storage,
+    workspace: Workspace,
+    settings: Settings,
+    run: RunRecord,
+) -> ToolRegistry:
+    snapshot = WorkspaceInstructionSnapshot.empty()
+    storage.create_run(run, instruction_snapshot=snapshot)
+    registry = ToolRegistry(workspace, settings)
+    registry.bind_workspace_instruction_snapshot(run.id, snapshot.snapshot_sha256)
+    return registry
 
 
 def test_permission_policy(settings: Settings, workspace: Workspace) -> None:
@@ -274,9 +288,13 @@ async def test_command_prefers_traceforge_runtime_and_rejects_external_paths(
     storage: Storage,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    storage.create_run(RunRecord(id="run-1", task="Run", workspace=str(workspace.root)))
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="run-1", task="Run", workspace=str(workspace.root)),
+    )
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    registry = ToolRegistry(workspace, settings)
 
     runtime = await registry.execute(
         "run-1",
@@ -308,12 +326,16 @@ async def test_command_scrubs_ambient_credentials_from_child_environment(
     storage: Storage,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    storage.create_run(RunRecord(id="run-1", task="Run", workspace=str(workspace.root)))
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="run-1", task="Run", workspace=str(workspace.root)),
+    )
     monkeypatch.setenv("TRACEFORGE_TEST_API_KEY", "credential-probe")
     monkeypatch.setenv("TRACEFORGE_TEST_PASSPHRASE", "passphrase-probe")
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-probe.sock")
     monkeypatch.setenv("TRACEFORGE_TEST_PLAIN", "visible")
-    registry = ToolRegistry(workspace, settings)
 
     result = await registry.execute(
         "run-1",
@@ -342,8 +364,12 @@ async def test_command_scrubs_ambient_credentials_from_child_environment(
 async def test_create_patch_command_and_rollback(
     settings: Settings, workspace: Workspace, storage: Storage
 ) -> None:
-    storage.create_run(RunRecord(id="run-1", task="Edit", workspace=str(workspace.root)))
-    registry = ToolRegistry(workspace, settings)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="run-1", task="Edit", workspace=str(workspace.root)),
+    )
 
     create = await registry.execute(
         "run-1",
@@ -394,10 +420,12 @@ async def test_native_mutations_never_snapshot_or_write_credentials(
 ) -> None:
     configured = "owner-only-key-123456"
     protected_settings = replace(settings, api_key=configured)
-    storage.create_run(
-        RunRecord(id="run-1", task="Edit safely", workspace=str(workspace.root))
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        protected_settings,
+        RunRecord(id="run-1", task="Edit safely", workspace=str(workspace.root)),
     )
-    registry = ToolRegistry(workspace, protected_settings)
     existing = workspace.root / "existing.txt"
     existing.write_text(f"first\n{configured}\n")
     safe_existing = workspace.root / "safe-existing.txt"
@@ -457,12 +485,16 @@ async def test_mutation_metadata_reports_only_files_that_actually_changed(
     storage: Storage,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    storage.create_run(RunRecord(id="run-1", task="Patch", workspace=str(workspace.root)))
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="run-1", task="Patch", workspace=str(workspace.root)),
+    )
     first = workspace.root / "first.txt"
     second = workspace.root / "second.txt"
     first.write_text("before one\n")
     second.write_text("before two\n")
-    registry = ToolRegistry(workspace, settings)
     original_write_text = Path.write_text
 
     def fail_second_write(path: Path, content: str, **kwargs: object) -> int:
@@ -497,11 +529,15 @@ async def test_mutation_metadata_reports_only_files_that_actually_changed(
 async def test_mutation_metadata_canonicalizes_aliases_and_ignores_no_ops(
     settings: Settings, workspace: Workspace, storage: Storage
 ) -> None:
-    storage.create_run(RunRecord(id="run-1", task="Patch", workspace=str(workspace.root)))
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="run-1", task="Patch", workspace=str(workspace.root)),
+    )
     target = workspace.root / "src" / "example.py"
     target.parent.mkdir()
     target.write_text("value = 1\n")
-    registry = ToolRegistry(workspace, settings)
     call = ToolCall(
         id="noop",
         name="apply_patch",
@@ -531,8 +567,12 @@ async def test_mutation_metadata_canonicalizes_aliases_and_ignores_no_ops(
 async def test_command_timeout(
     settings: Settings, workspace: Workspace, storage: Storage
 ) -> None:
-    storage.create_run(RunRecord(id="run-1", task="Wait", workspace=str(workspace.root)))
-    registry = ToolRegistry(workspace, settings)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="run-1", task="Wait", workspace=str(workspace.root)),
+    )
     result = await registry.execute(
         "run-1",
         ToolCall(
@@ -552,8 +592,12 @@ async def test_command_timeout(
 async def test_read_list_search_and_error_results(
     settings: Settings, workspace: Workspace, storage: Storage, monkeypatch
 ) -> None:
-    storage.create_run(RunRecord(id="run-1", task="Inspect", workspace=str(workspace.root)))
-    registry = ToolRegistry(workspace, settings)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="run-1", task="Inspect", workspace=str(workspace.root)),
+    )
     (workspace.root / "notes.txt").write_text("alpha\nbeta\n")
     (workspace.root / ".env").write_text("SECRET=value\n")
     (workspace.root / ".env.example").write_text("SECRET=\n")
@@ -600,9 +644,13 @@ async def test_read_list_search_and_error_results(
 async def test_command_failure_truncation_callback_and_validation(
     settings: Settings, workspace: Workspace, storage: Storage
 ) -> None:
-    storage.create_run(RunRecord(id="run-1", task="Run", workspace=str(workspace.root)))
     limited = replace(settings, stored_output_limit=24, model_output_limit=16)
-    registry = ToolRegistry(workspace, limited)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        limited,
+        RunRecord(id="run-1", task="Run", workspace=str(workspace.root)),
+    )
     streamed: list[str] = []
 
     async def capture(chunk: str) -> None:
@@ -657,8 +705,12 @@ async def test_command_failure_truncation_callback_and_validation(
 async def test_patch_can_delete_and_reject_rename(
     settings: Settings, workspace: Workspace, storage: Storage
 ) -> None:
-    storage.create_run(RunRecord(id="run-1", task="Patch", workspace=str(workspace.root)))
-    registry = ToolRegistry(workspace, settings)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="run-1", task="Patch", workspace=str(workspace.root)),
+    )
     target = workspace.root / "old.txt"
     target.write_text("old\n")
 

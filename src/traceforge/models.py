@@ -89,6 +89,7 @@ class Verdict(StrEnum):
 
 class EventType(StrEnum):
     STATE_CHANGED = "state.changed"
+    WORKSPACE_INSTRUCTIONS_RESOLVED = "workspace.instructions.resolved"
     MESSAGE = "message"
     CLARIFICATION_REQUESTED = "clarification.requested"
     CLARIFICATION_ANSWERED = "clarification.answered"
@@ -357,6 +358,159 @@ class ProviderConfig(BaseModel):
     credential_file: str | None = Field(default=None, max_length=4_096)
     context_window: int | None = Field(default=None, ge=1, le=10_000_000)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+WORKSPACE_INSTRUCTION_BUDGET_BYTES = 32 * 1024
+
+
+class WorkspaceInstructionReference(BaseModel):
+    """Public provenance for one private, turn-bound workspace instruction source."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=4_096)
+    scope: str = Field(min_length=1, max_length=4_096)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=0, le=WORKSPACE_INSTRUCTION_BUDGET_BYTES)
+
+    @model_validator(mode="after")
+    def validate_paths(self) -> Self:
+        source = PurePosixPath(self.path)
+        if source.is_absolute() or ".." in source.parts or source.name != "AGENTS.md":
+            raise ValueError("Workspace instruction paths must name a relative AGENTS.md")
+        expected_scope = source.parent.as_posix()
+        if self.scope != expected_scope:
+            raise ValueError("Workspace instruction scope must match the source directory")
+        return self
+
+
+class WorkspaceInstructionSource(WorkspaceInstructionReference):
+    """Private instruction content persisted only for deterministic model recovery."""
+
+    content: str = Field(max_length=WORKSPACE_INSTRUCTION_BUDGET_BYTES)
+
+    @model_validator(mode="after")
+    def validate_content_digest(self) -> Self:
+        encoded = self.content.encode("utf-8")
+        if len(encoded) != self.byte_count:
+            raise ValueError("Workspace instruction byte count does not match its content")
+        if not hmac.compare_digest(hashlib.sha256(encoded).hexdigest(), self.content_sha256):
+            raise ValueError("Workspace instruction SHA-256 does not match its content")
+        return self
+
+    def reference(self) -> WorkspaceInstructionReference:
+        return WorkspaceInstructionReference.model_validate(
+            self.model_dump(exclude={"content"})
+        )
+
+
+class WorkspaceInstructionManifest(BaseModel):
+    """Safe manifest emitted to the event ledger without instruction prose."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["traceforge.workspace-instructions.v1"]
+    captured_at: datetime
+    sources: list[WorkspaceInstructionReference] = Field(default_factory=list)
+    total_bytes: int = Field(ge=0, le=WORKSPACE_INSTRUCTION_BUDGET_BYTES)
+    snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> Self:
+        paths = [source.path for source in self.sources]
+        if len(paths) != len(set(paths)):
+            raise ValueError("Workspace instruction source paths must be unique")
+        expected_order = sorted(
+            self.sources,
+            key=lambda source: (len(PurePosixPath(source.scope).parts), source.path),
+        )
+        if self.sources != expected_order:
+            raise ValueError("Workspace instructions must be ordered from root to nested scope")
+        if self.total_bytes != sum(source.byte_count for source in self.sources):
+            raise ValueError("Workspace instruction total byte count is inconsistent")
+        if len(self.sources) > 1 or (
+            self.sources
+            and (self.sources[0].path, self.sources[0].scope) != ("AGENTS.md", ".")
+        ):
+            raise ValueError("Workspace instructions v1 supports only the root AGENTS.md")
+        expected_digest = _canonical_sha256(
+            [source.model_dump(mode="json") for source in self.sources]
+        )
+        if not hmac.compare_digest(self.snapshot_sha256, expected_digest):
+            raise ValueError("Workspace instruction manifest SHA-256 is inconsistent")
+        return self
+
+
+class WorkspaceInstructionSnapshot(BaseModel):
+    """Private immutable root instruction state for one conversation turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["traceforge.workspace-instructions.v1"] = (
+        "traceforge.workspace-instructions.v1"
+    )
+    captured_at: datetime = Field(default_factory=utc_now)
+    sources: list[WorkspaceInstructionSource] = Field(default_factory=list)
+    total_bytes: int = Field(ge=0, le=WORKSPACE_INSTRUCTION_BUDGET_BYTES)
+    snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @classmethod
+    def seal(
+        cls,
+        *,
+        sources: list[WorkspaceInstructionSource],
+        captured_at: datetime | None = None,
+    ) -> Self:
+        ordered_sources = sorted(
+            sources,
+            key=lambda source: (len(PurePosixPath(source.scope).parts), source.path),
+        )
+        references = [source.reference() for source in ordered_sources]
+        return cls(
+            captured_at=captured_at or utc_now(),
+            sources=ordered_sources,
+            total_bytes=sum(source.byte_count for source in ordered_sources),
+            snapshot_sha256=_canonical_sha256(
+                [source.model_dump(mode="json") for source in references]
+            ),
+        )
+
+    @classmethod
+    def empty(cls) -> Self:
+        return cls.seal(sources=[])
+
+    def manifest(self) -> WorkspaceInstructionManifest:
+        return WorkspaceInstructionManifest(
+            schema_version=self.schema_version,
+            captured_at=self.captured_at,
+            sources=[source.reference() for source in self.sources],
+            total_bytes=self.total_bytes,
+            snapshot_sha256=self.snapshot_sha256,
+        )
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> Self:
+        expected_sources = sorted(
+            self.sources,
+            key=lambda source: (len(PurePosixPath(source.scope).parts), source.path),
+        )
+        if self.sources != expected_sources:
+            raise ValueError("Workspace instructions must be ordered from root to nested scope")
+        if len(self.sources) > 1:
+            raise ValueError("Workspace instructions v1 supports only the root AGENTS.md")
+        if self.total_bytes != sum(source.byte_count for source in self.sources):
+            raise ValueError("Workspace instruction total byte count is inconsistent")
+        expected_digest = _canonical_sha256(
+            [source.reference().model_dump(mode="json") for source in self.sources]
+        )
+        if not hmac.compare_digest(self.snapshot_sha256, expected_digest):
+            raise ValueError("Workspace instruction snapshot SHA-256 is inconsistent")
+        if self.sources and (self.sources[0].path, self.sources[0].scope) != (
+            "AGENTS.md",
+            ".",
+        ):
+            raise ValueError("Workspace instructions v1 supports only the root AGENTS.md")
+        return self
 
 
 class ConversationTurn(BaseModel):

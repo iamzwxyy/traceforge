@@ -1,4 +1,12 @@
-import type { ProofPack, ReasoningEffort, Run, RunEvent, RunState } from "./types";
+import type {
+  ProofPack,
+  ReasoningEffort,
+  Run,
+  RunEvent,
+  RunState,
+  WorkspaceInstructionManifest,
+  WorkspaceInstructionReference,
+} from "./types";
 
 export interface StatePresentation {
   label: string;
@@ -408,6 +416,81 @@ export function projectProgressEvents(events: RunEvent[]): RunEvent[] {
   return progress;
 }
 
+export function workspaceInstructionManifest(
+  event: RunEvent,
+): WorkspaceInstructionManifest | null {
+  if (event.type !== "workspace.instructions.resolved") return null;
+  const payload = event.payload;
+  const turnIndex = Number(payload.turn_index);
+  const totalBytes = Number(payload.total_bytes);
+  if (
+    payload.schema_version !== "traceforge.workspace-instructions.v1"
+    || payload.status !== "loaded"
+    || payload.authority !== "guidance"
+    || payload.content_private !== true
+    || typeof payload.captured_at !== "string"
+    || !Number.isInteger(turnIndex)
+    || turnIndex < 1
+    || !Number.isInteger(totalBytes)
+    || totalBytes < 0
+    || typeof payload.snapshot_sha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(payload.snapshot_sha256)
+    || !Array.isArray(payload.sources)
+    || payload.sources.length !== 1
+  ) return null;
+  const sources: WorkspaceInstructionReference[] = [];
+  for (const rawSource of payload.sources) {
+    if (typeof rawSource !== "object" || rawSource === null || Array.isArray(rawSource)) {
+      return null;
+    }
+    const source = rawSource as Record<string, unknown>;
+    const byteCount = Number(source.byte_count);
+    if (
+      source.path !== "AGENTS.md"
+      || source.scope !== "."
+      || typeof source.content_sha256 !== "string"
+      || !/^[0-9a-f]{64}$/.test(source.content_sha256)
+      || !Number.isInteger(byteCount)
+      || byteCount < 0
+    ) return null;
+    sources.push({
+      path: source.path,
+      scope: source.scope,
+      content_sha256: source.content_sha256,
+      byte_count: byteCount,
+    });
+  }
+  if (sources.reduce((total, source) => total + source.byte_count, 0) !== totalBytes) {
+    return null;
+  }
+  return {
+    schema_version: "traceforge.workspace-instructions.v1",
+    captured_at: payload.captured_at,
+    sources,
+    total_bytes: totalBytes,
+    snapshot_sha256: payload.snapshot_sha256,
+    turn_index: turnIndex,
+    status: "loaded",
+    authority: "guidance",
+    content_private: true,
+  };
+}
+
+export function latestWorkspaceInstructionManifest(
+  events: RunEvent[],
+  currentTurnIndex: number,
+): WorkspaceInstructionManifest | null {
+  let latest: { seq: number; manifest: WorkspaceInstructionManifest } | null = null;
+  for (const event of events) {
+    const manifest = workspaceInstructionManifest(event);
+    if (
+      manifest?.turn_index === currentTurnIndex
+      && (latest === null || event.seq > latest.seq)
+    ) latest = { seq: event.seq, manifest };
+  }
+  return latest?.manifest ?? null;
+}
+
 export function reasoningErrorLabel(message: string): string | null {
   if (message.startsWith("Provider-private replay state was removed")) {
     return "模型私有推理已从当前记录清除，但 SQLite WAL 正被外部读取占用。请关闭外部数据库读取程序，然后停止或继续此任务。";
@@ -424,6 +507,34 @@ export function reasoningErrorLabel(message: string): string | null {
   return null;
 }
 
+export function workspaceInstructionErrorLabel(message: string): string | null {
+  const exact: Record<string, string> = {
+    "The workspace root has too many entries to inspect safely.": "工作区根目录超过 10,000 个直接条目，无法安全检查 AGENTS.md。",
+    "The workspace root could not be inspected for AGENTS.md.": "无法检查工作区根目录中的 AGENTS.md。",
+    "The root AGENTS.md metadata could not be read safely.": "无法安全读取根目录 AGENTS.md 的元数据。",
+    "The root AGENTS.md path could not be resolved safely.": "无法安全解析根目录 AGENTS.md 的路径。",
+    "The root AGENTS.md must resolve directly inside the workspace.": "根目录 AGENTS.md 必须直接解析到当前工作区内。",
+    "The root AGENTS.md changed while it was being opened.": "根目录 AGENTS.md 在打开期间发生变化，已拒绝载入。",
+    "The root AGENTS.md changed while it was being read.": "根目录 AGENTS.md 在读取期间发生变化，已拒绝载入。",
+    "The root AGENTS.md could not be read safely.": "无法安全读取根目录 AGENTS.md。",
+    "The stored AGENTS.md snapshot conflicts with the current credential and cannot be sent to the model.": "已保存的 AGENTS.md 快照与当前凭证冲突，已阻止发送给模型。请恢复原凭证，或停止后开始新一轮。",
+    "Protected model context and tool schemas exceed the configured context window": "工作区规则、当前请求和工具说明无法共同放入当前模型的上下文窗口；请缩短 AGENTS.md 或调整已确认的上下文容量。",
+    "Model request contains credential-like data and was blocked before provider transmission": "模型请求与当前凭证冲突，已在发送前阻止。请检查工作区规则或恢复原凭证。",
+    "Model request contains credential-like data and was blocked before HTTP transmission": "模型请求与当前凭证冲突，已在网络发送前阻止。请检查工作区规则或恢复原凭证。",
+  };
+  if (exact[message]) return exact[message];
+  if (message.startsWith("This legacy turn has no immutable workspace-instruction snapshot")) {
+    return "此旧版中断轮次没有不可变工作区规则快照，不能安全恢复；请先停止，再继续对话，或新建任务。";
+  }
+  if (message.startsWith("This task's stored context conflicts with the current provider credential")) {
+    if (message.includes("stop this interrupted turn")) {
+      return "此任务的已保存上下文与当前模型凭证冲突，不能发送给模型；请恢复原凭证，或先停止本轮再开始新任务。";
+    }
+    return "此任务的已保存上下文与当前模型凭证冲突，不能发送给模型；请恢复原凭证，或新建任务。";
+  }
+  return null;
+}
+
 export type ActivityPhase = "planning" | "building" | "verifying";
 
 export interface ActivityChapter {
@@ -435,6 +546,7 @@ export interface ActivityChapter {
 
 const activityEventTypes = new Set([
   "message",
+  "workspace.instructions.resolved",
   "tool.completed",
   "plan.gated",
   "verification.completed",

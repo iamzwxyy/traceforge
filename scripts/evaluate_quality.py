@@ -141,7 +141,9 @@ SCENARIOS = (
             "Visible output is incrementally persisted without credential leakage; semantic "
             "provider data cannot carry a credential into execution; JSON structure, native "
             "snapshots, SQLite, REST, and WebSocket fail closed; retries, cancellation, and "
-            "restart remain isolated; and exactly one stream plus its terminal turn is canonical."
+            "restart remain isolated; rotated-credential conflicts across guidance/history, "
+            "protocol text, timestamps, and old stream identifiers can be stopped without model "
+            "or tool side effects; and exactly one stream plus its terminal turn is canonical."
         ),
         tests=(
             (
@@ -175,7 +177,32 @@ SCENARIOS = (
             ),
             (
                 "tests/test_agent.py::"
-                "test_resume_abandons_an_accepted_legacy_secret_action_without_execution"
+                "test_unsafe_accepted_legacy_action_requires_destructive_cancel_without_execution"
+            ),
+            (
+                "tests/test_agent.py::"
+                "test_rotated_credential_context_can_be_cancelled_without_model_or_tool_side_effects"
+            ),
+            (
+                "tests/test_agent.py::"
+                "test_rotated_credential_cancellation_abandons_every_active_decision_kind"
+            ),
+            (
+                "tests/test_agent.py::"
+                "test_resume_rejects_compact_json_credential_synthesized_from_safe_leaves"
+            ),
+            (
+                "tests/test_workspace_instructions.py::"
+                "test_resume_preflight_rejects_compact_boundary_between_snapshot_and_history"
+            ),
+            (
+                "tests/test_runtime.py::"
+                "test_provider_credential_rejects_unrecoverable_protocol_collisions"
+            ),
+            "tests/test_agent.py::test_credential_conflict_cancel_chooses_a_safe_timestamp",
+            (
+                "tests/test_agent.py::"
+                "test_credential_conflict_cancel_does_not_copy_an_unsafe_stream_id"
             ),
             (
                 "tests/test_storage.py::"

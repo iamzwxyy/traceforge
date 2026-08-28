@@ -23,7 +23,12 @@ from openai.types.chat import ChatCompletionChunk
 from traceforge.config import Settings
 from traceforge.model_reasoning import resolve_reasoning_capability
 from traceforge.models import ReasoningEffort, ToolCall
-from traceforge.streaming import boundary_safe_json_dumps
+from traceforge.streaming import (
+    boundary_safe_json_dumps,
+    contains_compact_serialized_json_secret,
+    contains_redactable_json_secret,
+    contains_secret_representation,
+)
 
 
 class ProviderError(RuntimeError):
@@ -50,6 +55,10 @@ _MAX_RETRY_AFTER_SECONDS = 120.0
 
 
 class _ResponseGuardError(RuntimeError):
+    pass
+
+
+class _RequestGuardError(RuntimeError):
     pass
 
 
@@ -210,12 +219,16 @@ class OpenAICompatibleProvider:
 
     def __init__(self, settings: Settings) -> None:
         self.model = settings.model
+        self._api_key = settings.api_key
         self._request_timeout = settings.model_request_timeout
         self._reasoning = resolve_reasoning_capability(settings.model, base_url=settings.base_url)
         # TraceForge owns retry policy so one visible attempt is exactly one HTTP request.
         # The SDK defaults to two hidden retries and a 600-second read timeout, which can
         # otherwise leave a local run apparently idle for far too long.
         self._http_client = _build_http_client(settings.model_request_timeout)
+        self._http_client.event_hooks.setdefault("request", []).append(
+            self._guard_http_request
+        )
         self._client = AsyncOpenAI(
             api_key=settings.api_key,
             base_url=settings.base_url,
@@ -236,6 +249,19 @@ class OpenAICompatibleProvider:
                 await result
         if not self._http_client.is_closed:
             await self._http_client.aclose()
+
+    async def _guard_http_request(self, request: httpx.Request) -> None:
+        try:
+            body = await request.aread()
+            text = body.decode("utf-8", errors="strict")
+        except (UnicodeDecodeError, httpx.HTTPError) as exc:
+            raise _RequestGuardError(
+                "Model request body could not be inspected safely"
+            ) from exc
+        if contains_secret_representation(text, api_key=self._api_key):
+            raise _RequestGuardError(
+                "Model request body contains credential-like data"
+            )
 
     async def complete(
         self,
@@ -260,6 +286,7 @@ class OpenAICompatibleProvider:
                 reasoning_effort=reasoning_effort,
                 deepseek=deepseek,
             )
+            self._require_safe_request_surface(kwargs)
             async with asyncio.timeout(self._request_timeout):
                 response = await self._client.chat.completions.create(**kwargs)
             choice = response.choices[0]
@@ -295,6 +322,12 @@ class OpenAICompatibleProvider:
                 ),
                 preserve_empty_content=deepseek,
             )
+        except _RequestGuardError as exc:
+            raise ProviderError(
+                "Model request contains credential-like data and was blocked before HTTP "
+                "transmission",
+                category="credential_boundary",
+            ) from exc
         except RateLimitError as exc:
             retryable = (
                 _api_error_is_retryable(exc)
@@ -316,6 +349,12 @@ class OpenAICompatibleProvider:
                 category="timeout",
             ) from exc
         except APIConnectionError as exc:
+            if _find_request_guard_error(exc) is not None:
+                raise ProviderError(
+                    "Model request contains credential-like data and was blocked before HTTP "
+                    "transmission",
+                    category="credential_boundary",
+                ) from exc
             raise ProviderError(
                 "Model connection failed",
                 retryable=True,
@@ -362,6 +401,7 @@ class OpenAICompatibleProvider:
                 deepseek=deepseek,
             )
             kwargs["stream"] = True
+            self._require_safe_request_surface(kwargs)
             async with asyncio.timeout(self._request_timeout):
                 if self._supports_bounded_raw_stream():
                     await self._consume_bounded_stream(
@@ -377,6 +417,12 @@ class OpenAICompatibleProvider:
                             if delta.content or delta.tool_calls or delta.finish_reason:
                                 await on_delta(delta)
             return accumulator.finish()
+        except _RequestGuardError as exc:
+            raise ProviderError(
+                "Model request contains credential-like data and was blocked before HTTP "
+                "transmission",
+                category="credential_boundary",
+            ) from exc
         except _ResponseGuardError as exc:
             raise ProviderError(
                 "Model response exceeded a safe transport boundary",
@@ -403,6 +449,12 @@ class OpenAICompatibleProvider:
                 category="timeout",
             ) from exc
         except (APIConnectionError, httpx.TransportError) as exc:
+            if _find_request_guard_error(exc) is not None:
+                raise ProviderError(
+                    "Model request contains credential-like data and was blocked before HTTP "
+                    "transmission",
+                    category="credential_boundary",
+                ) from exc
             if _find_response_guard_error(exc) is not None:
                 raise ProviderError(
                     "Model response exceeded a safe transport boundary",
@@ -460,6 +512,24 @@ class OpenAICompatibleProvider:
             else:
                 kwargs["reasoning_effort"] = reasoning_effort.value
         return kwargs
+
+    def _require_safe_request_surface(self, kwargs: dict[str, Any]) -> None:
+        payload = dict(kwargs)
+        extra_body = payload.pop("extra_body", None)
+        if isinstance(extra_body, dict):
+            payload.update(extra_body)
+        if contains_redactable_json_secret(
+            payload,
+            api_key=self._api_key,
+        ) or contains_compact_serialized_json_secret(
+            payload,
+            api_key=self._api_key,
+        ):
+            raise ProviderError(
+                "Model request contains credential-like data and was blocked before HTTP "
+                "transmission",
+                category="credential_boundary",
+            )
 
     def _supports_bounded_raw_stream(self) -> bool:
         return hasattr(self._client.chat.completions, "with_streaming_response")
@@ -689,6 +759,17 @@ def _find_response_guard_error(exc: BaseException) -> _ResponseGuardError | None
     while current is not None and id(current) not in visited:
         visited.add(id(current))
         if isinstance(current, _ResponseGuardError):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _find_request_guard_error(exc: BaseException) -> _RequestGuardError | None:
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, _RequestGuardError):
             return current
         current = current.__cause__ or current.__context__
     return None

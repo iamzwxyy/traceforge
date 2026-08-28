@@ -121,6 +121,115 @@ test("legacy direct answers render once and hide model transport noise", async (
   await expectNoWcagViolations(page, "deduplicated direct answer");
 });
 
+test("workspace rules stay visible as provenance without leaking their content", async ({ page }) => {
+  const privateCanary = "PRIVATE-WORKSPACE-RULE-CANARY";
+  const initialRun = answeredRun("rules-run", "Review the repository", "Reviewed");
+  const firstTurn = initialRun.turns[0];
+  const run = {
+    ...initialRun,
+    turns: [
+      firstTurn,
+      {
+        ...firstTurn,
+        index: 2,
+        request: "Review it again",
+        summary: "Reviewed again",
+      },
+    ],
+  };
+  const events = [
+    { run_id: run.id, seq: 1, type: "turn.started", payload: { index: 1, request: run.task, approval_mode: "automatic", reasoning_effort: "auto" }, created_at: createdAt },
+    {
+      run_id: run.id,
+      seq: 2,
+      type: "workspace.instructions.resolved",
+      payload: {
+        schema_version: "traceforge.workspace-instructions.v1",
+        captured_at: createdAt,
+        sources: [{
+          path: "AGENTS.md",
+          scope: ".",
+          content_sha256: "a".repeat(64),
+          byte_count: 128,
+          content: privateCanary,
+        }],
+        total_bytes: 128,
+        snapshot_sha256: "b".repeat(64),
+        turn_index: 1,
+        status: "loaded",
+        authority: "guidance",
+        content_private: true,
+      },
+      created_at: createdAt,
+    },
+    { run_id: run.id, seq: 3, type: "turn.completed", payload: { index: 1, outcome: "answered", summary: "Reviewed", changed_files: [] }, created_at: createdAt },
+    { run_id: run.id, seq: 4, type: "turn.started", payload: { index: 2, request: "Review it again", approval_mode: "automatic", reasoning_effort: "auto" }, created_at: createdAt },
+    {
+      run_id: run.id,
+      seq: 5,
+      type: "workspace.instructions.resolved",
+      payload: {
+        schema_version: "traceforge.workspace-instructions.v1",
+        captured_at: createdAt,
+        sources: [{
+          path: "AGENTS.md",
+          scope: ".",
+          content_sha256: "c".repeat(64),
+          byte_count: 96,
+          content: `${privateCanary}-SECOND`,
+        }],
+        total_bytes: 96,
+        snapshot_sha256: "d".repeat(64),
+        turn_index: 2,
+        status: "loaded",
+        authority: "guidance",
+        content_private: true,
+      },
+      created_at: createdAt,
+    },
+    { run_id: run.id, seq: 6, type: "turn.completed", payload: { index: 2, outcome: "answered", summary: "Reviewed again", changed_files: [] }, created_at: createdAt },
+    {
+      run_id: run.id,
+      seq: 7,
+      type: "workspace.instructions.resolved",
+      payload: { turn_index: 2, status: "loaded" },
+      created_at: createdAt,
+    },
+  ];
+
+  await page.route("**/api/status", (route) => route.fulfill(json(status(run.workspace))));
+  await page.route("**/api/runs", (route) => route.fulfill(json([run])));
+  await page.route("**/api/projects", (route) => route.fulfill(json([])));
+  await page.route("**/api/provider", (route) => route.fulfill(json(provider())));
+  await page.route("**/api/runs/rules-run", (route) => route.fulfill(json(run)));
+  await page.route("**/api/runs/rules-run/events?*", (route) => route.fulfill(json(events)));
+  await page.route("**/api/runs/rules-run/diff", (route) => route.fulfill(json({ diff: "" })));
+
+  await page.setViewportSize({ width: 390, height: 768 });
+  await page.goto("/");
+
+  await expect(page.getByLabel("已载入 1 份工作区规则；仅作为模型上下文，不改变权限或沙箱"))
+    .toBeVisible();
+  await page.locator(".trace-details > summary").click();
+  await expect(page.locator(".trace-details > summary")).toContainText("2 条 Trace");
+  await expect(page.locator(".workspace-rules-activity")).toHaveCount(2);
+  await expect(page.locator(".workspace-rules-activity").nth(0)).toContainText("第 1 轮");
+  await expect(page.locator(".workspace-rules-activity").nth(1)).toContainText("第 2 轮");
+  await expect(page.locator(".workspace-rules-activity").nth(1)).toContainText("AGENTS.md · 已载入");
+  await expect(page.locator(".workspace-rules-activity").nth(1))
+    .toContainText("仅作为项目指引，不改变权限或沙箱");
+  await expect(page.locator("body")).not.toContainText(privateCanary);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth))
+    .toBe(true);
+
+  await page.getByRole("button", { name: "任务详情" }).click();
+  await expect(page.locator(".timeline")).toContainText("工作区规则");
+  await expect(page.locator(".timeline")).toContainText("第 1 轮 · AGENTS.md · 已载入 · 128 B");
+  await expect(page.locator(".timeline")).toContainText("第 2 轮 · AGENTS.md · 已载入 · 96 B");
+  await expect(page.locator(".timeline")).toContainText("工作区规则清单格式无效");
+  await expectNoWcagViolations(page, "workspace rule provenance");
+});
+
 test("reasoning picker follows the exact sparse model capability list", async ({ page }) => {
   const workspace = "/tmp/traceforge-picker";
   let submitted: Record<string, unknown> | null = null;

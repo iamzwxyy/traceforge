@@ -14,6 +14,10 @@ from urllib.parse import urlparse
 
 from traceforge.agent import AgentManager, RunConflictError
 from traceforge.config import Settings
+from traceforge.credentials import (
+    PROVIDER_CREDENTIAL_MAX_BYTES,
+    validate_provider_credential,
+)
 from traceforge.events import EventBroker
 from traceforge.model_context import ResolvedModelContext, resolve_model_context
 from traceforge.models import (
@@ -34,7 +38,6 @@ from traceforge.provider import (
 from traceforge.storage import Storage
 from traceforge.streaming import redact_text
 
-_CREDENTIAL_MAX_BYTES = 16 * 1024
 _MANAGED_CREDENTIAL_DIRECTORY = "provider-credentials"
 _MANAGED_CREDENTIAL_PREFIX = "provider-credential-"
 _LEGACY_MANAGED_CREDENTIAL_NAME = "provider-credential.key"
@@ -73,7 +76,7 @@ def validate_credential_file(raw: str | Path) -> Path:
         raise ValueError(f"Credential file is not readable: {candidate}") from exc
     if not resolved.is_file():
         raise ValueError(f"Credential path is not a file: {resolved}")
-    if metadata.st_size > _CREDENTIAL_MAX_BYTES:
+    if metadata.st_size > PROVIDER_CREDENTIAL_MAX_BYTES:
         raise ValueError("Credential file must be smaller than 16 KiB")
     if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o077:
         raise ValueError("Credential file must be owner-only; run chmod 600 on it")
@@ -82,12 +85,7 @@ def validate_credential_file(raw: str | Path) -> Path:
 
 def _normalized_api_key(raw: str) -> tuple[str, bytes]:
     value = raw.strip()
-    encoded = value.encode("utf-8")
-    if not value or "\n" in value or "\r" in value:
-        raise ValueError("API key must contain exactly one non-empty line")
-    if len(encoded) > _CREDENTIAL_MAX_BYTES:
-        raise ValueError("API key must be smaller than 16 KiB")
-    return value, encoded
+    return value, validate_provider_credential(value)
 
 
 def _open_managed_credential_directory(settings: Settings) -> tuple[Path, int]:
@@ -215,12 +213,13 @@ def _read_api_key(settings: Settings, config: ProviderConfig) -> str:
     if config.credential_file:
         credential_file = validate_credential_file(config.credential_file)
         try:
-            value = credential_file.read_text(encoding="utf-8").strip()
+            value = credential_file.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             raise ValueError("Credential file could not be read as UTF-8") from exc
-        if not value or "\n" in value or "\r" in value:
-            raise ValueError("Credential file must contain exactly one non-empty line")
-        return value
+        try:
+            return _normalized_api_key(value)[0]
+        except ValueError as exc:
+            raise ValueError(f"Credential file is invalid: {exc}") from exc
     if settings.api_key:
         return _normalized_api_key(settings.api_key)[0]
     raise ValueError("Configure a credential file or set OPENAI_API_KEY before starting a run")

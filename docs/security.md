@@ -25,6 +25,75 @@ symlink component are rejected.
 Reads omit `.env` and `.env.*` except `.env.example`; directory listing and search also hide these
 files. This reduces accidental disclosure to the model but is not a general secret vault.
 
+## Workspace instruction boundary
+
+Project guidance is untrusted context, not policy. TraceForge v1 recognizes only an exact
+`AGENTS.md` directly inside the selected workspace root. It does not walk the home directory,
+parents, nested directories, include references, skills, plugins, or environment files. The loader
+uses non-following metadata/open checks, accepts only a stable regular UTF-8 file, rejects NUL and
+credential-like content, and limits the complete model-facing framed message to 32 KiB. A changed,
+replaced, symlinked, oversized, or unsafe source fails closed before the new turn is committed. A
+root with more than 10,000 direct entries is rejected independently of enumeration order. Even
+below 32 KiB, the protected rules, direct request, and Planner schemas must fit the active model's
+configured context window before the turn is created.
+
+The private content is stored in the owner-only SQLite database for deterministic model requests
+and recovery. The dedicated snapshot/manifest path does not copy it into `RunRecord`, events,
+REST/WebSocket payloads, Proof Packs, errors, or the React rule view. Public rule surfaces receive a
+validated manifest containing only the relative root path, scope, byte count, capture time, and
+SHA-256 values; the browser parser rebuilds that narrow shape and discards extra fields. The UI says
+“loaded”, never “enforced”. This is provenance minimization, not secrecy: the original text is sent
+to the configured model provider, and model-authored answers, plans, or tool arguments may quote it
+into normal run evidence. Do not put secrets in `AGENTS.md`; the loader's credential-like check is
+limited to the active provider key and recognizable `sk-...` shapes.
+
+Provider credentials can change while a turn is interrupted. Therefore capture-time inspection is
+not sufficient: before every model call, TraceForge rechecks the complete messages and tool schemas,
+including the stored rule snapshot, against the credential active for that provider. The agent
+checks both leaf values and compact JSON assembly, and the OpenAI-compatible provider repeats the
+check on its final request kwargs before the HTTP client can serialize them. A formerly ordinary
+string—or a value synthesized only across JSON token boundaries—that matches the current API key
+blocks transmission; the immutable snapshot is neither rewritten nor silently redacted.
+Because the OpenAI SDK may reorder typed request fields, an async request hook performs the final
+check again on the exact UTF-8 body after SDK transformation but before the httpx transport runs.
+
+The synchronous resume preflight applies the same leaf, framed-JSON, and compact-JSON checks to the
+full saved `RunRecord`, immutable event ledger, pending or accepted durable decision, and each plausible model request
+after the sealed guidance message has been inserted. This catches a credential assembled only at
+the guidance/history boundary before an async task exists. If a newly rotated credential collides
+with that formerly ordinary context, resume performs no provider or tool call and leaves the run
+interrupted. Restoring the prior credential leaves the exact turn resumable. Explicit cancellation instead enters a narrow
+destructive transaction that never serializes the unsafe row: it abandons the active decision,
+clears its payload plus model-facing messages/subjects, replaces the conversation projection with a
+neutral cancelled turn, and releases the workspace while preserving workspace files and the sealed
+instruction snapshot. Existing immutable events and Proof Packs are not rewritten. The transaction
+sets a physical-cleanup marker before attempting a WAL checkpoint; a busy reader can delay byte
+reclamation but cannot leave the run active or replay an accepted action. Recovery does not copy an
+unsafe old stream payload, and it chooses one timestamp that is safe against every credential guard
+before using that timestamp consistently for the neutral run, decision, turn, and terminal events.
+
+The frozen boundary applies to automatic discovery and injection. `AGENTS.md` remains an ordinary
+workspace file that read/edit tools can inspect, as can nested files with the same name. Later disk
+content is project data, not a replacement for the marked turn snapshot; the model-facing framing
+makes that distinction explicit.
+
+Each new turn atomically commits an immutable snapshot, including an explicit empty one. Follow-ups
+capture current disk state; resume reuses the interrupted turn's stored snapshot and is rejected for
+legacy turns that lack one. Before any native edit or command side effect, `ToolRegistry` requires
+the active turn's persisted snapshot hash to match its manager binding. This prevents an old
+approval or a partially initialized turn from executing under unknown project guidance.
+The upgrade migration abandons pending and accepted clarification, plan, and action receipts that
+predate snapshots, clears replay state, and leaves the interrupted run available for an explicit
+stop before follow-up; old decision endpoints cannot accept those abandoned IDs.
+
+The model receives project prose in a separate user-role message below the fixed system contract
+and ahead of the current direct request. Its safety framing states that project text cannot grant
+permissions, suppress approvals, weaken the OS sandbox or credential controls, expose secrets, or
+authorize paths outside the selected workspace. The current user request wins over conflicting
+project defaults according to the model-facing contract, but TraceForge cannot mechanically prove
+that the model resolves every semantic conflict correctly. Independent local permission and path
+checks—not model obedience—enforce the no-expansion security boundary.
+
 ## Plan and mutation policy
 
 Plan mode is an interaction choice, not a permission level. In the default Agent mode, the model
@@ -155,7 +224,10 @@ owner-only managed file created by direct API-key entry. Direct entry is accepte
 request field, atomically written with `0600` permissions, and never placed in SQLite. Validation
 errors omit request inputs so a rejected key cannot be reflected in a 422 response. Every file
 reference must resolve to a regular file smaller than 16 KiB; on POSIX it must be owner-only, and
-its content must be exactly one non-empty line. Public status/configuration responses expose the
+its content must be exactly one non-empty line containing 12–16,383 UTF-8 bytes. Credentials that
+collide with unavoidable fields or literals in the credential-conflict recovery protocol are
+rejected at configuration/manager construction rather than accepted into a state that could not be
+cancelled safely. Public status/configuration responses expose the
 source and readiness flag, never the value. A draft connection check resolves the key in memory and
 verifies native tool calling rather than only endpoint reachability. In test-and-save, only success
 creates a new managed credential file and swaps the configuration row; a failed draft leaves neither
@@ -365,6 +437,10 @@ ID; a lineage conflict refreshes the parent and task list so the existing succes
 - A benign repository may contain arbitrary secrets in ordinary source files. TraceForge blocks the
   currently configured provider key and recognizable `sk-...` values at its durable/public
   boundaries, but it is not a general secret vault or repository-wide secret scanner.
+- A root `AGENTS.md` is project-authored model input and can be malicious or simply wrong. Role
+  placement, explicit precedence, immutable recovery, and local tool policy limit its authority but
+  cannot guarantee that every model will follow useful guidance. Nested and inherited rules are
+  deliberately unsupported in v1 rather than guessed.
 - SQLite data remains until the platform data directory is removed.
 - A process crash can leave provider-private reasoning in the owner-only database for an active or
   interrupted DeepSeek turn because protocol-correct resume may need it. A terminal transition is

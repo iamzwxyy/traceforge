@@ -49,7 +49,7 @@ def test_context_compaction_keeps_tool_request_and_result_adjacent() -> None:
 
 
 def test_context_compaction_accounts_for_tool_schema_surface() -> None:
-    manager = ContextManager(320, threshold=0.5, retain_ratio=0.1)
+    manager = ContextManager(800, threshold=0.5, retain_ratio=0.1)
     messages = [
         {"role": "system", "content": "system"},
         {"role": "user", "content": "task"},
@@ -73,6 +73,47 @@ def test_context_compaction_accounts_for_tool_schema_surface() -> None:
 
     assert changed
     assert compacted[-1] == messages[-1]
+
+
+def test_context_compaction_can_protect_system_rules_and_current_request() -> None:
+    manager = ContextManager(260, threshold=0.5, retain_ratio=0.1)
+    protected = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "immutable workspace guidance"},
+        {"role": "user", "content": "current request"},
+    ]
+    messages = [
+        *protected,
+        *[
+            {"role": "tool", "content": f"historical evidence {index} " * 12}
+            for index in range(12)
+        ],
+    ]
+
+    compacted, changed = manager.prepare(messages, protected_count=3)
+
+    assert changed
+    assert compacted[:3] == protected
+    assert "compacted deterministically" in compacted[3]["content"]
+
+
+def test_context_compaction_rejects_negative_protected_count() -> None:
+    manager = ContextManager(1_000)
+
+    with pytest.raises(ValueError, match="protected_count"):
+        manager.prepare([], protected_count=-1)
+
+
+def test_context_manager_rejects_an_overflowing_protected_prefix() -> None:
+    manager = ContextManager(100, threshold=0.5)
+    messages = [
+        {"role": "system", "content": "system " * 80},
+        {"role": "user", "content": "workspace guidance " * 80},
+        {"role": "user", "content": "current request " * 80},
+    ]
+
+    with pytest.raises(ValueError, match="Protected model context"):
+        manager.prepare(messages, protected_count=3)
 
 
 @pytest.mark.parametrize(

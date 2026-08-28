@@ -300,6 +300,66 @@ async def test_raw_sdk_stream_surfaces_refusal_and_closes_transport(
 
 
 @pytest.mark.asyncio
+async def test_provider_rejects_a_credential_synthesized_by_compact_json_boundaries(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential = '--- END WORKSPACE GUIDANCE ---"},{"role":"user"'
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError("Credential-bearing JSON must be rejected before HTTP transmission")
+
+    provider = _raw_provider(replace(settings, api_key=credential), monkeypatch, handler)
+    try:
+        with pytest.raises(ProviderError) as raised:
+            await provider.complete(
+                [
+                    {
+                        "role": "user",
+                        "content": "--- END WORKSPACE GUIDANCE ---",
+                    },
+                    {"role": "user", "content": "next request"},
+                ]
+            )
+    finally:
+        await provider.close()
+
+    assert raised.value.category == "credential_boundary"
+    assert credential not in str(raised.value)
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_provider_guards_the_sdk_reordered_wire_body_before_transport(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential = 'tail-fragment"}],"model":"custom"'
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError("The SDK-transformed credential must not reach transport")
+
+    provider = _raw_provider(
+        replace(settings, api_key=credential, model="custom"),
+        monkeypatch,
+        handler,
+    )
+    try:
+        with pytest.raises(ProviderError) as raised:
+            await provider.complete([{"role": "user", "content": "tail-fragment"}])
+    finally:
+        await provider.close()
+
+    assert raised.value.category == "credential_boundary"
+    assert credential not in str(raised.value)
+    assert requests == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error_type", "retryable", "category"),
     [
@@ -1030,7 +1090,7 @@ def test_private_reasoning_rejects_a_key_equal_to_the_legacy_marker(
     settings: Settings,
     storage: Storage,
 ) -> None:
-    configured = "[REDACTED]"
+    configured = "[REDACTED]-owner-key-123456"
     manager = AgentManager(
         replace(settings, api_key=configured),
         storage,

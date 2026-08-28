@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from traceforge.models import (
     ToolCall,
     ToolResult,
     Verdict,
+    WorkspaceInstructionSnapshot,
 )
 from traceforge.prompts import (
     BUILDER_SYSTEM_PROMPT,
@@ -922,7 +924,10 @@ async def test_rollback_cannot_race_a_newly_resumed_worker(
         interrupted_from=RunState.PLANNING,
         turns=[ConversationTurn(index=1, request="Resume or rollback, never both")],
     )
-    storage.create_run(run)
+    storage.create_run(
+        run,
+        instruction_snapshot=WorkspaceInstructionSnapshot.empty(),
+    )
     manager = AgentManager(settings, storage, BlockingProvider())
 
     await manager.resume(run.id)
@@ -4259,7 +4264,7 @@ async def test_restart_refuses_legacy_secret_bearing_approval_without_execution(
 
 
 @pytest.mark.asyncio
-async def test_resume_abandons_an_accepted_legacy_secret_action_without_execution(
+async def test_unsafe_accepted_legacy_action_requires_destructive_cancel_without_execution(
     settings: Settings,
     storage: Storage,
     monkeypatch: pytest.MonkeyPatch,
@@ -4321,17 +4326,18 @@ async def test_resume_abandons_an_accepted_legacy_secret_action_without_executio
         raise AssertionError("Unsafe accepted approval must never execute")
 
     monkeypatch.setattr(second.tools, "execute", execute)
-    await second.resume(run.id)
-    completed = await second.wait(run.id)
+    with pytest.raises(InvalidRunAction, match="stored context conflicts"):
+        await second.resume(run.id)
+    completed = await second.cancel(run.id)
     new_events = [
         event for event in storage.get_events(run.id) if event.seq > baseline_seq
     ]
 
-    assert completed.state is RunState.FAILED
+    assert completed.state is RunState.CANCELLED
     assert completed.pending_approval is None
-    assert completed.error == (
-        "Persisted action approval contains credential-like data and cannot be resumed"
-    )
+    assert completed.error is None
+    assert completed.messages == []
+    assert completed.turns[-1].outcome == "cancelled"
     assert storage.get_decision(run.id, approval_id).status is DecisionStatus.ABANDONED
     assert executed == []
     assert configured not in json.dumps(
@@ -4341,6 +4347,496 @@ async def test_resume_abandons_an_accepted_legacy_secret_action_without_executio
         event.type in {EventType.APPROVAL_REQUESTED, EventType.TOOL_STARTED}
         for event in new_events
     )
+
+
+@pytest.mark.asyncio
+async def test_rotated_credential_context_can_be_cancelled_without_model_or_tool_side_effects(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rotated_credential = "rotated-owner-credential-987654"
+    run = RunRecord(
+        id="rotated-context-cancel",
+        task="Inspect a saved response",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.PLANNING,
+        turns=[ConversationTurn(index=1, request=rotated_credential)],
+        messages=[{"role": "assistant", "content": rotated_credential}],
+    )
+    snapshot = WorkspaceInstructionSnapshot.empty()
+    storage.create_run(run, instruction_snapshot=snapshot)
+    storage.append_event(
+        run.id,
+        EventType.ASSISTANT_OUTPUT_STARTED,
+        {"stream_id": "credential-conflict-stream", "status": "streaming"},
+    )
+    baseline_seq = storage.get_events(run.id)[-1].seq if storage.get_events(run.id) else 0
+    provider = ScriptedProvider([])
+    manager = AgentManager(
+        replace(settings, api_key=rotated_credential),
+        storage,
+        provider,
+    )
+
+    async def forbidden_tool_side_effect(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Credential-conflict recovery must not invoke tools")
+
+    monkeypatch.setattr(manager.tools, "cancel", forbidden_tool_side_effect)
+    monkeypatch.setattr(manager.tools, "execute", forbidden_tool_side_effect)
+
+    with pytest.raises(InvalidRunAction, match="stored context conflicts"):
+        await manager.resume(run.id)
+    cancelled = await manager.cancel(run.id)
+    new_events = [
+        event for event in storage.get_events(run.id) if event.seq > baseline_seq
+    ]
+
+    assert cancelled.state is RunState.CANCELLED
+    assert cancelled.interrupted_from is None
+    assert cancelled.messages == []
+    assert cancelled.plan is None
+    assert cancelled.clarification is None
+    assert cancelled.pending_approval is None
+    assert cancelled.verification is None
+    assert cancelled.plan_gate is None
+    assert cancelled.error is None
+    assert cancelled.provider_reasoning_cleanup_pending is False
+    assert cancelled.turns[-1].outcome == "cancelled"
+    assert rotated_credential not in cancelled.model_dump_json()
+    assert provider.requests == []
+    assert storage.has_active_run(settings.workspace) is False
+    assert (
+        storage.get_workspace_instruction_snapshot(run.id, 1).snapshot_sha256
+        == snapshot.snapshot_sha256
+    )
+    assert [event.type for event in new_events] == [
+        EventType.ASSISTANT_OUTPUT_ABORTED,
+        EventType.STATE_CHANGED,
+        EventType.TURN_COMPLETED,
+        EventType.RUN_COMPLETED,
+    ]
+    assert new_events[0].payload == {
+        "status": "cancelled",
+        "reason": "credential_conflict_cancelled",
+        "all_open": True,
+    }
+    assert storage.abort_open_assistant_output_streams(
+        run.id,
+        status="cancelled",
+        reason="test_probe",
+    ) == []
+    assert rotated_credential not in json.dumps(
+        [event.model_dump(mode="json") for event in new_events], ensure_ascii=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_credential_conflict_cancel_chooses_a_safe_timestamp(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preferred_time = datetime(2026, 8, 28, 12, 34, 56, 123456, tzinfo=UTC)
+    timestamp_credential = preferred_time.isoformat()[:12]
+    run = RunRecord(
+        id="timestamp-credential-conflict",
+        task="Recover a timestamp collision",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.PLANNING,
+        turns=[ConversationTurn(index=1, request=timestamp_credential)],
+        messages=[{"role": "user", "content": timestamp_credential}],
+    )
+    storage.create_run(
+        run,
+        instruction_snapshot=WorkspaceInstructionSnapshot.empty(),
+    )
+    monkeypatch.setattr("traceforge.storage.utc_now", lambda: preferred_time)
+    manager = AgentManager(
+        replace(settings, api_key=timestamp_credential),
+        storage,
+        ScriptedProvider([]),
+    )
+
+    with pytest.raises(InvalidRunAction, match="stored context conflicts"):
+        await manager.resume(run.id)
+    cancelled = await manager.cancel(run.id)
+    events = storage.get_events(run.id)
+
+    assert cancelled.state is RunState.CANCELLED
+    assert cancelled.created_at != preferred_time
+    assert cancelled.updated_at == cancelled.created_at
+    assert cancelled.turns[-1].started_at == cancelled.created_at
+    assert cancelled.turns[-1].completed_at == cancelled.created_at
+    assert all(event.created_at == cancelled.created_at for event in events)
+    assert timestamp_credential not in cancelled.model_dump_json()
+    assert timestamp_credential not in json.dumps(
+        [event.model_dump(mode="json") for event in events],
+        ensure_ascii=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_credential_conflict_cancel_does_not_copy_an_unsafe_stream_id(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream_id_credential = "rotated-stream-id-credential-987654"
+    run = RunRecord(
+        id="stream-id-credential-conflict",
+        task="Recover an old stream identifier",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.PLANNING,
+        turns=[ConversationTurn(index=1, request="Recover an old stream identifier")],
+        messages=[{"role": "user", "content": "Resume safely"}],
+    )
+    storage.create_run(
+        run,
+        instruction_snapshot=WorkspaceInstructionSnapshot.empty(),
+    )
+    storage.append_event(
+        run.id,
+        EventType.ASSISTANT_OUTPUT_STARTED,
+        {"stream_id": stream_id_credential, "status": "streaming"},
+    )
+    baseline_seq = storage.get_events(run.id)[-1].seq
+    provider = ScriptedProvider([])
+    manager = AgentManager(
+        replace(settings, api_key=stream_id_credential),
+        storage,
+        provider,
+    )
+
+    async def forbidden_tool_side_effect(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Credential-conflict recovery must not invoke tools")
+
+    monkeypatch.setattr(manager.tools, "cancel", forbidden_tool_side_effect)
+    monkeypatch.setattr(manager.tools, "execute", forbidden_tool_side_effect)
+
+    with pytest.raises(InvalidRunAction, match="stored context conflicts"):
+        await manager.resume(run.id)
+    cancelled = await manager.cancel(run.id)
+    new_events = [
+        event for event in storage.get_events(run.id) if event.seq > baseline_seq
+    ]
+
+    assert cancelled.state is RunState.CANCELLED
+    assert provider.requests == []
+    assert [event.type for event in new_events] == [
+        EventType.ASSISTANT_OUTPUT_ABORTED,
+        EventType.STATE_CHANGED,
+        EventType.TURN_COMPLETED,
+        EventType.RUN_COMPLETED,
+    ]
+    assert new_events[0].payload == {
+        "status": "cancelled",
+        "reason": "credential_conflict_cancelled",
+        "all_open": True,
+    }
+    assert stream_id_credential not in json.dumps(
+        [event.model_dump(mode="json") for event in new_events],
+        ensure_ascii=False,
+    )
+    assert storage.abort_open_assistant_output_streams(
+        run.id,
+        status="cancelled",
+        reason="test_probe",
+    ) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_index", [2, 3])
+async def test_multiturn_credential_conflict_cancel_preserves_snapshot_indexes_for_follow_up(
+    settings: Settings,
+    storage: Storage,
+    current_index: int,
+) -> None:
+    rotated_credential = f"rotated-turn-{current_index}-credential-987654"
+    previous_turns = [
+        ConversationTurn(
+            index=index,
+            request=f"Completed request {index}",
+            outcome="answered",
+            summary=f"Completed response {index}",
+        )
+        for index in range(1, current_index)
+    ]
+    run = RunRecord(
+        id=f"multiturn-credential-conflict-{current_index}",
+        task="Recover a multi-turn task",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.PLANNING,
+        turns=[
+            *previous_turns,
+            ConversationTurn(index=current_index, request=rotated_credential),
+        ],
+        messages=[{"role": "user", "content": rotated_credential}],
+    )
+    storage.create_run(run)
+    snapshots = [WorkspaceInstructionSnapshot.empty() for _ in range(current_index)]
+    for turn_index, snapshot in enumerate(snapshots, start=1):
+        storage.insert_workspace_instruction_snapshot(run.id, turn_index, snapshot)
+    provider = ScriptedProvider([_direct_response("Recovered after cleanup")])
+    manager = AgentManager(
+        replace(settings, api_key=rotated_credential),
+        storage,
+        provider,
+    )
+
+    with pytest.raises(InvalidRunAction, match="stored context conflicts"):
+        await manager.resume(run.id)
+    cancelled = await manager.cancel(run.id)
+
+    assert [turn.index for turn in cancelled.turns] == [current_index]
+    for turn_index, snapshot in enumerate(snapshots, start=1):
+        assert storage.get_workspace_instruction_snapshot(run.id, turn_index) == snapshot
+
+    continued = await manager.follow_up(run.id, "Continue safely")
+    completed = await manager.wait(continued.id)
+
+    assert completed.state is RunState.ANSWERED
+    assert [turn.index for turn in completed.turns] == [current_index, current_index + 1]
+    assert completed.turns[-1].summary == "Recovered after cleanup"
+    assert storage.get_workspace_instruction_snapshot(run.id, current_index + 1)
+    for turn_index, snapshot in enumerate(snapshots, start=1):
+        assert storage.get_workspace_instruction_snapshot(run.id, turn_index) == snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "waiting_state"),
+    [
+        (DecisionKind.CLARIFICATION, RunState.AWAITING_CLARIFICATION),
+        (DecisionKind.PLAN, RunState.AWAITING_PLAN_APPROVAL),
+        (DecisionKind.ACTION, RunState.AWAITING_ACTION_APPROVAL),
+    ],
+)
+@pytest.mark.parametrize("accepted", [False, True], ids=["pending", "accepted"])
+async def test_rotated_credential_cancellation_abandons_every_active_decision_kind(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: DecisionKind,
+    waiting_state: RunState,
+    accepted: bool,
+) -> None:
+    rotated_credential = f"rotated-{kind.value}-{accepted}-credential-987654"
+    conflict = rotated_credential if not accepted else "safe subject"
+    clarification = ClarificationRequest(
+        questions=[
+            ClarificationQuestion(
+                id="scope",
+                prompt=conflict,
+                options=[
+                    QuestionOption(id="safe", label="Safe"),
+                    QuestionOption(id="alternate", label="Alternate"),
+                ],
+            )
+        ]
+    )
+    plan = TaskPlan.model_validate(
+        {
+            **_review_plan(),
+            "summary": conflict,
+        }
+    )
+    approval = ApprovalRequest(
+        id=f"rotated-{kind.value}-approval",
+        tool_call=ToolCall(
+            id=f"rotated-{kind.value}-call",
+            name="run_command",
+            arguments={"argv": ["python", "app.py"]},
+        ),
+        summary=conflict,
+        reason="Manual approval is required",
+        risk="elevated",
+        approval_mode=ApprovalMode.MANUAL,
+        policy_decision="ask",
+    )
+    previous_state = (
+        RunState.EXECUTING if kind is DecisionKind.ACTION else RunState.PLANNING
+    )
+    request_id = approval.id if kind is DecisionKind.ACTION else f"{kind.value}-request"
+    subject_model = {
+        DecisionKind.CLARIFICATION: clarification,
+        DecisionKind.PLAN: plan,
+        DecisionKind.ACTION: approval,
+    }[kind]
+    run = RunRecord(
+        id=f"rotated-{kind.value}-{accepted}",
+        task="Recover a durable decision",
+        workspace=str(settings.workspace),
+        state=previous_state,
+        turns=[ConversationTurn(index=1, request="Recover a durable decision")],
+        clarification=clarification if kind is DecisionKind.CLARIFICATION else None,
+        plan=plan if kind is DecisionKind.PLAN else None,
+        pending_approval=approval if kind is DecisionKind.ACTION else None,
+    )
+    snapshot = WorkspaceInstructionSnapshot.empty()
+    storage.create_run(run, instruction_snapshot=snapshot)
+    run.state = waiting_state
+    storage.open_decision(
+        run,
+        previous_state=previous_state,
+        request_id=request_id,
+        kind=kind,
+        turn_index=1,
+        subject=subject_model.model_dump(mode="json"),
+        requested_event_type={
+            DecisionKind.CLARIFICATION: EventType.CLARIFICATION_REQUESTED,
+            DecisionKind.PLAN: EventType.PLAN_UPDATED,
+            DecisionKind.ACTION: EventType.APPROVAL_REQUESTED,
+        }[kind],
+        requested_payload=subject_model.model_dump(mode="json"),
+    )
+    if accepted:
+        storage.accept_decision(
+            run.id,
+            request_id,
+            kind,
+            {"accepted": True, "persisted_reply": rotated_credential},
+        )
+    interrupted = storage.get_run(run.id)
+    interrupted.state = RunState.INTERRUPTED
+    interrupted.interrupted_from = waiting_state
+    storage.save_run(interrupted)
+    baseline_seq = storage.get_events(run.id)[-1].seq
+    provider = ScriptedProvider([])
+    manager = AgentManager(
+        replace(settings, api_key=rotated_credential),
+        storage,
+        provider,
+    )
+
+    async def forbidden_tool_side_effect(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Credential-conflict recovery must not invoke tools")
+
+    monkeypatch.setattr(manager.tools, "cancel", forbidden_tool_side_effect)
+    monkeypatch.setattr(manager.tools, "execute", forbidden_tool_side_effect)
+
+    with pytest.raises(InvalidRunAction, match="stored context conflicts"):
+        await manager.resume(run.id)
+    cancelled = await manager.cancel(run.id)
+    receipt = storage.get_decision(run.id, request_id)
+    new_events = [
+        event for event in storage.get_events(run.id) if event.seq > baseline_seq
+    ]
+
+    assert cancelled.state is RunState.CANCELLED
+    assert cancelled.messages == []
+    assert cancelled.plan is None
+    assert cancelled.clarification is None
+    assert cancelled.pending_approval is None
+    assert cancelled.verification is None
+    assert cancelled.plan_gate is None
+    assert cancelled.turns[-1].outcome == "cancelled"
+    assert storage.get_active_decision(run.id) is None
+    assert receipt.status is DecisionStatus.ABANDONED
+    assert receipt.payload is None
+    assert receipt.payload_sha256 is None
+    assert provider.requests == []
+    assert storage.has_active_run(settings.workspace) is False
+    assert (
+        storage.get_workspace_instruction_snapshot(run.id, 1).snapshot_sha256
+        == snapshot.snapshot_sha256
+    )
+    abandoned = [
+        event for event in new_events if event.type is EventType.DECISION_ABANDONED
+    ]
+    assert len(abandoned) == 1
+    assert abandoned[0].payload == {
+        "kind": kind.value,
+        "cause": "credential_conflict_cancelled",
+        "unsafe_subject_discarded": True,
+    }
+    assert rotated_credential not in json.dumps(
+        [event.model_dump(mode="json") for event in new_events], ensure_ascii=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_compact_json_credential_synthesized_from_safe_leaves(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    compact_credential = '"alpha":"omega"'
+    run = RunRecord(
+        id="compact-persisted-context",
+        task="Inspect compact JSON boundaries",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.PLANNING,
+        turns=[ConversationTurn(index=1, request="Inspect compact JSON boundaries")],
+        messages=[{"alpha": "omega"}],
+    )
+    storage.create_run(
+        run,
+        instruction_snapshot=WorkspaceInstructionSnapshot.empty(),
+    )
+    provider = ScriptedProvider([])
+    manager = AgentManager(
+        replace(settings, api_key=compact_credential),
+        storage,
+        provider,
+    )
+
+    with pytest.raises(InvalidRunAction, match="stored context conflicts"):
+        await manager.resume(run.id)
+    cancelled = await manager.cancel(run.id)
+
+    assert cancelled.state is RunState.CANCELLED
+    assert cancelled.messages == []
+    assert compact_credential not in cancelled.model_dump_json()
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_credential_conflict_cancel_releases_workspace_when_checkpoint_is_busy(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rotated_credential = "rotated-busy-checkpoint-credential-987654"
+    run = RunRecord(
+        id="rotated-busy-checkpoint",
+        task="Stop safely",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.PLANNING,
+        turns=[ConversationTurn(index=1, request=rotated_credential)],
+        messages=[{"role": "user", "content": rotated_credential}],
+    )
+    storage.create_run(
+        run,
+        instruction_snapshot=WorkspaceInstructionSnapshot.empty(),
+    )
+    manager = AgentManager(
+        replace(settings, api_key=rotated_credential),
+        storage,
+        ScriptedProvider([]),
+    )
+
+    def reject_checkpoint(*_args: object, **_kwargs: object) -> None:
+        raise SecureCheckpointError("reader is busy")
+
+    monkeypatch.setattr(storage, "secure_checkpoint", reject_checkpoint)
+    cancelled = await manager.cancel(run.id)
+
+    assert cancelled.state is RunState.CANCELLED
+    assert cancelled.provider_reasoning_cleanup_pending is True
+    assert cancelled.messages == []
+    assert rotated_credential not in cancelled.model_dump_json()
+    assert storage.has_active_run(settings.workspace) is False
+    with pytest.raises(InvalidRunAction, match="cleanup is still waiting"):
+        await manager.follow_up(run.id, "Continue after cleanup")
+    persisted = storage.get_run(run.id)
+    assert persisted.state is RunState.CANCELLED
+    assert persisted.provider_reasoning_cleanup_pending is True
 
 
 @pytest.mark.asyncio
@@ -5173,7 +5669,10 @@ async def test_resume_repairs_only_the_missing_result_in_a_partial_tool_batch(
             },
         ],
     )
-    storage.create_run(run)
+    storage.create_run(
+        run,
+        instruction_snapshot=WorkspaceInstructionSnapshot.empty(),
+    )
     provider = ScriptedProvider(
         [
             ModelResponse(
@@ -5245,7 +5744,10 @@ async def test_resume_preserves_persisted_fast_path_decision(
             reasons=["Explicit single-file scope"],
         ),
     )
-    storage.create_run(run)
+    storage.create_run(
+        run,
+        instruction_snapshot=WorkspaceInstructionSnapshot.empty(),
+    )
     manager = AgentManager(
         settings,
         storage,

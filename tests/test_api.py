@@ -24,6 +24,7 @@ from traceforge.models import (
     RunRecord,
     RunState,
     ToolCall,
+    WorkspaceInstructionSnapshot,
 )
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
 from traceforge.storage import Storage
@@ -93,6 +94,94 @@ def test_api_represents_direct_answer_without_completion_evidence(
         assert client.get(f"/api/runs/{answered['id']}/proof-pack").status_code == 409
         assert client.get(f"/api/runs/{answered['id']}/proof-pack.md").status_code == 409
         assert client.post(f"/api/runs/{answered['id']}/rollback").status_code == 409
+
+
+def test_api_exposes_only_workspace_rule_provenance(
+    settings: Settings,
+) -> None:
+    canary = "private-workspace-rule-canary-9813"
+    (settings.workspace / "AGENTS.md").write_text(canary)
+    app = create_app(
+        settings,
+        provider=ScriptedProvider(
+            [
+                _plan_response(),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish",
+                            name="finish",
+                            arguments={"summary": "Reviewed"},
+                        )
+                    ]
+                ),
+            ]
+        ),
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={
+                "task": "Review",
+                "workspace": str(settings.workspace),
+                "verifier_enabled": False,
+            },
+        )
+        assert created.status_code == 201
+        run_id = created.json()["id"]
+        _wait_for_state(client, run_id, "succeeded")
+
+        events = client.get(f"/api/runs/{run_id}/events").json()
+        websocket_events = []
+        with client.websocket_connect(
+            f"/api/runs/{run_id}/events?after_seq=0"
+        ) as websocket:
+            for _ in events:
+                websocket_events.append(websocket.receive_json())
+        proof_response = client.get(f"/api/runs/{run_id}/proof-pack")
+        proof_markdown = client.get(f"/api/runs/{run_id}/proof-pack.md")
+        assert proof_response.status_code == 200
+        assert proof_markdown.status_code == 200
+
+        public_payload = {
+            "run": client.get(f"/api/runs/{run_id}").json(),
+            "runs": client.get("/api/runs").json(),
+            "events": events,
+            "websocket_events": websocket_events,
+            "proof": proof_response.json(),
+            "proof_markdown": proof_markdown.text,
+        }
+        rendered = json.dumps(public_payload)
+        assert canary not in rendered
+        resolved = [
+            event
+            for event in public_payload["events"]
+            if event["type"] == "workspace.instructions.resolved"
+        ]
+        assert len(resolved) == 1
+        assert resolved[0]["payload"]["sources"][0]["path"] == "AGENTS.md"
+        assert resolved[0]["payload"]["content_private"] is True
+        assert app.state.storage.get_workspace_instruction_snapshot(
+            run_id, 1
+        ).sources[0].content == canary
+
+
+def test_api_rejects_unsafe_workspace_rules_before_creating_a_run(
+    settings: Settings,
+) -> None:
+    (settings.workspace / "AGENTS.md").write_text("do not store sk-abcdefghijkl")
+    app = create_app(settings, provider=ScriptedProvider([]))
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/runs",
+            json={"task": "Review", "workspace": str(settings.workspace)},
+        )
+
+        assert rejected.status_code == 422
+        assert "credential-like" in rejected.json()["detail"]
+        assert client.get("/api/runs").json() == []
 
 
 def test_api_rejects_duplicate_answers_for_one_clarification_question(
@@ -1066,7 +1155,10 @@ def test_resume_preserves_effort_and_blocks_an_incompatible_new_route(
             ],
             interrupted_from=RunState.PLANNING,
         )
-        app.state.storage.create_run(run)
+        app.state.storage.create_run(
+            run,
+            instruction_snapshot=WorkspaceInstructionSnapshot.empty(),
+        )
         updated = client.put(
             "/api/provider",
             json={

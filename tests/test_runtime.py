@@ -9,9 +9,16 @@ import pytest
 import traceforge.runtime as runtime_module
 from traceforge.agent import RunConflictError
 from traceforge.events import EventBroker
-from traceforge.models import ProviderConfig, RunRecord, RunState, ToolCall, utc_now
+from traceforge.models import (
+    ProviderConfig,
+    RunRecord,
+    RunState,
+    ToolCall,
+    WorkspaceInstructionSnapshot,
+    utc_now,
+)
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
-from traceforge.runtime import AgentRuntime, validate_credential_file
+from traceforge.runtime import AgentRuntime, _normalized_api_key, validate_credential_file
 from traceforge.storage import Storage
 
 
@@ -51,6 +58,24 @@ def test_environment_credential_must_also_be_exactly_one_line(
     runtime = AgentRuntime(invalid, storage, EventBroker(storage))
 
     assert runtime.credential_configured() is False
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "cancelled",
+        "credential",
+        "provider",
+        "interrupted",
+        "state",
+        "provider credential",
+    ],
+)
+def test_provider_credential_rejects_unrecoverable_protocol_collisions(
+    credential: str,
+) -> None:
+    with pytest.raises(ValueError, match=r"at least 12|recovery protocol"):
+        _normalized_api_key(credential)
 
 
 @pytest.mark.asyncio
@@ -456,7 +481,8 @@ async def test_resumed_run_blocks_provider_changes_before_worker_leaves_interrup
             workspace=str(settings.workspace),
             state=RunState.INTERRUPTED,
             interrupted_from=RunState.PLANNING,
-        )
+        ),
+        instruction_snapshot=WorkspaceInstructionSnapshot.empty(),
     )
     provider = ScriptedProvider(
         [

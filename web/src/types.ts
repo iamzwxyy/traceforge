@@ -161,6 +161,25 @@ export interface RunEvent {
   created_at: string;
 }
 
+export interface WorkspaceInstructionReference {
+  path: string;
+  scope: string;
+  content_sha256: string;
+  byte_count: number;
+}
+
+export interface WorkspaceInstructionManifest {
+  schema_version: "traceforge.workspace-instructions.v1";
+  captured_at: string;
+  sources: WorkspaceInstructionReference[];
+  total_bytes: number;
+  snapshot_sha256: string;
+  turn_index: number;
+  status: "loaded";
+  authority: "guidance";
+  content_private: true;
+}
+
 export interface RollbackResult {
   restored: string[];
   removed: string[];

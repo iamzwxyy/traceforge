@@ -35,6 +35,7 @@ from traceforge.agent import InvalidRunAction, PlanDecision, RunConflictError
 from traceforge.config import Settings
 from traceforge.context import ContextManager
 from traceforge.events import EventBroker
+from traceforge.instructions import render_workspace_instruction_context
 from traceforge.model_context import resolve_model_context
 from traceforge.model_reasoning import CATALOG_VERSION, resolve_reasoning_capability
 from traceforge.models import (
@@ -236,6 +237,7 @@ class RunView(BaseModel):
         decision: DecisionRequest | None = None,
         parent_run_id: str | None = None,
         successor_run_id: str | None = None,
+        workspace_instruction_context: str | None = None,
     ) -> RunView:
         public = run.model_dump(
             exclude={
@@ -245,8 +247,15 @@ class RunView(BaseModel):
                 "provider_reasoning_cleanup_pending",
             }
         )
+        context_messages = run.messages
+        if workspace_instruction_context is not None and context_messages:
+            context_messages = [
+                context_messages[0],
+                {"role": "user", "content": workspace_instruction_context},
+                *context_messages[1:],
+            ]
         public["context_tokens"] = ContextManager(run.context_limit).estimated_tokens(
-            run.messages
+            context_messages
         )
         public["proof_turn_indexes"] = proof_turn_indexes or []
         public["decision_request_id"] = decision.request_id if decision else None
@@ -316,12 +325,22 @@ def create_app(
     app.state.instance_config_fingerprint = instance_config_fingerprint
 
     def run_view(run: RunRecord) -> RunView:
+        turn_index = run.turns[-1].index if run.turns else 1
+        instruction_snapshot = storage.try_get_workspace_instruction_snapshot(
+            run.id,
+            turn_index,
+        )
         return RunView.from_record(
             run,
             proof_turn_indexes=storage.list_proof_pack_turn_indexes(run.id),
             decision=storage.get_active_decision(run.id),
             parent_run_id=storage.get_parent_run_id(run.id),
             successor_run_id=storage.get_successor_run_id(run.id),
+            workspace_instruction_context=(
+                render_workspace_instruction_context(instruction_snapshot)
+                if instruction_snapshot is not None
+                else None
+            ),
         )
 
     async def frozen_proof(

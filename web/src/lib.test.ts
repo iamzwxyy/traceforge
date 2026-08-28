@@ -5,6 +5,7 @@ import {
   buildActivityChapters,
   effectiveAssistantOutputStatus,
   inferProviderPreset,
+  latestWorkspaceInstructionManifest,
   mergeEvents,
   parseDiff,
   preferNewerRun,
@@ -18,6 +19,8 @@ import {
   shouldSubmitPrompt,
   supportedReasoningEffort,
   taskTitle,
+  workspaceInstructionManifest,
+  workspaceInstructionErrorLabel,
 } from "./lib";
 import type { Run, RunEvent } from "./types";
 
@@ -202,6 +205,93 @@ describe("mission control helpers", () => {
     expect(supportedReasoningEffort(["low", "high"], "max")).toBe("low");
     expect(supportedReasoningEffort(["high", "auto"], "max")).toBe("auto");
     expect(supportedReasoningEffort([], "high")).toBe("auto");
+  });
+
+  it("projects only safe workspace-rule provenance for the current turn", () => {
+    const first = {
+      ...event(2),
+      type: "workspace.instructions.resolved",
+      payload: {
+        schema_version: "traceforge.workspace-instructions.v1",
+        captured_at: "2026-08-28T00:00:00Z",
+        sources: [{
+          path: "AGENTS.md",
+          scope: ".",
+          content_sha256: "a".repeat(64),
+          byte_count: 42,
+          content: "private-rule-canary",
+        }],
+        total_bytes: 42,
+        snapshot_sha256: "b".repeat(64),
+        turn_index: 1,
+        status: "loaded",
+        authority: "guidance",
+        content_private: true,
+      },
+    };
+    const second = {
+      ...first,
+      seq: 5,
+      payload: { ...first.payload, turn_index: 2, snapshot_sha256: "c".repeat(64) },
+    };
+
+    const projected = workspaceInstructionManifest(first);
+
+    expect(projected).toMatchObject({
+      turn_index: 1,
+      total_bytes: 42,
+      sources: [{ path: "AGENTS.md", scope: ".", byte_count: 42 }],
+    });
+    expect(JSON.stringify(projected)).not.toContain("private-rule-canary");
+    expect(latestWorkspaceInstructionManifest([second, first], 1)?.snapshot_sha256)
+      .toBe("b".repeat(64));
+    expect(latestWorkspaceInstructionManifest([first, second], 2)?.snapshot_sha256)
+      .toBe("c".repeat(64));
+    expect(latestWorkspaceInstructionManifest([first], 3)).toBeNull();
+  });
+
+  it("rejects malformed or nested workspace-rule manifests", () => {
+    const malformed = {
+      ...event(1),
+      type: "workspace.instructions.resolved",
+      payload: {
+        schema_version: "traceforge.workspace-instructions.v1",
+        captured_at: "now",
+        sources: [{
+          path: "nested/AGENTS.md",
+          scope: "nested",
+          content_sha256: "a".repeat(64),
+          byte_count: 1,
+        }],
+        total_bytes: 1,
+        snapshot_sha256: "b".repeat(64),
+        turn_index: 1,
+        status: "loaded",
+        authority: "guidance",
+        content_private: true,
+      },
+    };
+
+    expect(workspaceInstructionManifest(malformed)).toBeNull();
+  });
+
+  it("localizes workspace-rule capture and credential recovery failures", () => {
+    expect(workspaceInstructionErrorLabel(
+      "The stored AGENTS.md snapshot conflicts with the current credential and cannot be sent to the model.",
+    )).toContain("当前凭证冲突");
+    expect(workspaceInstructionErrorLabel(
+      "This task's stored context conflicts with the current provider credential and cannot be sent to the model. Restore the previous credential or start a new task.",
+    )).toContain("已保存上下文");
+    expect(workspaceInstructionErrorLabel(
+      "This task's stored context conflicts with the current provider credential and cannot be sent to the model. Restore the previous credential, or stop this interrupted turn before starting a new task.",
+    )).toContain("先停止本轮");
+    expect(workspaceInstructionErrorLabel(
+      "The root AGENTS.md changed while it was being read.",
+    )).toContain("读取期间发生变化");
+    expect(workspaceInstructionErrorLabel(
+      "This legacy turn has no immutable workspace-instruction snapshot and cannot be resumed safely.",
+    )).toContain("不能安全恢复");
+    expect(workspaceInstructionErrorLabel("unrelated error")).toBeNull();
   });
 
   it("keeps completed turns conversation-first and moves distinct progress to Trace", () => {

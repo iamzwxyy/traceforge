@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 import re
 import shutil
@@ -74,6 +75,19 @@ class ToolRegistry:
             workspace.root, credential_file=settings.credential_file
         )
         self._processes: dict[str, asyncio.subprocess.Process] = {}
+        self._instruction_grants: dict[str, str] = {}
+
+    def bind_workspace_instruction_snapshot(
+        self,
+        run_id: str,
+        snapshot_sha256: str,
+    ) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", snapshot_sha256):
+            raise ValueError("Workspace instruction snapshot SHA-256 is invalid")
+        self._instruction_grants[run_id] = snapshot_sha256
+
+    def clear_workspace_instruction_snapshot(self, run_id: str) -> None:
+        self._instruction_grants.pop(run_id, None)
 
     @property
     def sandbox_status(self) -> SandboxStatus:
@@ -307,6 +321,8 @@ class ToolRegistry:
     ) -> ToolResult:
         mutation_baseline: dict[str, tuple[bool, str | None]] = {}
         try:
+            if call.name in {"apply_patch", "create_file", "run_command"}:
+                self._require_workspace_instruction_grant(run_id)
             if call.name in {"apply_patch", "create_file"}:
                 mutation_baseline = self._mutation_baseline(call)
             if call.name == "list_files":
@@ -356,6 +372,29 @@ class ToolRegistry:
                     if call.name in {"apply_patch", "create_file"}
                     else {}
                 ),
+            )
+
+    def _require_workspace_instruction_grant(self, run_id: str) -> None:
+        try:
+            run = self.workspace.storage.get_run(run_id)
+        except KeyError as exc:
+            raise ValueError(
+                "Workspace mutation was blocked because the run is not persisted"
+            ) from exc
+        turn_index = run.turns[-1].index if run.turns else 1
+        snapshot = self.workspace.storage.try_get_workspace_instruction_snapshot(
+            run_id,
+            turn_index,
+        )
+        granted = self._instruction_grants.get(run_id)
+        if (
+            snapshot is None
+            or granted is None
+            or not hmac.compare_digest(granted, snapshot.snapshot_sha256)
+        ):
+            raise ValueError(
+                "Workspace mutation was blocked because this turn's immutable AGENTS.md "
+                "snapshot is missing or not bound"
             )
 
     def _mutation_paths(self, call: ToolCall) -> list[str]:

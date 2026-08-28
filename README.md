@@ -25,6 +25,11 @@ Its differentiator is a defensible engineering loop with useful human control.
   while hard destructive commands, real-path boundaries, and credential scrubbing stay invariant.
 - **Plan as a completion contract.** Planned files, builder progress, check status, exact commands,
   and evidence stay visible. A write outside the declared file scope pauses for action approval.
+- **Turn-bound workspace guidance.** An exact root `AGENTS.md` is captured once per turn and used by
+  planner, builder, and verifier below system safety and the current request. Follow-ups capture a
+  new immutable snapshot; restart recovery reuses the stored one. Public APIs and the UI expose
+  a dedicated manifest with only its path, size, and hashes—not a second copy of the
+  project-authored content or any new authority.
 - **Independent completion review.** The reviewer cannot write files or run commands. A rejection
   returns concrete findings to the builder for at most two repair cycles.
 - **Downloadable Proof Pack.** Every successful turn atomically freezes an immutable v2 artifact
@@ -122,6 +127,30 @@ the new lock protocol is detected and refused rather than bypassed on another po
 process on the requested port fails before startup mutation and prints a copyable command with an
 available port.
 
+When the selected root contains an exact `AGENTS.md`, each new turn safely captures it before the
+turn is created. A neutral **规则 1** badge and Trace item identify the loaded source without
+showing its text. Project guidance remains below the current user request and cannot change
+approvals, sandboxing, credential rules, or the selected workspace. That semantic precedence is a
+model-facing instruction rather than a local proof; the security boundaries are enforced locally.
+v1 intentionally ignores home,
+parent, nested, included, skill, plugin, and environment files. A follow-up rereads the root file,
+while resume uses only the interrupted turn's immutable stored snapshot. Symlinks, non-regular or
+changing files, invalid UTF-8/NUL, credential-like content, and a complete framed context over
+32 KiB fail before a new turn is persisted.
+
+The snapshot freezes automatic rule discovery and injection; it does not make `AGENTS.md` secret or
+hide it from ordinary workspace file tools. Later disk content can be inspected as project content
+but does not replace the turn's marked guidance snapshot. The original rules are sent to the
+configured model provider, and model-authored answers or tool arguments may quote them, so do not
+store secrets there. If credentials change while a turn is interrupted, every model request is
+rechecked against the current key before transmission and conflicts fail closed without rewriting
+the snapshot. The user can restore the previous credential to resume, or explicitly stop the turn:
+that recovery atomically replaces the now-unsafe model context with a neutral cancelled record,
+abandons any active decision, and releases the workspace while preserving files and the immutable
+rule snapshot. Resume performs this check synchronously over the saved state and the exact
+rule-message insertion, so a key formed only across that compact JSON boundary cannot briefly start
+the provider loop or turn the paused task into a failure.
+
 Switching between tasks keeps each direct-task, project, and follow-up draft separate in page memory,
 including plan mode, approval mode, and reasoning effort. Draft text is never written to browser
 storage or the backend and disappears on reload. Successful submissions clear only their own draft;
@@ -153,8 +182,10 @@ links; similarly named user-supplied credential files are never treated as manag
 separate save-only path can retain an unverified draft for later testing but
 does not enable tasks. SQLite saves only the credential file's absolute path, and the value is never
 returned by the API or UI.
-Advanced users may instead reference an existing one-line owner-only credential
-file or set a model's documented context window. Leaving the context field empty uses an exact
+Advanced users may instead reference an existing owner-only credential file containing one
+non-empty line of 12–16,383 UTF-8 bytes, or set a model's documented context window. Direct and
+file-based credentials that collide with TraceForge's unavoidable recovery-protocol representation
+are rejected before use, so an interrupted task always retains a safe stop path. Leaving the context field empty uses an exact
 catalog entry only for a recognized model on its official endpoint; all other routes use the
 configurable conservative fallback. The resolved value and its source remain visible in settings.
 Settings also advertise the exact route's reasoning-effort options and catalog source. This is a
@@ -274,8 +305,8 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 434 backend tests at 87.61% coverage (with a hard 85% gate), 32 frontend
-unit tests, and 34 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 488 backend tests at 87.44% coverage (with a hard 85% gate), 35 frontend
+unit tests, and 35 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 
@@ -301,6 +332,7 @@ backend passes its startup probe. A user can explicitly approve an unknown comma
 unsandboxed execution in the default Automatic profile, which is recorded as a bypass. The
 workspace Full-access profile is not host-wide `danger-full-access`; it retains the OS sandbox and
 falls back to a prompt for unknown commands when enforcement is unavailable. Binary file editing, Windows, parallel
-agents, browser automation, and plugin systems are outside v0.1.
+agents, browser automation, plugin systems, and nested or inherited workspace-instruction discovery
+are outside v0.1.
 
 Licensed under the [MIT License](LICENSE).

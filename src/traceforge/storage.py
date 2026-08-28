@@ -9,16 +9,23 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
+from traceforge.credentials import (
+    CREDENTIAL_CONFLICT_CAUSE,
+    CREDENTIAL_CONFLICT_DISCARDED_SUBJECT,
+    CREDENTIAL_CONFLICT_SUMMARY,
+    CREDENTIAL_CONFLICT_TASK,
+)
 from traceforge.models import (
     ApprovalMode,
     ApprovalRequest,
     ClarificationRequest,
+    ConversationTurn,
     DecisionKind,
     DecisionRequest,
     DecisionStatus,
@@ -34,6 +41,7 @@ from traceforge.models import (
     RunState,
     TaskPlan,
     VerificationReport,
+    WorkspaceInstructionSnapshot,
     utc_now,
 )
 from traceforge.streaming import (
@@ -298,6 +306,17 @@ class Storage:
                     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS workspace_instruction_snapshots (
+                    run_id TEXT NOT NULL,
+                    turn_index INTEGER NOT NULL CHECK(turn_index >= 1),
+                    schema_version TEXT NOT NULL,
+                    snapshot_sha256 TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, turn_index),
+                    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS proof_backfill_candidates (
                     run_id TEXT PRIMARY KEY,
                     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
@@ -438,6 +457,16 @@ class Storage:
                     "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
                     ("credential-boundary-v1", utc_now().isoformat()),
                 )
+            instruction_migration = self._connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                ("workspace-instructions-v1",),
+            ).fetchone()
+            if instruction_migration is None:
+                self._invalidate_pre_instruction_decisions()
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+                    ("workspace-instructions-v1", utc_now().isoformat()),
+                )
             self._scrub_terminal_reasoning_rows()
             row = self._connection.execute(
                 "SELECT 1 FROM runs WHERE provider_reasoning_cleanup_pending = 1 LIMIT 1"
@@ -486,7 +515,6 @@ class Storage:
                 """,
                 (boundary_safe_json_dumps([]), run_id),
             )
-            sequence = self._next_event_seq_locked(run_id)
             self._connection.execute(
                 """
                 INSERT INTO events(run_id, seq, type, payload_json, created_at)
@@ -494,12 +522,80 @@ class Storage:
                 """,
                 (
                     run_id,
-                    sequence,
+                    self._next_event_seq_locked(run_id),
                     EventType.DECISION_ABANDONED.value,
                     boundary_safe_json_dumps(
                         {
                             "kind": DecisionKind.ACTION.value,
                             "cause": "credential_boundary_upgrade",
+                        }
+                    ),
+                    now.isoformat(),
+                ),
+            )
+
+    def _invalidate_pre_instruction_decisions(self) -> None:
+        """Abandon every interactive receipt whose turn predates rule snapshots."""
+
+        rows = self._connection.execute(
+            """
+            SELECT decisions.run_id, decisions.request_id, decisions.kind
+            FROM decision_requests AS decisions
+            WHERE decisions.status IN (?, ?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM workspace_instruction_snapshots AS snapshots
+                  WHERE snapshots.run_id = decisions.run_id
+                    AND snapshots.turn_index = decisions.turn_index
+              )
+            """,
+            (
+                DecisionStatus.PENDING.value,
+                DecisionStatus.ACCEPTED.value,
+            ),
+        ).fetchall()
+        if not rows:
+            return
+        now = utc_now()
+        for row in rows:
+            run_id = str(row["run_id"])
+            request_id = str(row["request_id"])
+            kind = DecisionKind(str(row["kind"]))
+            self._connection.execute(
+                """
+                UPDATE decision_requests
+                SET status = ?, consumed_at = ?
+                WHERE run_id = ? AND request_id = ? AND status IN (?, ?)
+                """,
+                (
+                    DecisionStatus.ABANDONED.value,
+                    now.isoformat(),
+                    run_id,
+                    request_id,
+                    DecisionStatus.PENDING.value,
+                    DecisionStatus.ACCEPTED.value,
+                ),
+            )
+            self._connection.execute(
+                """
+                UPDATE runs
+                SET clarification_json = NULL, pending_approval_json = NULL, messages_json = ?
+                WHERE id = ?
+                """,
+                (boundary_safe_json_dumps([]), run_id),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO events(run_id, seq, type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    self._next_event_seq_locked(run_id),
+                    EventType.DECISION_ABANDONED.value,
+                    boundary_safe_json_dumps(
+                        {
+                            "kind": kind.value,
+                            "cause": "workspace_instruction_upgrade",
                         }
                     ),
                     now.isoformat(),
@@ -595,7 +691,14 @@ class Storage:
                 )
             return len(rows)
 
-    def create_run(self, run: RunRecord, *, parent_run_id: str | None = None) -> None:
+    def create_run(
+        self,
+        run: RunRecord,
+        *,
+        parent_run_id: str | None = None,
+        instruction_snapshot: WorkspaceInstructionSnapshot | None = None,
+        initial_events: list[tuple[EventType, dict[str, Any]]] | None = None,
+    ) -> list[RunEvent]:
         with self._lock, self._connection:
             self._connection.execute(
                 """
@@ -626,6 +729,113 @@ class Storage:
                     """,
                     (run.id, parent_run_id, run.created_at.isoformat()),
                 )
+            if instruction_snapshot is not None:
+                turn_index = run.turns[-1].index if run.turns else 1
+                self._insert_workspace_instruction_snapshot_locked(
+                    run.id,
+                    turn_index,
+                    instruction_snapshot,
+                )
+            events: list[RunEvent] = []
+            first_seq = self._next_event_seq_locked(run.id)
+            for offset, (event_type, payload) in enumerate(initial_events or []):
+                event = RunEvent(
+                    run_id=run.id,
+                    seq=first_seq + offset,
+                    type=event_type,
+                    payload=payload,
+                    created_at=run.created_at,
+                )
+                self._insert_event_locked(event)
+                events.append(event)
+            return events
+
+    def insert_workspace_instruction_snapshot(
+        self,
+        run_id: str,
+        turn_index: int,
+        snapshot: WorkspaceInstructionSnapshot,
+    ) -> None:
+        """Insert one immutable turn snapshot; existing rows are never overwritten."""
+
+        with self._lock, self._connection:
+            self._insert_workspace_instruction_snapshot_locked(
+                run_id,
+                turn_index,
+                snapshot,
+            )
+
+    def get_workspace_instruction_snapshot(
+        self,
+        run_id: str,
+        turn_index: int,
+    ) -> WorkspaceInstructionSnapshot:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT snapshot_json FROM workspace_instruction_snapshots
+                WHERE run_id = ? AND turn_index = ?
+                """,
+                (run_id, turn_index),
+            ).fetchone()
+        if row is None:
+            raise KeyError(
+                f"Workspace instruction snapshot not found: {run_id} turn {turn_index}"
+            )
+        return WorkspaceInstructionSnapshot.model_validate_json(row["snapshot_json"])
+
+    def try_get_workspace_instruction_snapshot(
+        self,
+        run_id: str,
+        turn_index: int,
+    ) -> WorkspaceInstructionSnapshot | None:
+        try:
+            return self.get_workspace_instruction_snapshot(run_id, turn_index)
+        except KeyError:
+            return None
+
+    def begin_turn(
+        self,
+        run: RunRecord,
+        *,
+        previous_state: RunState,
+        instruction_snapshot: WorkspaceInstructionSnapshot,
+        events: list[tuple[EventType, dict[str, Any]]],
+    ) -> list[RunEvent]:
+        """Atomically persist a follow-up turn, its rule snapshot, and visible events."""
+
+        if not run.turns:
+            raise ValueError("A follow-up run must contain a conversation turn")
+        now = utc_now()
+        with self._lock, self._connection:
+            current = self._connection.execute(
+                "SELECT state FROM runs WHERE id = ?",
+                (run.id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Run not found: {run.id}")
+            if current["state"] != previous_state.value:
+                raise DecisionConflictError("Run state changed before the follow-up began")
+            self._insert_workspace_instruction_snapshot_locked(
+                run.id,
+                run.turns[-1].index,
+                instruction_snapshot,
+            )
+            run.updated_at = now
+            self._update_run_locked(run, expected_state=previous_state)
+            first_seq = self._next_event_seq_locked(run.id)
+            persisted: list[RunEvent] = []
+            for offset, (event_type, payload) in enumerate(events):
+                event = RunEvent(
+                    run_id=run.id,
+                    seq=first_seq + offset,
+                    type=event_type,
+                    payload=payload,
+                    created_at=now,
+                )
+                self._insert_event_locked(event)
+                persisted.append(event)
+            return persisted
 
     def get_parent_run_id(self, run_id: str) -> str | None:
         with self._lock:
@@ -1436,6 +1646,234 @@ class Storage:
                 self._insert_event_locked(event)
         return terminal_events
 
+    def commit_credential_conflict_cancellation(self, run_id: str) -> list[RunEvent]:
+        """Atomically stop an interrupted run whose private context is no longer writable.
+
+        A provider credential can be rotated to a value that already exists in an interrupted
+        turn's formerly ordinary model context. The normal cancellation path deliberately cannot
+        serialize that row under the new credential guard. This narrow recovery transaction
+        discards model-facing subjects without reading them back through ordinary persistence,
+        abandons any active durable decision, and closes the run. Workspace snapshots and the
+        immutable workspace-instruction snapshot table are intentionally untouched.
+        """
+
+        preferred_time = utc_now()
+        safe_task = CREDENTIAL_CONFLICT_TASK
+        safe_summary = CREDENTIAL_CONFLICT_SUMMARY
+        with self._lock, self._connection:
+            now = self._credential_safe_recovery_time_locked(preferred_time)
+            row = self._connection.execute(
+                "SELECT * FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Run not found: {run_id}")
+            if row["state"] != RunState.INTERRUPTED.value:
+                raise RuntimeError(
+                    "Credential-conflict cancellation requires an interrupted run"
+                )
+
+            turn_index = self._recover_turn_index_locked(row, run_id)
+            try:
+                mode = InteractionMode(str(row["mode"]))
+            except ValueError:
+                mode = InteractionMode.AGENT
+            try:
+                approval_mode = ApprovalMode(str(row["approval_mode"]))
+            except ValueError:
+                approval_mode = ApprovalMode.AUTOMATIC
+            try:
+                reasoning_effort = ReasoningEffort(str(row["reasoning_effort"]))
+            except ValueError:
+                reasoning_effort = ReasoningEffort.AUTO
+            safe_turn = ConversationTurn(
+                index=turn_index,
+                request=safe_task,
+                mode=mode,
+                approval_mode=approval_mode,
+                reasoning_effort=reasoning_effort,
+                outcome="cancelled",
+                summary=safe_summary,
+                started_at=now,
+                completed_at=now,
+            )
+
+            active_decisions = self._connection.execute(
+                """
+                SELECT request_id, kind FROM decision_requests
+                WHERE run_id = ? AND status IN (?, ?)
+                ORDER BY created_at
+                """,
+                (
+                    run_id,
+                    DecisionStatus.PENDING.value,
+                    DecisionStatus.ACCEPTED.value,
+                ),
+            ).fetchall()
+            self._connection.execute(
+                """
+                UPDATE decision_requests
+                SET status = ?, subject_sha256 = ?, payload_json = NULL,
+                    payload_sha256 = NULL, consumed_at = ?
+                WHERE run_id = ? AND status IN (?, ?)
+                """,
+                (
+                    DecisionStatus.ABANDONED.value,
+                    CREDENTIAL_CONFLICT_DISCARDED_SUBJECT,
+                    now.isoformat(),
+                    run_id,
+                    DecisionStatus.PENDING.value,
+                    DecisionStatus.ACCEPTED.value,
+                ),
+            )
+
+            empty_json = self._json_dumps([])
+            cursor = self._connection.execute(
+                """
+                UPDATE runs SET
+                    task = ?, state = ?, turns_json = ?,
+                    plan_json = NULL, clarification_json = NULL,
+                    pending_approval_json = NULL, verification_json = NULL,
+                    plan_gate_json = NULL, messages_json = ?,
+                    provider_reasoning_cleanup_pending = 1,
+                    plan_approved = 0, interrupted_from = NULL,
+                    error = NULL, created_at = ?, updated_at = ?
+                WHERE id = ? AND state = ?
+                """,
+                (
+                    safe_task,
+                    RunState.CANCELLED.value,
+                    self._json_dumps([safe_turn.model_dump(mode="json")]),
+                    empty_json,
+                    now.isoformat(),
+                    now.isoformat(),
+                    run_id,
+                    RunState.INTERRUPTED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "Run state changed before credential-conflict cancellation"
+                )
+
+            sequence = self._next_event_seq_locked(run_id)
+            events: list[RunEvent] = []
+            if self._open_assistant_output_streams_locked(run_id):
+                events.append(
+                    RunEvent(
+                        run_id=run_id,
+                        seq=sequence,
+                        type=EventType.ASSISTANT_OUTPUT_ABORTED,
+                        payload={
+                            "status": "cancelled",
+                            "reason": CREDENTIAL_CONFLICT_CAUSE,
+                            "all_open": True,
+                        },
+                        created_at=now,
+                    )
+                )
+                sequence += 1
+            events.extend(
+                [
+                    RunEvent(
+                        run_id=run_id,
+                        seq=sequence + offset,
+                        type=EventType.DECISION_ABANDONED,
+                        payload={
+                            "kind": DecisionKind(str(decision["kind"])).value,
+                            "cause": CREDENTIAL_CONFLICT_CAUSE,
+                            "unsafe_subject_discarded": True,
+                        },
+                        created_at=now,
+                    )
+                    for offset, decision in enumerate(active_decisions)
+                ]
+            )
+            sequence += len(active_decisions)
+            events.extend(
+                [
+                    RunEvent(
+                        run_id=run_id,
+                        seq=sequence,
+                        type=EventType.STATE_CHANGED,
+                        payload={
+                            "state": RunState.CANCELLED.value,
+                            "previous": RunState.INTERRUPTED.value,
+                            "cause": CREDENTIAL_CONFLICT_CAUSE,
+                        },
+                        created_at=now,
+                    ),
+                    RunEvent(
+                        run_id=run_id,
+                        seq=sequence + 1,
+                        type=EventType.TURN_COMPLETED,
+                        payload={
+                            "index": turn_index,
+                            "outcome": "cancelled",
+                            "summary": safe_summary,
+                            "changed_files": [],
+                            "approval_mode": approval_mode.value,
+                            "reasoning_effort": reasoning_effort.value,
+                        },
+                        created_at=now,
+                    ),
+                    RunEvent(
+                        run_id=run_id,
+                        seq=sequence + 2,
+                        type=EventType.RUN_COMPLETED,
+                        payload={
+                            "state": RunState.CANCELLED.value,
+                            "cause": CREDENTIAL_CONFLICT_CAUSE,
+                        },
+                        created_at=now,
+                    ),
+                ]
+            )
+            for event in events:
+                self._insert_event_locked(event)
+        return events
+
+    def _credential_safe_recovery_time_locked(self, preferred: datetime) -> datetime:
+        """Choose one timestamp that cannot reproduce any registered credential."""
+
+        candidates = [preferred]
+        with self._lock:
+            credential_count = len(self._guarded_credentials)
+        baseline = datetime(2000, 1, 1, 0, 0, 0, 123456, tzinfo=UTC)
+        for offset in range(credential_count * 8 + 64):
+            candidates.append(
+                baseline
+                + timedelta(
+                    days=offset,
+                    seconds=(offset * 7_919) % 86_400,
+                    microseconds=(offset * 104_729) % 1_000_000,
+                )
+            )
+        for candidate in candidates:
+            try:
+                self._assert_safe_text(candidate.isoformat())
+            except CredentialPersistenceError:
+                continue
+            return candidate
+        raise CredentialPersistenceError(
+            "Credential-safe cancellation timestamp could not be constructed"
+        )
+
+    def finish_credential_conflict_cleanup(self, run_id: str) -> None:
+        """Clear the recovery checkpoint marker after the old row bytes leave the WAL."""
+
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE runs SET provider_reasoning_cleanup_pending = 0
+                WHERE id = ? AND state = ?
+                """,
+                (run_id, RunState.CANCELLED.value),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "Credential-conflict cleanup requires a cancelled run"
+                )
+
     def commit_success(
         self,
         run: RunRecord,
@@ -1839,6 +2277,32 @@ class Storage:
                 raise KeyError(f"Run not found: {run.id}")
             raise RuntimeError(f"Run update lost its state guard: {run.id}")
 
+    def _recover_turn_index_locked(self, row: sqlite3.Row, run_id: str) -> int:
+        """Recover only the non-secret numeric turn identity from an unsafe run row."""
+
+        try:
+            turns = json.loads(str(row["turns_json"]))
+        except (TypeError, ValueError):
+            turns = []
+        if isinstance(turns, list):
+            for turn in reversed(turns):
+                if isinstance(turn, dict):
+                    index = turn.get("index")
+                    if isinstance(index, int) and not isinstance(index, bool) and index >= 1:
+                        return index
+        snapshot = self._connection.execute(
+            """
+            SELECT MAX(turn_index) AS turn_index
+            FROM workspace_instruction_snapshots WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if snapshot is not None:
+            index = snapshot["turn_index"]
+            if isinstance(index, int) and index >= 1:
+                return index
+        return 1
+
     def _open_assistant_output_streams_locked(
         self, run_id: str
     ) -> dict[str, dict[str, Any]]:
@@ -1866,6 +2330,9 @@ class Storage:
                 if isinstance(candidate, str) and candidate:
                     open_streams[candidate] = payload
             elif event_type is EventType.ASSISTANT_OUTPUT_ABORTED:
+                if payload.get("all_open") is True:
+                    open_streams.clear()
+                    continue
                 candidate = payload.get("stream_id")
                 if isinstance(candidate, str):
                     open_streams.pop(candidate, None)
@@ -1922,6 +2389,31 @@ class Storage:
                 event.type.value,
                 self._json_dumps(event.payload),
                 event.created_at.isoformat(),
+            ),
+        )
+
+    def _insert_workspace_instruction_snapshot_locked(
+        self,
+        run_id: str,
+        turn_index: int,
+        snapshot: WorkspaceInstructionSnapshot,
+    ) -> None:
+        if turn_index < 1:
+            raise ValueError("Workspace instruction turn index must be positive")
+        self._connection.execute(
+            """
+            INSERT INTO workspace_instruction_snapshots(
+                run_id, turn_index, schema_version, snapshot_sha256,
+                snapshot_json, captured_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                turn_index,
+                snapshot.schema_version,
+                snapshot.snapshot_sha256,
+                self._json_dumps(snapshot.model_dump(mode="json"), sort_keys=True),
+                snapshot.captured_at.isoformat(),
             ),
         )
 

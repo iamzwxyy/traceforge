@@ -106,6 +106,22 @@ def contains_redactable_serialized_json_secret(
     return contains_secret_representation(serialized, api_key=api_key)
 
 
+def contains_compact_serialized_json_secret(
+    value: Any, *, api_key: str = ""
+) -> bool:
+    """Inspect compact JSON forms used by HTTP clients at the provider boundary."""
+
+    for ensure_ascii in (False, True):
+        serialized = json.dumps(
+            value,
+            ensure_ascii=ensure_ascii,
+            separators=(",", ":"),
+        )
+        if contains_secret_representation(serialized, api_key=api_key):
+            return True
+    return False
+
+
 def redact_json_value(value: Any, *, api_key: str = "") -> Any:
     """Redact every string in a JSON-like Python value before it is serialized.
 

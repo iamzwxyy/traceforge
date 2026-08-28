@@ -30,19 +30,26 @@ class ContextManager:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        *,
+        protected_count: int = 2,
     ) -> tuple[list[dict[str, Any]], bool]:
+        if protected_count < 0:
+            raise ValueError("protected_count cannot be negative")
         request_surface = {"messages": messages, "tools": tools or []}
-        if self.estimated_tokens([request_surface]) < self.context_limit * self.threshold:
+        initial_tokens = self.estimated_tokens([request_surface])
+        if initial_tokens < self.context_limit * self.threshold:
             return messages.copy(), False
-        if len(messages) <= 2:
+        if len(messages) <= protected_count:
+            self._require_within_context(initial_tokens)
             return messages.copy(), False
-        protected = messages[:2]
-        units = self._message_units(messages[2:])
+        protected = messages[:protected_count]
+        units = self._message_units(messages[protected_count:])
         recent_units = self._recent_units(
             units, token_budget=max(1, int(self.context_limit * self.retain_ratio))
         )
         removed_count = len(units) - len(recent_units)
         if removed_count <= 0:
+            self._require_within_context(initial_tokens)
             return messages.copy(), False
         middle = [message for unit in units[:removed_count] for message in unit]
         recent = [message for unit in recent_units for message in unit]
@@ -61,7 +68,17 @@ class ContextManager:
             },
             *recent,
         ]
+        compacted_tokens = self.estimated_tokens(
+            [{"messages": compacted, "tools": tools or []}]
+        )
+        self._require_within_context(compacted_tokens)
         return compacted, True
+
+    def _require_within_context(self, estimated_tokens: int) -> None:
+        if estimated_tokens >= self.context_limit:
+            raise ValueError(
+                "Protected model context and tool schemas exceed the configured context window"
+            )
 
     def _recent_units(
         self,

@@ -11,7 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from traceforge.config import Settings
 from traceforge.context import ContextManager
+from traceforge.credentials import validate_provider_credential
 from traceforge.events import EventBroker
+from traceforge.instructions import (
+    WorkspaceInstructionLoader,
+    render_workspace_instruction_context,
+)
 from traceforge.model_reasoning import ReasoningCapability, resolve_reasoning_capability
 from traceforge.models import (
     ApprovalMode,
@@ -38,6 +43,7 @@ from traceforge.models import (
     ToolResult,
     Verdict,
     VerificationReport,
+    WorkspaceInstructionSnapshot,
     utc_now,
 )
 from traceforge.planning import assess_plan_gate
@@ -68,6 +74,7 @@ from traceforge.storage import (
 from traceforge.streaming import (
     StableStreamingRedactor,
     boundary_safe_json_dumps,
+    contains_compact_serialized_json_secret,
     contains_redactable_json_secret,
     contains_redactable_secret,
     contains_redactable_serialized_json_secret,
@@ -404,13 +411,17 @@ class AgentManager:
         *,
         broker: EventBroker | None = None,
     ) -> None:
-        if "\n" in settings.api_key or "\r" in settings.api_key:
-            raise ValueError("Provider credentials must contain exactly one line")
+        if settings.api_key:
+            validate_provider_credential(settings.api_key)
         self.settings = settings
         self.storage = storage
         self.storage.register_credential_guard(settings.api_key)
         self.provider = provider
         self.workspace = Workspace(settings.workspace, storage)
+        self.workspace_instructions = WorkspaceInstructionLoader(
+            self.workspace.root,
+            api_key=settings.api_key,
+        )
         self.tools = ToolRegistry(self.workspace, settings)
         self.context = ContextManager(settings.context_limit)
         self.broker = broker or EventBroker(storage)
@@ -439,6 +450,8 @@ class AgentManager:
         if self.storage.has_active_run(self.settings.workspace):
             raise RunConflictError("This workspace already has an active or interrupted run")
         self._reasoning_capability().validate(reasoning_effort)
+        instruction_snapshot = self.workspace_instructions.capture()
+        self._validate_initial_model_context(clean_task, instruction_snapshot)
         run = RunRecord(
             id=uuid4().hex,
             task=clean_task,
@@ -459,13 +472,6 @@ class AgentManager:
                 )
             ],
         )
-        self.storage.create_run(run, parent_run_id=parent_run_id)
-        self._controls[run.id] = _Control()
-        await self.broker.emit(
-            run.id,
-            EventType.STATE_CHANGED,
-            {"state": run.state.value, "previous": None},
-        )
         turn_started_payload: dict[str, Any] = {
             "index": 1,
             "request": clean_task,
@@ -475,11 +481,26 @@ class AgentManager:
         }
         if parent_run_id is not None:
             turn_started_payload["continued_from_run_id"] = parent_run_id
-        await self.broker.emit(
-            run.id,
-            EventType.TURN_STARTED,
-            turn_started_payload,
+        events = [
+            (
+                EventType.STATE_CHANGED,
+                {"state": run.state.value, "previous": None},
+            ),
+            (EventType.TURN_STARTED, turn_started_payload),
+            *self._workspace_instruction_events(instruction_snapshot, turn_index=1),
+        ]
+        persisted = self.storage.create_run(
+            run,
+            parent_run_id=parent_run_id,
+            instruction_snapshot=instruction_snapshot,
+            initial_events=events,
         )
+        self.tools.bind_workspace_instruction_snapshot(
+            run.id,
+            instruction_snapshot.snapshot_sha256,
+        )
+        self._controls[run.id] = _Control()
+        await self._publish_persisted(persisted)
         self._spawn(run.id, resume=False)
         return run
 
@@ -534,6 +555,7 @@ class AgentManager:
                 )
             if parent.workspace != str(self.settings.workspace):
                 raise InvalidRunAction("The rolled-back task belongs to another workspace")
+            self._require_safe_persisted_context(parent)
             successor_id = self.storage.get_successor_run_id(parent.id)
             if successor_id is not None:
                 successor = self.storage.get_run(successor_id)
@@ -583,15 +605,30 @@ class AgentManager:
             RunState.CANCELLED,
         }:
             raise InvalidRunAction("Follow-up is available after the current turn stops")
+        self._require_safe_persisted_context(run)
         await self._wait_for_terminal_task(run_id)
         run = self.storage.get_run(run_id)
+        if run.provider_reasoning_cleanup_pending:
+            try:
+                self.storage.secure_checkpoint()
+            except SecureCheckpointError as exc:
+                raise InvalidRunAction(
+                    "Credential-conflict cleanup is still waiting for an external SQLite "
+                    "reader. Close external database readers before continuing this task."
+                ) from exc
+            self.storage.finish_credential_conflict_cleanup(run.id)
+            run = self.storage.get_run(run_id)
         if run.state is RunState.SUCCEEDED:
             self._freeze_success_or_reject(run)
         if self.storage.has_active_run(self.settings.workspace):
             raise RunConflictError("This workspace already has an active or interrupted run")
         self._reasoning_capability().validate(reasoning_effort)
+        instruction_snapshot = self.workspace_instructions.capture()
+        self._validate_initial_model_context(clean_prompt, instruction_snapshot)
 
-        index = len(run.turns) + 1
+        index = max((turn.index for turn in run.turns), default=0) + 1
+        previous_state = run.state
+        self._validate_transition(run, RunState.CREATED)
         run.mode = mode
         run.approval_mode = approval_mode
         run.reasoning_effort = reasoning_effort
@@ -615,19 +652,43 @@ class AgentManager:
         run.repair_cycles = 0
         run.context_limit = self.settings.context_limit
         run.error = None
-        self._controls[run.id] = _Control()
-        await self._transition(run, RunState.CREATED)
-        await self.broker.emit(
-            run.id,
-            EventType.TURN_STARTED,
-            {
-                "index": index,
-                "request": clean_prompt,
-                "mode": mode.value,
-                "approval_mode": approval_mode.value,
-                "reasoning_effort": reasoning_effort.value,
-            },
+        run.state = RunState.CREATED
+        run.interrupted_from = None
+        run.provider_reasoning_cleanup_pending = False
+        persisted = self.storage.begin_turn(
+            run,
+            previous_state=previous_state,
+            instruction_snapshot=instruction_snapshot,
+            events=[
+                (
+                    EventType.STATE_CHANGED,
+                    {
+                        "state": RunState.CREATED.value,
+                        "previous": previous_state.value,
+                    },
+                ),
+                (
+                    EventType.TURN_STARTED,
+                    {
+                        "index": index,
+                        "request": clean_prompt,
+                        "mode": mode.value,
+                        "approval_mode": approval_mode.value,
+                        "reasoning_effort": reasoning_effort.value,
+                    },
+                ),
+                *self._workspace_instruction_events(
+                    instruction_snapshot,
+                    turn_index=index,
+                ),
+            ],
         )
+        self.tools.bind_workspace_instruction_snapshot(
+            run.id,
+            instruction_snapshot.snapshot_sha256,
+        )
+        self._controls[run.id] = _Control()
+        await self._publish_persisted(persisted)
         self._spawn(run.id, resume=False)
         return self.storage.get_run(run.id)
 
@@ -727,6 +788,23 @@ class AgentManager:
         run = self.storage.get_run(run_id)
         if run.state.terminal:
             return run
+        instruction_snapshot = self._stored_instruction_snapshot_for_recovery(run)
+        if run.state is RunState.INTERRUPTED and self._persisted_context_is_unsafe(
+            run,
+            instruction_snapshot=instruction_snapshot,
+        ):
+            events = self.storage.commit_credential_conflict_cancellation(run_id)
+            self.tools.clear_workspace_instruction_snapshot(run_id)
+            await self._publish_persisted(events)
+            try:
+                self.storage.secure_checkpoint()
+            except SecureCheckpointError:
+                # The run is already terminal and no longer blocks its workspace. Startup will
+                # retry the physical WAL cleanup while the durable marker remains set.
+                pass
+            else:
+                self.storage.finish_credential_conflict_cleanup(run_id)
+            return self.storage.get_run(run_id)
         await self.tools.cancel(run_id)
         run = self.storage.get_run(run_id)
         if run.state.terminal:
@@ -767,6 +845,11 @@ class AgentManager:
             raise InvalidRunAction("Only interrupted runs can be resumed")
         if run_id in self._tasks and not self._tasks[run_id].done():
             raise RunConflictError("Run is already active")
+        instruction_snapshot = self._workspace_instruction_snapshot(run)
+        self._require_safe_persisted_context(
+            run,
+            instruction_snapshot=instruction_snapshot,
+        )
         if run.provider_reasoning_cleanup_pending:
             try:
                 self.storage.secure_checkpoint()
@@ -785,6 +868,10 @@ class AgentManager:
                 "The paused turn's reasoning effort is incompatible with the current exact "
                 f"model route. Restore a compatible model setting before resuming. {exc}"
             ) from exc
+        self.tools.bind_workspace_instruction_snapshot(
+            run.id,
+            instruction_snapshot.snapshot_sha256,
+        )
         self._controls[run_id] = _Control()
         self._spawn(run_id, resume=True)
         return run
@@ -1043,6 +1130,11 @@ class AgentManager:
             self._controls.pop(run_id, None)
 
     async def _prepare_resume(self, run: RunRecord) -> None:
+        instruction_snapshot = self._workspace_instruction_snapshot(run)
+        self.tools.bind_workspace_instruction_snapshot(
+            run.id,
+            instruction_snapshot.snapshot_sha256,
+        )
         previous = run.interrupted_from
         if run.pending_approval is not None:
             try:
@@ -1182,29 +1274,7 @@ class AgentManager:
             ]
         if run.state is not RunState.PLANNING:
             await self._transition(run, RunState.PLANNING)
-        exploration_tools = [
-            schema
-            for schema in self.tools.schemas
-            if schema["function"]["name"] in {"list_files", "read_file", "search_text"}
-        ]
-        planning_tools = [
-            *exploration_tools,
-            _model_tool(
-                "respond_to_user",
-                "Give a natural answer without claiming execution or verification.",
-                DirectResponse.model_json_schema(),
-            ),
-            _model_tool(
-                "ask_questions",
-                "Ask material clarification questions.",
-                _questions_schema(),
-            ),
-            _model_tool(
-                "submit_plan",
-                "Submit the implementation plan.",
-                TaskPlan.model_json_schema(),
-            ),
-        ]
+        planning_tools = self._planning_tools()
         non_tool_responses = 0
         for _ in range(12):
             response = await self._complete_model(run, planning_tools)
@@ -1375,14 +1445,7 @@ class AgentManager:
     async def _builder_phase(self, run: RunRecord) -> None:
         repeated_failures: dict[str, int] = {}
         no_tool_responses = 0
-        builder_tools = [
-            *self.tools.schemas,
-            _model_tool(
-                "update_plan",
-                "Update the status of one or more approved plan steps.",
-                PlanUpdateRequest.model_json_schema(),
-            ),
-        ]
+        builder_tools = self._builder_tools()
         finish_tools = [
             schema for schema in builder_tools if schema["function"]["name"] == "finish"
         ]
@@ -1700,21 +1763,21 @@ class AgentManager:
             {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
             {"role": "user", "content": boundary_safe_json_dumps(evidence)},
         ]
-        read_tools = [
-            schema
-            for schema in self.tools.schemas
-            if schema["function"]["name"] in {"list_files", "read_file", "search_text"}
-        ]
-        verifier_tools = [
-            *read_tools,
-            _model_tool(
-                "submit_verification",
-                "Submit the independent verification verdict.",
-                VerificationReport.model_json_schema(),
-            ),
-        ]
+        verifier_tools = self._verifier_tools()
         for _ in range(8):
-            prepared, _ = self.context.prepare(messages, verifier_tools)
+            decorated, protected_count, inserted = (
+                self._messages_with_workspace_instructions(run, messages)
+            )
+            prepared, compacted = self.context.prepare(
+                decorated,
+                verifier_tools,
+                protected_count=protected_count,
+            )
+            if compacted:
+                messages = self._strip_workspace_instruction_message(
+                    prepared,
+                    inserted=inserted,
+                )
             response = await self._request_model(run, prepared, verifier_tools)
             messages.append(response.as_assistant_message())
             submit_calls = [
@@ -1916,6 +1979,22 @@ class AgentManager:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> ModelResponse:
+        request_payload = {"messages": messages, "tools": tools}
+        if contains_redactable_json_secret(
+            request_payload,
+            api_key=self.settings.api_key,
+        ) or contains_redactable_serialized_json_secret(
+            request_payload,
+            api_key=self.settings.api_key,
+        ) or contains_compact_serialized_json_secret(
+            request_payload,
+            api_key=self.settings.api_key,
+        ):
+            raise ProviderError(
+                "Model request contains credential-like data and was blocked before provider "
+                "transmission",
+                category="credential_boundary",
+            )
         attempts = self.settings.model_retry_attempts
         delay = self.settings.model_retry_delay
         capability = self._reasoning_capability()
@@ -2072,9 +2151,20 @@ class AgentManager:
         )
 
     async def _complete_model(self, run: RunRecord, tools: list[dict[str, Any]]) -> ModelResponse:
-        prepared, compacted = self.context.prepare(run.messages, tools)
+        decorated, protected_count, inserted = self._messages_with_workspace_instructions(
+            run,
+            run.messages,
+        )
+        prepared, compacted = self.context.prepare(
+            decorated,
+            tools,
+            protected_count=protected_count,
+        )
         if compacted:
-            run.messages = prepared
+            run.messages = self._strip_workspace_instruction_message(
+                prepared,
+                inserted=inserted,
+            )
             self.storage.save_run(run)
             await self.broker.emit(
                 run.id,
@@ -2213,6 +2303,81 @@ class AgentManager:
             raise ValueError(
                 f"{label} contains credential-like data; remove it before {action}"
             )
+
+    def _require_safe_persisted_context(
+        self,
+        run: RunRecord,
+        *,
+        instruction_snapshot: WorkspaceInstructionSnapshot | None = None,
+    ) -> None:
+        if self._persisted_context_is_unsafe(
+            run,
+            instruction_snapshot=instruction_snapshot,
+        ):
+            recovery = (
+                "Restore the previous credential, or stop this interrupted turn before "
+                "starting a new task."
+                if run.state is RunState.INTERRUPTED
+                else "Restore the previous credential or start a new task."
+            )
+            raise InvalidRunAction(
+                "This task's stored context conflicts with the current provider credential and "
+                f"cannot be sent to the model. {recovery}"
+            )
+
+    def _persisted_context_is_unsafe(
+        self,
+        run: RunRecord,
+        *,
+        instruction_snapshot: WorkspaceInstructionSnapshot | None = None,
+    ) -> bool:
+        active_decision = self.storage.get_active_decision(run.id)
+        serialized = {
+            "run": run.model_dump(mode="json"),
+            "workspace_instruction_snapshot": (
+                instruction_snapshot.model_dump(mode="json")
+                if instruction_snapshot is not None
+                else None
+            ),
+            "events": [
+                event.model_dump(mode="json")
+                for event in self.storage.get_events(run.id)
+            ],
+            "active_decision": (
+                active_decision.model_dump(mode="json")
+                if active_decision is not None
+                else None
+            ),
+        }
+        if contains_redactable_json_secret(
+            serialized,
+            api_key=self.settings.api_key,
+        ) or contains_redactable_serialized_json_secret(
+            serialized,
+            api_key=self.settings.api_key,
+        ) or contains_compact_serialized_json_secret(
+            serialized,
+            api_key=self.settings.api_key,
+        ):
+            return True
+        if instruction_snapshot is None:
+            return False
+        for surface in self._persisted_model_request_surfaces(
+            run,
+            instruction_snapshot,
+        ):
+            if contains_redactable_json_secret(
+                surface,
+                api_key=self.settings.api_key,
+            ) or contains_redactable_serialized_json_secret(
+                surface,
+                api_key=self.settings.api_key,
+            ) or contains_compact_serialized_json_secret(
+                surface,
+                api_key=self.settings.api_key,
+            ):
+                return True
+        return False
 
     async def _await_clarification(
         self,
@@ -3074,6 +3239,210 @@ class AgentManager:
     async def _publish_persisted(self, events: list[RunEvent]) -> None:
         for event in events:
             await self.broker.publish(event)
+
+    @staticmethod
+    def _workspace_instruction_events(
+        snapshot: WorkspaceInstructionSnapshot,
+        *,
+        turn_index: int,
+    ) -> list[tuple[EventType, dict[str, Any]]]:
+        if not snapshot.sources:
+            return []
+        payload = snapshot.manifest().model_dump(mode="json")
+        payload.update(
+            {
+                "turn_index": turn_index,
+                "status": "loaded",
+                "authority": "guidance",
+                "content_private": True,
+            }
+        )
+        return [(EventType.WORKSPACE_INSTRUCTIONS_RESOLVED, payload)]
+
+    def _workspace_instruction_snapshot(
+        self,
+        run: RunRecord,
+    ) -> WorkspaceInstructionSnapshot:
+        turn_index = self._active_turn(run).index
+        try:
+            snapshot = self.storage.get_workspace_instruction_snapshot(run.id, turn_index)
+        except KeyError as exc:
+            raise InvalidRunAction(
+                "This legacy turn has no immutable workspace-instruction snapshot and "
+                "cannot be resumed safely. Stop this interrupted turn before following up, "
+                "or start a new task instead."
+            ) from exc
+        self.workspace_instructions.validate_for_model(snapshot)
+        return snapshot
+
+    def _stored_instruction_snapshot_for_recovery(
+        self,
+        run: RunRecord,
+    ) -> WorkspaceInstructionSnapshot | None:
+        if not run.turns:
+            return None
+        turn_index = max(turn.index for turn in run.turns)
+        return self.storage.try_get_workspace_instruction_snapshot(run.id, turn_index)
+
+    @staticmethod
+    def _messages_with_instruction_snapshot(
+        messages: list[dict[str, Any]],
+        snapshot: WorkspaceInstructionSnapshot,
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        context = render_workspace_instruction_context(snapshot)
+        if context is None:
+            return messages.copy(), 2, False
+        if not messages or messages[0].get("role") != "system":
+            raise RuntimeError(
+                "Workspace instructions require a leading system message"
+            )
+        return (
+            [
+                messages[0],
+                {"role": "user", "content": context},
+                *messages[1:],
+            ],
+            3,
+            True,
+        )
+
+    def _messages_with_workspace_instructions(
+        self,
+        run: RunRecord,
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int, bool]:
+        return self._messages_with_instruction_snapshot(
+            messages,
+            self._workspace_instruction_snapshot(run),
+        )
+
+    def _planning_tools(self) -> list[dict[str, Any]]:
+        exploration_tools = [
+            schema
+            for schema in self.tools.schemas
+            if schema["function"]["name"] in {"list_files", "read_file", "search_text"}
+        ]
+        return [
+            *exploration_tools,
+            _model_tool(
+                "respond_to_user",
+                "Give a natural answer without claiming execution or verification.",
+                DirectResponse.model_json_schema(),
+            ),
+            _model_tool(
+                "ask_questions",
+                "Ask material clarification questions.",
+                _questions_schema(),
+            ),
+            _model_tool(
+                "submit_plan",
+                "Submit the implementation plan.",
+                TaskPlan.model_json_schema(),
+            ),
+        ]
+
+    def _builder_tools(self) -> list[dict[str, Any]]:
+        return [
+            *self.tools.schemas,
+            _model_tool(
+                "update_plan",
+                "Update the status of one or more approved plan steps.",
+                PlanUpdateRequest.model_json_schema(),
+            ),
+        ]
+
+    def _verifier_tools(self) -> list[dict[str, Any]]:
+        read_tools = [
+            schema
+            for schema in self.tools.schemas
+            if schema["function"]["name"]
+            in {"list_files", "read_file", "search_text"}
+        ]
+        return [
+            *read_tools,
+            _model_tool(
+                "submit_verification",
+                "Submit the independent verification verdict.",
+                VerificationReport.model_json_schema(),
+            ),
+        ]
+
+    def _persisted_model_request_surfaces(
+        self,
+        run: RunRecord,
+        snapshot: WorkspaceInstructionSnapshot,
+    ) -> list[dict[str, Any]]:
+        message_variants: list[list[dict[str, Any]]] = []
+        if run.messages and run.messages[0].get("role") == "system":
+            message_variants.append(run.messages)
+        planning_messages = [
+            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": self._conversation_context(run, self._current_request(run)),
+            },
+        ]
+        if planning_messages not in message_variants:
+            message_variants.append(planning_messages)
+        if run.plan is not None:
+            builder_messages = self._builder_messages(run, run.plan)
+            if builder_messages not in message_variants:
+                message_variants.append(builder_messages)
+
+        tool_variants = [
+            self._planning_tools(),
+            self._builder_tools(),
+            self._verifier_tools(),
+        ]
+        builder_finish_tools = [
+            schema
+            for schema in tool_variants[1]
+            if schema["function"]["name"] == "finish"
+        ]
+        if builder_finish_tools:
+            tool_variants.append(builder_finish_tools)
+
+        surfaces: list[dict[str, Any]] = []
+        for messages in message_variants:
+            decorated, _protected_count, _inserted = (
+                self._messages_with_instruction_snapshot(messages, snapshot)
+            )
+            surfaces.extend(
+                {"messages": decorated, "tools": tools}
+                for tools in tool_variants
+            )
+        return surfaces
+
+    def _validate_initial_model_context(
+        self,
+        request: str,
+        snapshot: WorkspaceInstructionSnapshot,
+    ) -> None:
+        if not snapshot.sources:
+            return
+        guidance = render_workspace_instruction_context(snapshot)
+        assert guidance is not None
+        self.context.prepare(
+            [
+                {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+                {"role": "user", "content": guidance},
+                {"role": "user", "content": f"Current request:\n{request}"},
+            ],
+            self._planning_tools(),
+            protected_count=3,
+        )
+
+    @staticmethod
+    def _strip_workspace_instruction_message(
+        messages: list[dict[str, Any]],
+        *,
+        inserted: bool,
+    ) -> list[dict[str, Any]]:
+        if not inserted:
+            return messages.copy()
+        if len(messages) < 2:
+            raise RuntimeError("Compacted workspace instruction context is incomplete")
+        return [messages[0], *messages[2:]]
 
     def _decision_or_reject(self, run_id: str, request_id: str) -> DecisionRequest:
         try:

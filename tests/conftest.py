@@ -18,7 +18,7 @@ def settings(tmp_path: Path) -> Settings:
     return Settings(
         workspace=workspace,
         data_dir=data_dir,
-        api_key="test-key",
+        api_key="test-provider-key-123456",
         base_url="http://model.test/v1",
         model="test-model",
     )
@@ -34,4 +34,3 @@ def storage(settings: Settings) -> Storage:
 @pytest.fixture
 def workspace(settings: Settings, storage: Storage) -> Workspace:
     return Workspace(settings.workspace, storage)
-

@@ -696,6 +696,75 @@ def test_atomic_terminal_turn_rolls_back_state_turn_and_events_together(
     assert storage.get_events(run.id) == before_events
 
 
+def test_credential_conflict_cancel_rolls_back_run_decision_and_events_together(
+    storage: Storage,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approval = ApprovalRequest(
+        id="credential-conflict-approval",
+        tool_call=ToolCall(
+            id="credential-conflict-call",
+            name="run_command",
+            arguments={"argv": ["python", "app.py"]},
+        ),
+        summary="Run the planned check",
+        reason="Manual approval is required",
+        risk="elevated",
+        approval_mode=ApprovalMode.MANUAL,
+        policy_decision="ask",
+    )
+    run = RunRecord(
+        id="atomic-credential-conflict",
+        task="Cancel an unsafe persisted context",
+        workspace=str(settings.workspace),
+        state=RunState.EXECUTING,
+        turns=[ConversationTurn(index=1, request="Cancel safely")],
+        pending_approval=approval,
+        messages=[{"role": "assistant", "content": "private replay"}],
+    )
+    storage.create_run(run)
+    run.state = RunState.AWAITING_ACTION_APPROVAL
+    storage.open_decision(
+        run,
+        previous_state=RunState.EXECUTING,
+        request_id=approval.id,
+        kind=DecisionKind.ACTION,
+        turn_index=1,
+        subject=approval.model_dump(mode="json"),
+        requested_event_type=EventType.APPROVAL_REQUESTED,
+        requested_payload=approval.model_dump(mode="json"),
+    )
+    storage.accept_decision(
+        run.id,
+        approval.id,
+        DecisionKind.ACTION,
+        {"approved": True},
+    )
+    interrupted = storage.get_run(run.id)
+    interrupted.state = RunState.INTERRUPTED
+    interrupted.interrupted_from = RunState.AWAITING_ACTION_APPROVAL
+    storage.save_run(interrupted)
+    events_before = storage.get_events(run.id)
+    original_insert = storage._insert_event_locked
+
+    def fail_terminal_event(event: RunEvent) -> None:
+        original_insert(event)
+        if event.type is EventType.TURN_COMPLETED:
+            raise RuntimeError("credential-conflict terminal event failed")
+
+    monkeypatch.setattr(storage, "_insert_event_locked", fail_terminal_event)
+    with pytest.raises(RuntimeError, match="credential-conflict terminal event failed"):
+        storage.commit_credential_conflict_cancellation(run.id)
+
+    unchanged = storage.get_run(run.id)
+    assert unchanged.state is RunState.INTERRUPTED
+    assert unchanged.pending_approval == approval
+    assert unchanged.messages == [{"role": "assistant", "content": "private replay"}]
+    assert storage.get_decision(run.id, approval.id).status is DecisionStatus.ACCEPTED
+    assert storage.get_events(run.id) == events_before
+
+
 def test_interruption_closes_stream_updates_run_and_emits_events_atomically(
     storage: Storage,
     settings: Settings,
@@ -1268,6 +1337,84 @@ def test_upgrade_abandons_pre_boundary_active_action_decisions(tmp_path: Path) -
             "kind": DecisionKind.ACTION.value,
             "cause": "credential_boundary_upgrade",
         }
+    finally:
+        migrated.close()
+
+
+def test_workspace_instruction_migration_abandons_every_legacy_decision_kind(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-workspace-instructions.db"
+    repository = Storage(database)
+    cases = [
+        (
+            "legacy-clarification",
+            DecisionKind.CLARIFICATION,
+            RunState.AWAITING_CLARIFICATION,
+            EventType.CLARIFICATION_REQUESTED,
+            False,
+        ),
+        (
+            "legacy-plan",
+            DecisionKind.PLAN,
+            RunState.AWAITING_PLAN_APPROVAL,
+            EventType.PLAN_UPDATED,
+            True,
+        ),
+        (
+            "legacy-workspace-action",
+            DecisionKind.ACTION,
+            RunState.AWAITING_ACTION_APPROVAL,
+            EventType.APPROVAL_REQUESTED,
+            True,
+        ),
+    ]
+    for run_id, kind, waiting_state, event_type, accepted in cases:
+        run = RunRecord(
+            id=run_id,
+            task="Legacy decision",
+            workspace=str(tmp_path),
+            state=RunState.PLANNING,
+            messages=[{"role": "user", "content": "legacy protocol state"}],
+        )
+        repository.create_run(run)
+        run.state = waiting_state
+        repository.open_decision(
+            run,
+            previous_state=RunState.PLANNING,
+            request_id=f"{run_id}-request",
+            kind=kind,
+            turn_index=1,
+            subject={"kind": kind.value},
+            requested_event_type=event_type,
+            requested_payload={"kind": kind.value},
+        )
+        if accepted:
+            repository.accept_decision(
+                run_id,
+                f"{run_id}-request",
+                kind,
+                {"accepted": True},
+            )
+    with sqlite3.connect(database) as legacy_writer:
+        legacy_writer.execute(
+            "DELETE FROM schema_migrations WHERE name = 'workspace-instructions-v1'"
+        )
+    repository.close()
+
+    migrated = Storage(database)
+    try:
+        for run_id, kind, _waiting_state, _event_type, _accepted in cases:
+            request_id = f"{run_id}-request"
+            assert migrated.get_active_decision(run_id) is None
+            assert migrated.get_decision(run_id, request_id).status is (
+                DecisionStatus.ABANDONED
+            )
+            assert migrated.get_run(run_id).messages == []
+            assert migrated.get_events(run_id)[-1].payload == {
+                "kind": kind.value,
+                "cause": "workspace_instruction_upgrade",
+            }
     finally:
         migrated.close()
 

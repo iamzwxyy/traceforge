@@ -6,11 +6,24 @@ from pathlib import Path
 import pytest
 
 from traceforge.config import Settings
-from traceforge.models import RunRecord, ToolCall
+from traceforge.models import RunRecord, ToolCall, WorkspaceInstructionSnapshot
 from traceforge.sandbox import CommandSandbox, SandboxStatus
 from traceforge.storage import Storage
 from traceforge.tools import ToolRegistry
 from traceforge.workspace import Workspace
+
+
+def _persisted_registry(
+    storage: Storage,
+    workspace: Workspace,
+    settings: Settings,
+    run: RunRecord,
+) -> ToolRegistry:
+    snapshot = WorkspaceInstructionSnapshot.empty()
+    storage.create_run(run, instruction_snapshot=snapshot)
+    registry = ToolRegistry(workspace, settings)
+    registry.bind_workspace_instruction_snapshot(run.id, snapshot.snapshot_sha256)
+    return registry
 
 
 def test_seatbelt_launch_is_parameterized_and_fail_closed(tmp_path: Path) -> None:
@@ -88,10 +101,14 @@ def test_bubblewrap_launch_is_namespaced_and_keeps_git_read_only(tmp_path: Path)
 async def test_enforced_sandbox_allows_workspace_write_and_blocks_escape(
     settings: Settings, storage: Storage, workspace: Workspace
 ) -> None:
-    registry = ToolRegistry(workspace, settings)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="sandbox-run", task="Probe", workspace=str(workspace.root)),
+    )
     if not registry.sandbox_status.enforced:
         pytest.skip(registry.sandbox_status.detail)
-    storage.create_run(RunRecord(id="sandbox-run", task="Probe", workspace=str(workspace.root)))
     outside = workspace.root.parent / "sandbox-escape.txt"
     outside.unlink(missing_ok=True)
 
@@ -139,10 +156,14 @@ async def test_enforced_sandbox_blocks_secret_file_contents(
     secret = workspace.root / ".env"
     secret.write_text("TRACEFORGE_SANDBOX_SECRET=never-readable\n")
     configured = replace(settings, credential_file=secret)
-    registry = ToolRegistry(workspace, configured)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        configured,
+        RunRecord(id="secret-run", task="Probe", workspace=str(workspace.root)),
+    )
     if not registry.sandbox_status.enforced:
         pytest.skip(registry.sandbox_status.detail)
-    storage.create_run(RunRecord(id="secret-run", task="Probe", workspace=str(workspace.root)))
 
     result = await registry.execute(
         "secret-run",
@@ -168,8 +189,12 @@ async def test_enforced_sandbox_blocks_secret_file_contents(
 async def test_explicit_sandbox_bypass_is_visible_and_one_shot(
     settings: Settings, storage: Storage, workspace: Workspace
 ) -> None:
-    registry = ToolRegistry(workspace, settings)
-    storage.create_run(RunRecord(id="bypass-run", task="Probe", workspace=str(workspace.root)))
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="bypass-run", task="Probe", workspace=str(workspace.root)),
+    )
     outside = workspace.root.parent / "approved-bypass.txt"
     outside.unlink(missing_ok=True)
 
