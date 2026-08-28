@@ -20,6 +20,7 @@ class RunState(StrEnum):
     EXECUTING = "executing"
     AWAITING_ACTION_APPROVAL = "awaiting_action_approval"
     VERIFYING = "verifying"
+    ANSWERED = "answered"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -29,6 +30,7 @@ class RunState(StrEnum):
     @property
     def terminal(self) -> bool:
         return self in {
+            self.ANSWERED,
             self.SUCCEEDED,
             self.FAILED,
             self.CANCELLED,
@@ -111,6 +113,12 @@ class ClarificationRequest(BaseModel):
 
     questions: list[ClarificationQuestion] = Field(min_length=1, max_length=3)
     round: int = Field(default=1, ge=1, le=2)
+
+
+class DirectResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1, max_length=20_000)
 
 
 class ClarificationAnswer(BaseModel):
@@ -272,8 +280,10 @@ class ConversationTurn(BaseModel):
     index: int = Field(ge=1)
     request: str = Field(min_length=1, max_length=20_000)
     mode: InteractionMode = InteractionMode.AGENT
-    outcome: Literal["in_progress", "succeeded", "failed", "cancelled"] = "in_progress"
-    summary: str = Field(default="", max_length=4_000)
+    outcome: Literal["in_progress", "answered", "succeeded", "failed", "cancelled"] = (
+        "in_progress"
+    )
+    summary: str = Field(default="", max_length=20_000)
     started_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
 

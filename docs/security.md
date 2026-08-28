@@ -28,10 +28,12 @@ files. This reduces accidental disclosure to the model but is not a general secr
 
 Plan mode is an interaction choice, not a permission level. In the default Agent mode, the model
 still submits a structured plan before mutation, but the application records its risk assessment
-and proceeds without a plan-approval click. In Plan mode, every valid plan pauses for human review,
-even when it names one routine file. The canonical Markdown document and policy reasons remain
-visible in both modes. Selecting Agent mode cannot turn a denied command into an allowed command or
-expand the workspace boundary.
+and proceeds without a plan-approval click. In Plan mode, every valid executable plan pauses for
+human review, even when it names one routine file. Conversational and explicitly read-only requests
+can instead end in the distinct `answered` state in either mode; that state cannot claim completion
+evidence or expose a Proof Pack. The canonical Markdown document and policy reasons remain visible
+for executable work in both modes. Selecting Agent mode cannot turn a denied command into an
+allowed command or expand the workspace boundary.
 
 After planning, each `create_file` and every file in an `apply_patch` is compared with the declared
 scope. An unexpected path pauses for a one-time action decision before any bytes are written. This

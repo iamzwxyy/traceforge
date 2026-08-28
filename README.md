@@ -13,11 +13,12 @@ Its differentiator is a defensible engineering loop with useful human control.
 
 ## Why it stands out
 
-- **Material clarification, not guesswork.** Complex requests can pause for one to three
-  questions, each with mutually exclusive options and a recommended choice.
-- **Agent by default, Plan when requested.** Normal tasks inspect, plan internally, implement, and
-  verify without a plan-approval ceremony. Plan mode is an explicit composer toggle that always
-  pauses on a complete downloadable Markdown plan before implementation.
+- **Natural answers before workflow.** Greetings, capability questions, general explanations, and
+  explicit read-only analysis end as an honest answer with no fabricated plan or proof. A
+  clarification card appears only after executable intent is clear and a material choice remains.
+- **Agent by default, Plan when requested.** Executable tasks inspect, plan internally, implement,
+  and verify without a plan-approval ceremony. Plan mode is an explicit composer toggle that
+  pauses on a complete downloadable Markdown plan whenever implementation is actually needed.
 - **Permission boundaries remain independent.** Routine work inside the workspace proceeds; an
   undeclared file, unknown command, or dangerous operation still asks or is denied regardless of
   whether Plan mode is enabled.
@@ -104,7 +105,8 @@ creates a unique task directory beneath the visible default root. Click **添加
 reusable project root in the application, then use the plus button beside that folder for
 project-scoped tasks. Direct runs stay at the top level. After a
 turn finishes, use the bottom composer to continue in the same task; each follow-up can choose its
-own Agent or Plan mode.
+own Agent or Plan mode. In either mode, conversational or read-only requests can answer directly;
+the UI labels that terminal state separately from evidence-backed completion.
 
 Environment variables remain available as a non-persisted fallback:
 
@@ -125,6 +127,7 @@ complete a native function call, so a successful HTTP response alone is not trea
 ```mermaid
 flowchart LR
     A[Task] --> B[Inspect and clarify]
+    B -->|conversation or read-only| J[Direct answer, no completion claim]
     B --> C[Complete Markdown plan]
     C -->|Agent mode| D[Builder and native tools]
     C -->|Plan mode| H[Human plan review]
@@ -134,6 +137,7 @@ flowchart LR
     F -->|pass| G[Evidence board + Proof Pack]
     F -->|findings, max 2| D
     G -->|follow-up| B
+    J -->|follow-up| B
     D -. snapshots .-> I[Conflict-aware rollback]
 ```
 

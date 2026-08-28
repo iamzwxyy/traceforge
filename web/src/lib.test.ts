@@ -41,6 +41,7 @@ describe("mission control helpers", () => {
 
   it("presents evidence-backed success distinctly", () => {
     expect(presentState("succeeded")).toEqual({ label: "已证实", tone: "success" });
+    expect(presentState("answered")).toEqual({ label: "已答复", tone: "success" });
   });
 
   it("submits prompts on Enter while preserving Shift+Enter and IME composition", () => {

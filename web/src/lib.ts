@@ -13,6 +13,7 @@ const states: Record<RunState, StatePresentation> = {
   executing: { label: "正在执行", tone: "active" },
   awaiting_action_approval: { label: "动作审批", tone: "waiting" },
   verifying: { label: "正在验证", tone: "active" },
+  answered: { label: "已答复", tone: "success" },
   succeeded: { label: "已证实", tone: "success" },
   failed: { label: "失败", tone: "danger" },
   cancelled: { label: "已停止", tone: "danger" },
@@ -51,7 +52,9 @@ export function parseDiff(diff: string): DiffLine[] {
 }
 
 export function isActiveState(state: RunState): boolean {
-  return !["succeeded", "failed", "cancelled", "interrupted", "rolled_back"].includes(state);
+  return ![
+    "answered", "succeeded", "failed", "cancelled", "interrupted", "rolled_back",
+  ].includes(state);
 }
 
 export function shouldSubmitPrompt(event: {

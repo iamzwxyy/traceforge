@@ -6,6 +6,7 @@ export type RunState =
   | "executing"
   | "awaiting_action_approval"
   | "verifying"
+  | "answered"
   | "succeeded"
   | "failed"
   | "cancelled"
@@ -121,7 +122,7 @@ export interface ConversationTurn {
   index: number;
   request: string;
   mode: InteractionMode;
-  outcome: "in_progress" | "succeeded" | "failed" | "cancelled";
+  outcome: "in_progress" | "answered" | "succeeded" | "failed" | "cancelled";
   summary: string;
   started_at: string;
   completed_at: string | null;

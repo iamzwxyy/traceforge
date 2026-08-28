@@ -48,6 +48,7 @@ flowchart TB
 stateDiagram-v2
     [*] --> created
     created --> planning
+    planning --> answered: conversation or read-only answer
     planning --> awaiting_clarification
     awaiting_clarification --> planning
     planning --> awaiting_plan_approval: Plan mode
@@ -60,6 +61,7 @@ stateDiagram-v2
     verifying --> executing: findings and repair budget
     verifying --> succeeded: pass
     verifying --> failed: repair limit
+    answered --> created: follow-up turn
     succeeded --> created: follow-up turn
     failed --> created: follow-up turn
     cancelled --> created: follow-up turn
@@ -84,14 +86,20 @@ changing state. A process shutdown records the previous phase and never automati
 incomplete tool call. On resume, any unmatched assistant tool call receives a synthetic failure
 result before the model is called again, preserving the provider protocol.
 
-## Clarify, plan, build, verify
+## Answer, clarify, plan, build, verify
 
 ### Planning
 
-The planner can only list, read, and search. Material ambiguity is represented as structured
-questions: at most three per round, two to four options per question, and at most two rounds. A
-validated `TaskPlan` contains steps, an explicit relative file scope, acceptance checks, optional
-argv commands, and risks.
+The planning role can list, read, and search, then must choose one structured terminal action.
+`respond_to_user` ends greetings, general questions, explicit read-only analysis, or a remaining
+blocker as `answered`, without a plan, verifier verdict, or Proof Pack. `ask_questions` is reserved
+for a known implementation request whose material choice cannot be discovered: at most three
+questions per round, two to four options per question, and at most two rounds. `submit_plan` begins
+executable work only when enough context exists. Terminal actions cannot be mixed with reads or
+with each other in one model response.
+
+A validated `TaskPlan` contains steps, an explicit relative file scope, acceptance checks,
+optional argv commands, and risks.
 
 Malformed structured clarification or plan calls are returned as failed tool results with
 field-level schema errors that omit invalid input values. They remain auditable and can be corrected
@@ -164,14 +172,16 @@ against a local user deliberately rewriting both SQLite and the artifact.
 
 ## Context management
 
-TraceForge estimates tokens deterministically from serialized UTF-8 bytes. At 70% of the configured
-window, and only when history is long enough, it retains the first two messages, the newest twelve,
-and inserts an evidence-oriented summary of the middle. Tool names and bounded results are kept;
-hidden reasoning is neither requested nor displayed.
+TraceForge resolves a context window for each route using a validated user override, an exact
+official-endpoint/model catalog entry, or a conservative fallback, and snapshots that value on the
+run. It estimates tokens deterministically from serialized UTF-8 bytes, including the current tool
+schemas. At 80% pressure it retains the first two messages, selects a recent tail within 16% of the
+window, and inserts a bounded evidence-oriented summary of the middle. Assistant tool calls remain
+paired with their following tool results; hidden reasoning is neither requested nor displayed.
 
 A run is also a durable conversation. `ConversationTurn` records the request, selected Agent/Plan
-mode, outcome, completion summary, and timestamps. A terminal successful, failed, or cancelled run
-can transition back to `created` for a follow-up. The next planner receives the last six completed
+mode, outcome, completion summary, and timestamps. A terminal answered, successful, failed, or
+cancelled run can transition back to `created` for a follow-up. The next planner receives the last six completed
 turn requests and summaries while keeping the same run id, project, workspace snapshots, event
 ledger, and rollback boundary. Model protocol messages reset per turn so stale tool-call state is
 not mixed into a new request.

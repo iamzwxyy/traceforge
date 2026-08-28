@@ -54,12 +54,17 @@ SCENARIOS = (
     ),
     Scenario(
         id="human-control",
-        title="Mode-aware human control",
+        title="Mode-aware intent and human control",
         claim=(
-            "Agent mode proceeds without a plan pause, Plan mode waits for review, and scope "
-            "drift or unknown execution still requires a decision."
+            "Conversation answers without a false workflow; executable Agent work proceeds "
+            "without a plan pause, Plan mode waits for review, and scope drift or unknown "
+            "execution still requires a decision."
         ),
         tests=(
+            (
+                "tests/test_agent.py::"
+                "test_conversational_request_is_answered_without_false_workflow"
+            ),
             (
                 "tests/test_agent.py::"
                 "test_agent_mode_continues_without_plan_approval_but_stays_visible"

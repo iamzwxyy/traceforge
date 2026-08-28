@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -18,6 +18,7 @@ from traceforge.models import (
     ClarificationAnswer,
     ClarificationRequest,
     ConversationTurn,
+    DirectResponse,
     EventType,
     InteractionMode,
     PlanGate,
@@ -84,6 +85,7 @@ _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
     RunState.PLANNING: {
         RunState.AWAITING_CLARIFICATION,
         RunState.AWAITING_PLAN_APPROVAL,
+        RunState.ANSWERED,
         RunState.EXECUTING,
         RunState.CANCELLED,
         RunState.FAILED,
@@ -128,6 +130,7 @@ _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
         RunState.CANCELLED,
         RunState.ROLLED_BACK,
     },
+    RunState.ANSWERED: {RunState.CREATED},
     RunState.SUCCEEDED: {RunState.CREATED, RunState.ROLLED_BACK},
     RunState.FAILED: {RunState.CREATED, RunState.ROLLED_BACK},
     RunState.CANCELLED: {RunState.CREATED, RunState.ROLLED_BACK},
@@ -201,7 +204,12 @@ class AgentManager:
         if not clean_prompt:
             raise ValueError("Follow-up prompt must not be empty")
         run = self.storage.get_run(run_id)
-        if run.state not in {RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED}:
+        if run.state not in {
+            RunState.ANSWERED,
+            RunState.SUCCEEDED,
+            RunState.FAILED,
+            RunState.CANCELLED,
+        }:
             raise InvalidRunAction("Follow-up is available after the current turn stops")
         if self.storage.has_active_run(self.settings.workspace):
             raise RunConflictError("This workspace already has an active or interrupted run")
@@ -299,6 +307,8 @@ class AgentManager:
 
     async def rollback(self, run_id: str) -> RollbackResult:
         run = self.storage.get_run(run_id)
+        if run.state is RunState.ANSWERED:
+            raise InvalidRunAction("Answer-only turns have no file changes to roll back")
         if not run.state.terminal and run.state is not RunState.INTERRUPTED:
             raise InvalidRunAction("Cancel the active run before rolling it back")
         result = self.workspace.rollback(run_id)
@@ -511,6 +521,11 @@ class AgentManager:
         planning_tools = [
             *exploration_tools,
             _model_tool(
+                "respond_to_user",
+                "Give a natural answer without claiming execution or verification.",
+                DirectResponse.model_json_schema(),
+            ),
+            _model_tool(
                 "ask_questions", "Ask material clarification questions.", _questions_schema()
             ),
             _model_tool(
@@ -520,22 +535,45 @@ class AgentManager:
         non_tool_responses = 0
         for _ in range(12):
             response = await self._complete_model(run, planning_tools)
-            run.messages.append(response.as_assistant_message())
+            terminal_calls = [
+                call
+                for call in response.tool_calls
+                if call.name in {"respond_to_user", "ask_questions", "submit_plan"}
+            ]
+            run.messages.append(self._assistant_message_for_storage(response))
             self.storage.save_run(run)
-            if response.content:
+            if response.content and not any(
+                call.name == "respond_to_user" for call in terminal_calls
+            ):
                 await self._emit_message(run, response.content, phase="planning")
             if not response.tool_calls:
                 non_tool_responses += 1
                 if non_tool_responses >= 2:
-                    raise RuntimeError("Planner did not submit a plan or clarification request")
+                    raise RuntimeError(
+                        "Planner did not submit a plan, clarification request, or direct response"
+                    )
                 run.messages.append(
                     {
                         "role": "user",
                         "content": (
-                            "Use ask_questions or submit_plan now; do not answer in prose only."
+                            "Use respond_to_user, ask_questions, or submit_plan now; do not "
+                            "answer in prose only."
                         ),
                     }
                 )
+                continue
+            if terminal_calls and (
+                len(terminal_calls) != 1 or len(response.tool_calls) != 1
+            ):
+                error = (
+                    "A terminal planning action must be called exactly once and alone. "
+                    "Review any read results first, then choose respond_to_user, ask_questions, "
+                    "or submit_plan in a new turn."
+                )
+                for call in response.tool_calls:
+                    self._append_tool_error(run, call, error)
+                run.messages.append({"role": "user", "content": error})
+                self.storage.save_run(run)
                 continue
             for call in response.tool_calls:
                 if call.name in {"list_files", "read_file", "search_text"}:
@@ -543,13 +581,41 @@ class AgentManager:
                     self._append_tool_result(run, result)
                     await self._emit_tool_result(run, call, result)
                     continue
+                if call.name == "respond_to_user":
+                    try:
+                        direct_response = DirectResponse.model_validate(call.arguments)
+                    except ValidationError as exc:
+                        await self._reject_invalid_planning_call(
+                            run,
+                            call,
+                            label="direct response",
+                            error=exc,
+                        )
+                        continue
+                    content = self._redact(direct_response.content)
+                    self._append_tool_result(
+                        run,
+                        ToolResult(
+                            tool_call_id=call.id,
+                            name=call.name,
+                            ok=True,
+                            output=(
+                                "Response accepted. No file mutation, command execution, or "
+                                "completion verification occurred."
+                            ),
+                        ),
+                    )
+                    self.storage.save_run(run)
+                    await self._complete_answer(run, content)
+                    return
                 if call.name == "ask_questions":
                     round_number = self._clarification_round(run.id) + 1
                     if round_number > 2:
                         self._append_tool_error(
                             run,
                             call,
-                            "At most two clarification rounds are allowed. Submit a plan.",
+                            "At most two clarification rounds are allowed. Submit a justified "
+                            "plan or use respond_to_user to explain the remaining blocker.",
                         )
                         continue
                     try:
@@ -645,7 +711,7 @@ class AgentManager:
         ]
         while run.step_count < self.settings.max_steps:
             response = await self._complete_model(run, builder_tools)
-            run.messages.append(response.as_assistant_message())
+            run.messages.append(self._assistant_message_for_storage(response))
             if response.content:
                 await self._emit_message(run, response.content, phase="building")
             if not response.tool_calls:
@@ -955,6 +1021,15 @@ class AgentManager:
             },
         )
 
+    async def _complete_answer(self, run: RunRecord, content: str) -> None:
+        await self._transition(run, RunState.ANSWERED)
+        await self._close_turn(run, "answered", content)
+        await self.broker.emit(
+            run.id,
+            EventType.RUN_COMPLETED,
+            {"state": RunState.ANSWERED.value},
+        )
+
     async def _fail(self, run: RunRecord, error: str) -> None:
         run.error = error
         self.storage.save_run(run)
@@ -1187,6 +1262,10 @@ class AgentManager:
             }
         )
 
+    def _assistant_message_for_storage(self, response: ModelResponse) -> dict[str, Any]:
+        serialized = json.dumps(response.as_assistant_message(), ensure_ascii=False)
+        return cast(dict[str, Any], json.loads(self._redact(serialized)))
+
     def _event_for_model(self, event: RunEvent) -> dict[str, Any]:
         payload = event.model_dump(mode="json")
         result = payload.get("payload", {}).get("result")
@@ -1363,14 +1442,15 @@ class AgentManager:
     async def _close_turn(
         self,
         run: RunRecord,
-        outcome: Literal["succeeded", "failed", "cancelled"],
+        outcome: Literal["answered", "succeeded", "failed", "cancelled"],
         summary: str,
     ) -> None:
         turn = self._active_turn(run)
         if turn.outcome != "in_progress":
             return
         turn.outcome = outcome
-        turn.summary = self._redact(summary)[:4_000]
+        limit = 20_000 if outcome == "answered" else 4_000
+        turn.summary = self._redact(summary)[:limit]
         turn.completed_at = utc_now()
         self.storage.save_run(run)
         await self.broker.emit(

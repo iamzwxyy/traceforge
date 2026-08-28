@@ -40,6 +40,46 @@ def _plan_response() -> ModelResponse:
     )
 
 
+def _answer_response(content: str) -> ModelResponse:
+    return ModelResponse(
+        tool_calls=[
+            ToolCall(
+                id="answer",
+                name="respond_to_user",
+                arguments={"content": content},
+            )
+        ]
+    )
+
+
+def test_api_represents_direct_answer_without_completion_evidence(
+    settings: Settings,
+) -> None:
+    app = create_app(settings, provider=ScriptedProvider([_answer_response("你好!")]))
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={
+                "task": "你好",
+                "mode": "agent",
+                "create_direct_workspace": True,
+            },
+        )
+        assert created.status_code == 201
+        answered = _wait_for_state(client, created.json()["id"], "answered")
+
+        assert answered["plan"] is None
+        assert answered["clarification"] is None
+        assert answered["verification"] is None
+        assert answered["turns"][-1]["outcome"] == "answered"
+        assert answered["turns"][-1]["summary"] == "你好!"
+        assert client.get(f"/api/runs/{answered['id']}/diff").json() == {"diff": ""}
+        assert client.get(f"/api/runs/{answered['id']}/proof-pack").status_code == 409
+        assert client.get(f"/api/runs/{answered['id']}/proof-pack.md").status_code == 409
+        assert client.post(f"/api/runs/{answered['id']}/rollback").status_code == 409
+
+
 def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
     provider = ScriptedProvider(
         [

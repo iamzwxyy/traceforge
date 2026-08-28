@@ -414,7 +414,13 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     @app.get("/api/runs/{run_id}/proof-pack", response_model=ProofPack)
     async def get_proof_pack(run_id: str) -> ProofPack:
-        return build_proof_pack(storage.get_run(run_id), storage)
+        run = storage.get_run(run_id)
+        if run.state is RunState.ANSWERED:
+            raise HTTPException(
+                status_code=409,
+                detail="Answer-only turns have no completion Proof Pack",
+            )
+        return build_proof_pack(run, storage)
 
     @app.get("/api/runs/{run_id}/plan.md", response_class=PlainTextResponse)
     async def download_plan(run_id: str) -> PlainTextResponse:
@@ -433,7 +439,13 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     @app.get("/api/runs/{run_id}/proof-pack.md", response_class=PlainTextResponse)
     async def download_proof_pack(run_id: str) -> PlainTextResponse:
-        pack = build_proof_pack(storage.get_run(run_id), storage)
+        run = storage.get_run(run_id)
+        if run.state is RunState.ANSWERED:
+            raise HTTPException(
+                status_code=409,
+                detail="Answer-only turns have no completion Proof Pack",
+            )
+        pack = build_proof_pack(run, storage)
         return PlainTextResponse(
             proof_pack_markdown(pack),
             media_type="text/markdown; charset=utf-8",

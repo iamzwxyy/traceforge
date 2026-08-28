@@ -604,14 +604,14 @@ function TaskComposer({
   return (
     <div className="composer-wrap">
       <div className="hero-symbol"><Code2 size={30} /></div>
-      <p className="eyebrow">{targetLabel} · 新建证据任务</p>
-      <h1>{project ? `你希望在 ${project.name} 中完成什么？` : "你希望 TraceForge 完成并证明什么？"}</h1>
+      <p className="eyebrow">{targetLabel} · 新建对话</p>
+      <h1>{project ? `你想在 ${project.name} 中处理什么？` : "你想让 TraceForge 帮你做什么？"}</h1>
       <p className="hero-copy">
         {project
           ? `任务会在 ${project.root} 中执行，并归入这个项目。`
           : demoMode
             ? "这是可重复的固定导览，只接受下方预置案例；真实任务请运行 traceforge。"
-            : "只需描述结果。TraceForge 会在默认路径下自动创建独立目录，并用证据证明完成情况。"}
+            : "可以直接提问，也可以描述要实现的结果；需要实施时，TraceForge 会在独立目录中工作并提供完成证据。"}
       </p>
       <form
         className="task-composer"
@@ -665,7 +665,7 @@ function TaskComposer({
               event.currentTarget.form?.requestSubmit();
             }
           }}
-          placeholder="例如：修复多租户缓存串读，保持 TTL 语义，补充回归测试并确保全部检查通过。"
+          placeholder="例如：解释这个项目的结构；或修复多租户缓存串读，补充回归测试并确保检查通过。"
           rows={6}
         />
         <div className="composer-actions">
@@ -686,7 +686,7 @@ function TaskComposer({
               disabled={!task.trim() || !providerReady || submitting}
             >
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={16} />}
-              开始任务
+              发送
             </button>
           </div>
         </div>
@@ -1074,9 +1074,14 @@ function RunStage({
             请使用“回滚”处理本次运行记录的快照。
           </Notice>
         )}
+        {run.state === "answered" && (
+          <Notice icon={<MessageSquareMore size={18} />} title="本轮已直接答复">
+            本轮没有修改文件、运行命令或生成完成证明；需要继续分析或开始实施时，直接在下方输入即可。
+          </Notice>
+        )}
         {run.error && <Notice icon={<OctagonX size={18} />} title={run.state === "interrupted" ? "暂停原因" : "停止原因"} danger={run.state !== "interrupted"}>{systemMessageLabel(run.error)}</Notice>}
         {run.state === "succeeded" && <EvidenceBoard run={run} onProof={onProof} />}
-        {followUpEnabled && ["succeeded", "failed", "cancelled"].includes(run.state) && (
+        {followUpEnabled && ["answered", "succeeded", "failed", "cancelled"].includes(run.state) && (
           <FollowUpComposer onSubmit={onFollowUp} />
         )}
       </div>
@@ -1369,7 +1374,7 @@ function FollowUpComposer({ onSubmit }: { onSubmit: (prompt: string, mode: Inter
             event.currentTarget.form?.requestSubmit();
           }
         }}
-        placeholder="继续提出修改，TraceForge 会保留同一任务的上下文与证据…"
+        placeholder="继续提问或提出修改，TraceForge 会保留同一任务的上下文与证据…"
         rows={3}
         aria-label="继续此任务"
       />
@@ -1449,6 +1454,7 @@ function DiffView({ diff }: { diff: string }) {
 }
 
 function ChecksView({ run }: { run: Run }) {
+  if (run.state === "answered") return <div className="inspector-empty"><ClipboardCheck size={26} /><p>本轮是直接答复，不需要实施计划或验收检查。</p></div>;
   if (!run.plan) return <div className="inspector-empty"><ClipboardCheck size={26} /><p>规划完成后会显示检查项。</p></div>;
   return <div className="checks-view">{run.plan_gate && <PlanGateSummary gate={run.plan_gate} />}<div className="section-heading"><div className="section-kicker">Markdown 计划</div><a href={`/api/runs/${run.id}/plan.md`} download title="下载计划"><Download size={13} /> 下载</a></div><div className="plan-document compact"><ReactMarkdown>{run.plan.markdown}</ReactMarkdown></div><div className="section-kicker contract-kicker">实时验收证据</div>{run.plan.acceptance_checks.map((check) => <article className={`check-row ${check.status}`} key={check.id}><div className="check-icon">{check.status === "passed" ? <Check size={14} /> : check.status === "failed" ? <X size={14} /> : <Circle size={10} />}</div><div><strong>{check.label}</strong>{check.command && <code>{check.command.join(" ")}</code>}{check.evidence && <pre>{check.evidence}</pre>}</div><span>{checkStatusLabel(check.status)}</span></article>)}</div>;
 }
@@ -1489,6 +1495,7 @@ function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; run
 
 function VerifierView({ run }: { run: Run }) {
   const report = run.verification;
+  if (run.state === "answered") return <div className="inspector-empty"><ShieldCheck size={26} /><p>本轮没有执行修改，因此不生成完成后复核结论或证据包。</p></div>;
   if (!report) return <div className="inspector-empty"><ShieldCheck size={26} /><p>{run.verifier_enabled ? "实现和检查完成后，将自动进行独立只读复核。" : "本次运行未启用完成后复核。"}</p></div>;
   return <div className="verifier-view"><div className={`verdict ${report.verdict}`}><ShieldCheck size={22} /><div><span>完成后复核</span><strong>{verdictLabel(report.verdict)}</strong></div></div><p>{report.summary}</p>{report.findings.map((finding) => <article className="finding" key={`${finding.severity}-${finding.title}`}><span>{severityLabel(finding.severity)}</span><strong>{finding.title}</strong><p>{finding.evidence}</p>{finding.suggested_fix && <small>建议修复：{finding.suggested_fix}</small>}</article>)}</div>;
 }
@@ -1519,6 +1526,7 @@ function agentPhaseLabel(phase: string): string {
     planning: "规划",
     building: "执行",
     executing: "执行",
+    answering: "答复",
     verifying: "验证",
     recovery: "恢复",
   });
@@ -1698,7 +1706,7 @@ function eventSummary(event: RunEvent): string {
     const known = [
       "created", "planning", "awaiting_clarification", "awaiting_plan_approval",
       "executing", "awaiting_action_approval", "verifying", "succeeded", "failed",
-      "cancelled", "interrupted", "rolled_back",
+      "answered", "cancelled", "interrupted", "rolled_back",
     ].includes(state);
     return `→ ${known ? presentState(state as RunState).label : state}`;
   }

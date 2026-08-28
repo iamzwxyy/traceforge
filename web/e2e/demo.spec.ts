@@ -17,7 +17,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
 
   await page.getByRole("button", { name: "模型设置" }).click();
   await expect(page.locator('input[type="password"]')).toHaveAttribute("type", "password");
-  await page.getByText("高级：使用已有凭证文件").click();
+  await page.getByText("高级设置", { exact: true }).click();
   await page.getByLabel(/凭证文件路径/).fill("/does/not/exist");
   await page.getByRole("button", { name: "保存设置" }).click();
   const settingsError = page.getByRole("alert");
@@ -92,11 +92,11 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByText("已回滚", { exact: true }).first()).toBeVisible();
 
   await page.getByRole("button", { name: "新建任务" }).click();
-  await expect(page.getByRole("heading", { name: "你希望 TraceForge 完成并证明什么？" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "你想让 TraceForge 帮你做什么？" })).toBeVisible();
   await page.locator(".run-item").first().click();
   await expect(page.getByText("已回滚", { exact: true }).first()).toBeVisible();
   await page.getByRole("button", { name: "新建任务" }).click();
-  await page.getByRole("button", { name: "开始任务" }).click();
+  await page.getByRole("button", { name: "发送" }).click();
   await expect(page.getByRole("heading", { name: /选择会影响具体实现/ })).toBeVisible();
   await page.getByRole("button", { name: "停止", exact: true }).click();
   await expect(page.getByText("任务已停止", { exact: true }).last()).toBeVisible();

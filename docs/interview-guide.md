@@ -6,7 +6,8 @@ TraceForge is a local coding agent built without an agent framework. The model c
 calls, but the application owns every consequential decision: a state machine, structured
 clarification, Agent/Plan interaction mode, path and command policy, subprocess lifecycle, evidence
 freshness, persistence, recovery, rollback, and independent completion review. Agent mode is the
-low-friction default; optional Plan mode always pauses before implementation. The visual workbench
+low-friction default; optional Plan mode pauses whenever implementation is needed. Greetings and
+read-only questions end as a distinct answer instead of fabricating a plan or proof. The visual workbench
 keeps multi-turn conversation primary while exposing the same persisted Trace used for recovery and
 a downloadable Proof Pack. The project's deliberate tradeoff is one reliable writer plus one
 read-only verifier instead of many parallel agents.
@@ -46,10 +47,11 @@ still reject the result and trigger a bounded repair cycle.
 ### Does Agent mode let the model bypass the user?
 
 No. Agent mode skips only the plan-review click. The model still submits a structured scope and
-acceptance contract, and the application still enforces workspace paths, undeclared-file approval,
+acceptance contract before any mutation, and the application still enforces workspace paths, undeclared-file approval,
 command classification, sandboxing, and destructive-operation denial. Plan mode is available when
 the user wants to inspect the full Markdown plan first; permissions have the same meaning in both
-modes. Completion review is also separate and read-only.
+modes. A direct answer executes nothing and is labeled separately; completion review is also
+separate and read-only.
 
 ### What does the Proof Pack hash prove?
 

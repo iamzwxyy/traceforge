@@ -18,6 +18,11 @@ from traceforge.models import (
     ToolCall,
     Verdict,
 )
+from traceforge.prompts import (
+    BUILDER_SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT,
+    VERIFIER_SYSTEM_PROMPT,
+)
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
 from traceforge.storage import Storage
 
@@ -43,6 +48,161 @@ def _plan_arguments(command: list[str]) -> dict[str, object]:
         ],
         "risks": ["The file must stay inside the workspace"],
     }
+
+
+def _direct_response(content: str, *, call_id: str = "respond") -> ModelResponse:
+    return ModelResponse(
+        tool_calls=[
+            ToolCall(
+                id=call_id,
+                name="respond_to_user",
+                arguments={"content": content},
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [InteractionMode.AGENT, InteractionMode.PLAN])
+async def test_conversational_request_is_answered_without_false_workflow(
+    settings: Settings,
+    storage: Storage,
+    mode: InteractionMode,
+) -> None:
+    provider = ScriptedProvider([_direct_response("你好! 今天想一起处理什么?")])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("你好", mode=mode)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED
+    assert completed.plan is None
+    assert completed.clarification is None
+    assert completed.verification is None
+    assert completed.step_count == 0
+    assert completed.turns[-1].outcome == "answered"
+    assert completed.turns[-1].summary == "你好! 今天想一起处理什么?"
+    event_types = [event.type for event in storage.get_events(run.id)]
+    assert EventType.CLARIFICATION_REQUESTED not in event_types
+    assert EventType.PLAN_GATED not in event_types
+    assert EventType.VERIFICATION_COMPLETED not in event_types
+    assert EventType.DIFF_UPDATED not in event_types
+    tool_names = {
+        schema["function"]["name"] for schema in (provider.requests[0][1] or [])
+    }
+    assert "respond_to_user" in tool_names
+    assert "Simplified Chinese" in str(provider.requests[0][0][0]["content"])
+
+    with pytest.raises(InvalidRunAction, match="no file changes"):
+        await manager.rollback(run.id)
+
+
+@pytest.mark.asyncio
+async def test_read_only_inspection_can_end_in_a_direct_answer(
+    settings: Settings, storage: Storage
+) -> None:
+    (settings.workspace / "architecture.txt").write_text("local core\n")
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="read",
+                        name="read_file",
+                        arguments={"path": "architecture.txt"},
+                    )
+                ]
+            ),
+            _direct_response("这个项目把核心逻辑保持在本地。"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("只分析 architecture.txt, 不要修改")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED
+    assert completed.plan is None
+    assert (settings.workspace / "architecture.txt").read_text() == "local core\n"
+    tool_events = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TOOL_COMPLETED
+    ]
+    assert [event.payload["call"]["name"] for event in tool_events] == ["read_file"]
+
+
+@pytest.mark.asyncio
+async def test_direct_response_must_be_a_separate_terminal_tool_call(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="premature",
+                        name="respond_to_user",
+                        arguments={"content": "不应提前结束。"},
+                    ),
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=_plan_arguments(["python3", "-m", "pytest"]),
+                    ),
+                ]
+            ),
+            _direct_response("我需要先确认你的实际目标。", call_id="valid"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("帮我一下")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED
+    assert completed.plan is None
+    assert len(provider.requests) == 2
+    rejected = [
+        message
+        for message in completed.messages
+        if message.get("role") == "tool" and '"ok":false' in str(message.get("content"))
+    ]
+    assert {message["name"] for message in rejected} == {
+        "respond_to_user",
+        "submit_plan",
+    }
+
+
+@pytest.mark.asyncio
+async def test_answered_turn_supports_follow_up_and_redacts_credentials(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            _direct_response(f"不会泄露 {settings.api_key}", call_id="first"),
+            _direct_response("可以, 我们继续。", call_id="second"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("你好")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+    assert settings.api_key not in first.model_dump_json()
+    assert "[REDACTED]" in first.turns[-1].summary
+
+    await manager.follow_up(run.id, "继续聊聊", mode=InteractionMode.AGENT)
+    second = await manager.wait(run.id)
+
+    assert second.state is RunState.ANSWERED
+    assert [turn.outcome for turn in second.turns] == ["answered", "answered"]
+    assert second.turns[-1].summary == "可以, 我们继续。"
+
+
+def test_all_model_roles_require_simplified_chinese_user_facing_text() -> None:
+    for prompt in (PLANNER_SYSTEM_PROMPT, BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT):
+        assert "Simplified Chinese" in prompt
 
 
 @pytest.mark.asyncio

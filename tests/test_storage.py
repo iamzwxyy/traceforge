@@ -53,6 +53,14 @@ def test_mark_active_runs_interrupted(storage: Storage, settings: Settings) -> N
     )
     storage.create_run(
         RunRecord(
+            id="run-answered",
+            task="Hello",
+            workspace=str(workspace),
+            state=RunState.ANSWERED,
+        )
+    )
+    storage.create_run(
+        RunRecord(
             id="run-interrupted",
             task="Already stopped",
             workspace=str(workspace),
@@ -64,6 +72,7 @@ def test_mark_active_runs_interrupted(storage: Storage, settings: Settings) -> N
     assert storage.mark_active_runs_interrupted(workspace) == 1
     assert storage.get_run("run-active").state is RunState.INTERRUPTED
     assert storage.get_run("run-done").state is RunState.SUCCEEDED
+    assert storage.get_run("run-answered").state is RunState.ANSWERED
     assert storage.get_run("run-interrupted").interrupted_from is RunState.EXECUTING
     interruption = storage.get_events("run-active")[-1]
     assert interruption.type is EventType.STATE_CHANGED
