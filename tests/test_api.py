@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from traceforge.api import _choose_macos_directory, _open_workspace_directory, create_app
 from traceforge.config import Settings
-from traceforge.models import ToolCall
+from traceforge.models import ConversationTurn, ProviderConfig, RunRecord, RunState, ToolCall
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
 
 
@@ -181,6 +181,7 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
         run_id = created.json()["id"]
         assert created.json()["mode"] == "agent"
         assert created.json()["approval_mode"] == "automatic"
+        assert created.json()["reasoning_effort"] == "auto"
         first = _wait_for_state(client, run_id, "succeeded")
         assert first["plan_gate"]["decision"] == "agent_continues"
         assert len(first["turns"]) == 1
@@ -200,7 +201,63 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
         assert second["turns"][1]["request"] == "Check the edge case too"
         assert second["turns"][0]["approval_mode"] == "automatic"
         assert second["turns"][1]["approval_mode"] == "manual"
+        assert all(turn["reasoning_effort"] == "auto" for turn in second["turns"])
         assert all(turn["outcome"] == "succeeded" for turn in second["turns"])
+
+
+def test_api_freezes_model_supported_reasoning_per_turn(settings: Settings) -> None:
+    provider = ScriptedProvider(
+        [_answer_response("first"), _answer_response("second")]
+    )
+    app = create_app(
+        replace(settings, model="gpt-5.6-sol", base_url=None), provider=provider
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={"task": "First question", "reasoning_effort": "high"},
+        )
+        assert created.status_code == 201
+        run_id = created.json()["id"]
+        _wait_for_state(client, run_id, "answered")
+
+        follow_up = client.post(
+            f"/api/runs/{run_id}/turns",
+            json={"prompt": "Second question", "reasoning_effort": "low"},
+        )
+        assert follow_up.status_code == 200
+        completed = _wait_for_state(client, run_id, "answered")
+
+        assert completed["reasoning_effort"] == "low"
+        assert [turn["reasoning_effort"] for turn in completed["turns"]] == [
+            "high",
+            "low",
+        ]
+        assert provider.reasoning_efforts == ["high", "low"]
+        started = [
+            event["payload"]
+            for event in client.get(f"/api/runs/{run_id}/events").json()
+            if event["type"] == "turn.started"
+        ]
+        assert [payload["reasoning_effort"] for payload in started] == ["high", "low"]
+
+
+def test_api_rejects_unadvertised_reasoning_before_model_call(
+    settings: Settings,
+) -> None:
+    provider = ScriptedProvider([_answer_response("must not run")])
+    app = create_app(settings, provider=provider)
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/runs",
+            json={"task": "Do work", "reasoning_effort": "high"},
+        )
+
+        assert rejected.status_code == 422
+        assert "exact model route" in rejected.json()["detail"]
+        assert provider.requests == []
 
 
 def test_api_validates_approval_modes(settings: Settings) -> None:
@@ -407,7 +464,54 @@ def test_fixed_demo_rejects_unrelated_tasks(settings: Settings) -> None:
         )
         assert unsafe_mode.status_code == 422
         assert "automatic approval" in unsafe_mode.json()["detail"]
+        explicit_reasoning = client.post(
+            "/api/runs",
+            json={"task": suggested_task, "reasoning_effort": "high"},
+        )
+        assert explicit_reasoning.status_code == 422
+        assert "model-default reasoning" in explicit_reasoning.json()["detail"]
         assert client.get("/api/runs").json() == []
+
+
+def test_resume_preserves_effort_and_blocks_an_incompatible_new_route(
+    settings: Settings,
+) -> None:
+    official = replace(settings, model="gpt-5.6-sol", base_url=None)
+    app = create_app(official, provider=ScriptedProvider([]))
+
+    with TestClient(app) as client:
+        run = RunRecord(
+            id="reasoning-resume",
+            task="Resume precisely",
+            workspace=str(settings.workspace),
+            state=RunState.INTERRUPTED,
+            reasoning_effort="high",
+            turns=[
+                ConversationTurn(
+                    index=1,
+                    request="Resume precisely",
+                    reasoning_effort="high",
+                )
+            ],
+            interrupted_from=RunState.PLANNING,
+        )
+        app.state.storage.create_run(run)
+        updated = client.put(
+            "/api/provider",
+            json={
+                "model": "custom-model",
+                "base_url": "https://provider.example/v1",
+            },
+        )
+        assert updated.status_code == 200
+
+        rejected = client.post("/api/runs/reasoning-resume/resume")
+
+        assert rejected.status_code == 409
+        assert "incompatible" in rejected.json()["detail"]
+        persisted = client.get("/api/runs/reasoning-resume").json()
+        assert persisted["state"] == "interrupted"
+        assert persisted["reasoning_effort"] == "high"
 
 
 def test_macos_directory_picker_reports_capability(
@@ -670,6 +774,16 @@ def test_provider_config_uses_a_file_reference_without_returning_secret(
         assert payload["context_window"] is None
         assert payload["resolved_context_window"] == 1_000_000
         assert payload["context_window_source"] == "catalog"
+        assert payload["supported_reasoning_efforts"] == [
+            "auto",
+            "none",
+            "low",
+            "high",
+            "max",
+        ]
+        assert payload["default_reasoning_effort"] == "high"
+        assert payload["reasoning_effort_source"] == "deepseek_catalog"
+        assert payload["reasoning_effort_catalog_version"] == "2026-08-28"
         assert "credential-value" not in updated.text
 
         created = client.post(
@@ -715,6 +829,9 @@ def test_provider_config_stores_direct_api_key_in_owner_only_file(
         assert payload["context_window"] == 240_000
         assert payload["resolved_context_window"] == 240_000
         assert payload["context_window_source"] == "configured"
+        assert payload["supported_reasoning_efforts"] == ["auto"]
+        assert payload["default_reasoning_effort"] is None
+        assert payload["reasoning_effort_source"] == "provider_default"
         assert "api_key" not in payload
         assert secret not in updated.text
         assert credential.parent == settings.data_dir.resolve()
@@ -723,6 +840,51 @@ def test_provider_config_stores_direct_api_key_in_owner_only_file(
 
     for database_file in settings.data_dir.glob("traceforge.db*"):
         assert secret.encode() not in database_file.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.deepseek.com:bad/v1",
+        "https://api.deepseek.com:99999/v1",
+        "https://[api.deepseek.com/v1",
+    ],
+)
+def test_provider_config_rejects_malformed_ports_and_hosts(
+    settings: Settings, base_url: str
+) -> None:
+    app = create_app(settings, provider=ScriptedProvider([]))
+
+    with TestClient(app) as client:
+        rejected = client.put(
+            "/api/provider",
+            json={"model": "deepseek-v4-pro", "base_url": base_url},
+        )
+
+        assert rejected.status_code == 422
+        assert rejected.json()["detail"] == (
+            "Base URL must be an absolute http:// or https:// URL"
+        )
+
+
+def test_legacy_malformed_provider_route_remains_safe_to_inspect(
+    settings: Settings,
+) -> None:
+    app = create_app(settings, provider=ScriptedProvider([]))
+    app.state.storage.save_provider_config(
+        ProviderConfig(
+            model="deepseek-v4-pro",
+            base_url="https://api.deepseek.com:bad/v1",
+        )
+    )
+
+    with TestClient(app) as client:
+        payload = client.get("/api/provider").json()
+
+        assert payload["resolved_context_window"] == settings.context_limit
+        assert payload["context_window_source"] == "fallback"
+        assert payload["supported_reasoning_efforts"] == ["auto"]
+        assert payload["reasoning_effort_source"] == "provider_default"
 
 
 def test_provider_config_rejects_multiple_credential_sources(settings: Settings) -> None:

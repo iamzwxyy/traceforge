@@ -11,6 +11,7 @@ import type {
   ProviderConfig,
   ProviderUpdate,
   ProviderProbe,
+  ReasoningEffort,
   Run,
   RunEvent,
   RunTarget,
@@ -47,6 +48,7 @@ export const api = {
     task: string,
     mode: InteractionMode,
     approvalMode: ApprovalMode,
+    reasoningEffort: ReasoningEffort,
     target: RunTarget,
   ) =>
     request<Run>("/api/runs", {
@@ -56,6 +58,7 @@ export const api = {
         verifier_enabled: true,
         mode,
         approval_mode: approvalMode,
+        reasoning_effort: reasoningEffort,
         ...target,
       }),
     }),
@@ -64,10 +67,16 @@ export const api = {
     prompt: string,
     mode: InteractionMode,
     approvalMode: ApprovalMode,
+    reasoningEffort: ReasoningEffort,
   ) =>
     request<Run>(`/api/runs/${runId}/turns`, {
       method: "POST",
-      body: JSON.stringify({ prompt, mode, approval_mode: approvalMode }),
+      body: JSON.stringify({
+        prompt,
+        mode,
+        approval_mode: approvalMode,
+        reasoning_effort: reasoningEffort,
+      }),
     }),
   listProjects: () => request<Project[]>("/api/projects"),
   createProject: (name: string, root: string, createDirectory: boolean) =>

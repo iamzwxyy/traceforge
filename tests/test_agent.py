@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from traceforge.models import (
     EventType,
     InteractionMode,
     PlanGate,
+    ReasoningEffort,
     RunRecord,
     RunState,
     TaskPlan,
@@ -26,9 +28,10 @@ from traceforge.prompts import (
     PLANNER_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
 )
+from traceforge.proof import build_proof_pack, proof_pack_markdown
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
 from traceforge.sandbox import SandboxStatus
-from traceforge.storage import Storage
+from traceforge.storage import SecureCheckpointError, Storage
 
 
 async def _wait_for_state(
@@ -951,6 +954,233 @@ def _verification(verdict: str, summary: str) -> ModelResponse:
             )
         ]
     )
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_is_frozen_across_planner_builder_and_verifier(
+    settings: Settings, storage: Storage
+) -> None:
+    sentinel = "PRIVATE-REASONING-MUST-NOT-LEAK"
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                reasoning_content=sentinel,
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ],
+            ),
+            ModelResponse(
+                reasoning_content=sentinel,
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Reviewed", "evidence": ["plan"]},
+                    )
+                ],
+            ),
+            ModelResponse(
+                reasoning_content=sentinel,
+                tool_calls=[
+                    ToolCall(
+                        id="verify-pass",
+                        name="submit_verification",
+                        arguments={
+                            "verdict": "pass",
+                            "summary": "Verified",
+                            "findings": [],
+                        },
+                    )
+                ],
+            ),
+        ]
+    )
+    manager = AgentManager(
+        replace(settings, model="gpt-5.6-sol", base_url=None), storage, provider
+    )
+
+    run = await manager.start_run(
+        "Review the workspace", reasoning_effort=ReasoningEffort.HIGH
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    assert completed.reasoning_effort is ReasoningEffort.HIGH
+    assert completed.turns[-1].reasoning_effort is ReasoningEffort.HIGH
+    assert provider.reasoning_efforts == [ReasoningEffort.HIGH] * 3
+    requested = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.MODEL_REQUESTED
+    ]
+    assert [event.payload["requested_effort"] for event in requested] == [
+        "high",
+        "high",
+        "high",
+    ]
+    assert all(event.payload["wire_effort"] == "high" for event in requested)
+    assert sentinel not in json.dumps(completed.messages)
+    assert sentinel not in json.dumps(
+        [event.model_dump(mode="json") for event in storage.get_events(run.id)]
+    )
+    pack = build_proof_pack(completed, storage)
+    assert pack.turns[-1].reasoning_effort is ReasoningEffort.HIGH
+    assert sentinel not in pack.model_dump_json()
+    assert sentinel not in proof_pack_markdown(pack)
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert sentinel.encode() not in database_file.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_terminal_transition_scrubs_private_reasoning_before_state_persist(
+    settings: Settings, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = "PRIVATE-TERMINAL-ORDER-SENTINEL"
+    run = RunRecord(
+        id="terminal-order",
+        task="Finish safely",
+        workspace=str(settings.workspace),
+        state=RunState.VERIFYING,
+        messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": sentinel,
+            }
+        ],
+    )
+    storage.create_run(run)
+    manager = AgentManager(settings, storage, ScriptedProvider([]))
+
+    def reject_checkpoint() -> None:
+        persisted = storage.get_run(run.id)
+        assert persisted.state is RunState.VERIFYING
+        assert sentinel not in json.dumps(persisted.messages)
+        assert persisted.provider_reasoning_cleanup_pending is True
+        raise SecureCheckpointError("simulated busy WAL")
+
+    monkeypatch.setattr(storage, "secure_checkpoint", reject_checkpoint)
+
+    transitioned = await manager._transition(run, RunState.SUCCEEDED)
+
+    assert transitioned is False
+    assert run.state is RunState.INTERRUPTED
+    persisted = storage.get_run(run.id)
+    assert persisted.state is RunState.INTERRUPTED
+    assert persisted.interrupted_from is RunState.VERIFYING
+    assert persisted.provider_reasoning_cleanup_pending is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_checkpoint_failure_interrupts_worker_without_a_ghost_run(
+    settings: Settings, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = "PRIVATE-RECOVERABLE-CLEANUP-SENTINEL"
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                reasoning_content=sentinel,
+                tool_calls=[
+                    ToolCall(
+                        id="answer",
+                        name="respond_to_user",
+                        arguments={"content": "Safe public answer"},
+                    )
+                ],
+            )
+        ]
+    )
+    manager = AgentManager(
+        replace(
+            settings,
+            model="deepseek-v4-pro",
+            base_url="https://api.deepseek.com/v1",
+        ),
+        storage,
+        provider,
+    )
+    original_checkpoint = storage.secure_checkpoint
+
+    def reject_checkpoint() -> None:
+        raise SecureCheckpointError("simulated persistent reader")
+
+    monkeypatch.setattr(storage, "secure_checkpoint", reject_checkpoint)
+    run = await manager.start_run(
+        "Answer safely", reasoning_effort=ReasoningEffort.HIGH
+    )
+    interrupted = await manager.wait(run.id)
+
+    assert interrupted.state is RunState.INTERRUPTED
+    assert interrupted.provider_reasoning_cleanup_pending is True
+    assert manager._tasks[run.id].done()
+    assert storage.has_live_run() is False
+    assert sentinel not in json.dumps(interrupted.messages)
+    cleanup_error = next(
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.ERROR
+        and event.payload.get("cause") == "provider_reasoning_cleanup_pending"
+    )
+    assert cleanup_error.payload["recoverable"] is True
+
+    with pytest.raises(InvalidRunAction, match="cleanup is still waiting"):
+        await manager.resume(run.id)
+    assert manager._tasks[run.id].done()
+
+    monkeypatch.setattr(storage, "secure_checkpoint", original_checkpoint)
+    cancelled = await manager.cancel(run.id)
+
+    assert cancelled.state is RunState.CANCELLED
+    assert cancelled.provider_reasoning_cleanup_pending is False
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert sentinel.encode() not in database_file.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_credential_like_private_reasoning_fails_closed_without_persistence(
+    settings: Settings, storage: Storage
+) -> None:
+    sentinel = "sk-abcdefghijklmnop"
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                reasoning_content=sentinel,
+                tool_calls=[
+                    ToolCall(
+                        id="answer",
+                        name="respond_to_user",
+                        arguments={"content": "Safe public answer"},
+                    )
+                ],
+            )
+        ]
+    )
+    manager = AgentManager(
+        replace(
+            settings,
+            model="deepseek-v4-pro",
+            base_url="https://api.deepseek.com/v1",
+        ),
+        storage,
+        provider,
+    )
+
+    run = await manager.start_run(
+        "Answer safely", reasoning_effort=ReasoningEffort.HIGH
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.FAILED
+    assert completed.error == "Provider-private replay state could not be stored safely"
+    persisted = json.dumps(completed.model_dump(mode="json"), ensure_ascii=False)
+    events = json.dumps(
+        [event.model_dump(mode="json") for event in storage.get_events(run.id)],
+        ensure_ascii=False,
+    )
+    assert sentinel not in persisted
+    assert sentinel not in events
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert sentinel.encode() not in database_file.read_bytes()
 
 
 @pytest.mark.asyncio

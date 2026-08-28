@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from time import monotonic
 
 import pytest
 
@@ -12,10 +13,11 @@ from traceforge.models import (
     EventType,
     ProjectRecord,
     ProviderConfig,
+    ReasoningEffort,
     RunRecord,
     RunState,
 )
-from traceforge.storage import SnapshotRecord, Storage
+from traceforge.storage import SecureCheckpointError, SnapshotRecord, Storage
 
 
 def test_run_and_events_round_trip(storage: Storage, settings: Settings) -> None:
@@ -25,11 +27,13 @@ def test_run_and_events_round_trip(storage: Storage, settings: Settings) -> None
         task="Fix it",
         workspace=str(workspace),
         approval_mode=ApprovalMode.FULL_ACCESS,
+        reasoning_effort=ReasoningEffort.HIGH,
         turns=[
             ConversationTurn(
                 index=1,
                 request="Fix it",
                 approval_mode=ApprovalMode.FULL_ACCESS,
+                reasoning_effort=ReasoningEffort.HIGH,
             )
         ],
     )
@@ -43,7 +47,9 @@ def test_run_and_events_round_trip(storage: Storage, settings: Settings) -> None
 
     assert loaded.state is RunState.PLANNING
     assert loaded.approval_mode is ApprovalMode.FULL_ACCESS
+    assert loaded.reasoning_effort is ReasoningEffort.HIGH
     assert loaded.turns[0].approval_mode is ApprovalMode.FULL_ACCESS
+    assert loaded.turns[0].reasoning_effort is ReasoningEffort.HIGH
     assert loaded.messages[0]["content"] == "Fix it"
     assert event.seq == 1
     assert storage.get_events("run-1")[0].payload == {"state": "planning"}
@@ -223,5 +229,144 @@ def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:
         assert loaded.project_id is None
         assert loaded.plan_gate is None
         assert loaded.approval_mode is ApprovalMode.AUTOMATIC
+        assert loaded.reasoning_effort is ReasoningEffort.AUTO
+        assert loaded.provider_reasoning_cleanup_pending is False
     finally:
         migrated.close()
+
+
+def test_storage_loads_a_real_legacy_row_with_auto_reasoning(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-row.db"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TABLE runs (
+            id TEXT PRIMARY KEY, task TEXT NOT NULL, workspace TEXT NOT NULL,
+            state TEXT NOT NULL, verifier_enabled INTEGER NOT NULL, plan_json TEXT,
+            clarification_json TEXT, pending_approval_json TEXT, verification_json TEXT,
+            messages_json TEXT NOT NULL DEFAULT '[]', step_count INTEGER NOT NULL DEFAULT 0,
+            repair_cycles INTEGER NOT NULL DEFAULT 0, error TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO runs(
+            id, task, workspace, state, verifier_enabled, messages_json,
+            created_at, updated_at
+        ) VALUES (
+            'legacy', 'Legacy task', ?, 'interrupted', 1, '[]',
+            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+        )
+        """,
+        (str(tmp_path),),
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = Storage(database)
+    try:
+        loaded = migrated.get_run("legacy")
+        assert loaded.reasoning_effort is ReasoningEffort.AUTO
+        assert loaded.turns == []
+        assert loaded.provider_reasoning_cleanup_pending is False
+    finally:
+        migrated.close()
+
+
+def test_storage_files_are_owner_only(storage: Storage, settings: Settings) -> None:
+    storage.create_run(
+        RunRecord(id="private-db", task="Private", workspace=str(settings.workspace))
+    )
+
+    assert settings.data_dir.stat().st_mode & 0o077 == 0
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert database_file.stat().st_mode & 0o077 == 0
+
+
+def test_startup_scrubs_private_reasoning_from_legacy_terminal_rows(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-private.db"
+    sentinel = "PRIVATE-LEGACY-TERMINAL-SENTINEL"
+    legacy = Storage(database)
+    legacy.create_run(
+        RunRecord(
+            id="legacy-terminal",
+            task="Already done",
+            workspace=str(tmp_path),
+            state=RunState.SUCCEEDED,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning_content": sentinel,
+                }
+            ],
+        )
+    )
+    legacy.secure_checkpoint()
+    assert any(
+        sentinel.encode() in database_file.read_bytes()
+        for database_file in tmp_path.glob("legacy-private.db*")
+    )
+    legacy.close()
+
+    reopened = Storage(database)
+    try:
+        loaded = reopened.get_run("legacy-terminal")
+        assert loaded.state is RunState.SUCCEEDED
+        assert loaded.provider_reasoning_cleanup_pending is False
+        assert all("reasoning_content" not in message for message in loaded.messages)
+        assert all(
+            sentinel.encode() not in database_file.read_bytes()
+            for database_file in tmp_path.glob("legacy-private.db*")
+        )
+    finally:
+        reopened.close()
+
+
+def test_secure_checkpoint_rejects_busy_wal_then_succeeds_after_reader_closes(
+    storage: Storage, settings: Settings
+) -> None:
+    database = settings.data_dir / "test.db"
+    sentinel = "PRIVATE-BUSY-WAL-SENTINEL"
+    run = RunRecord(
+        id="busy-wal",
+        task="Scrub safely",
+        workspace=str(settings.workspace),
+        state=RunState.EXECUTING,
+        messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": sentinel,
+            }
+        ],
+    )
+    storage.create_run(run)
+
+    reader = sqlite3.connect(database)
+    try:
+        reader.execute("BEGIN")
+        assert sentinel in reader.execute(
+            "SELECT messages_json FROM runs WHERE id = 'busy-wal'"
+        ).fetchone()[0]
+        run.messages[0].pop("reasoning_content")
+        storage.save_run(run)
+
+        started = monotonic()
+        with pytest.raises(SecureCheckpointError, match="WAL remained busy"):
+            storage.secure_checkpoint()
+        assert monotonic() - started < 2
+        assert sentinel.encode() in Path(f"{database}-wal").read_bytes()
+    finally:
+        reader.rollback()
+        reader.close()
+
+    storage.secure_checkpoint(attempts=1, retry_delay=0)
+    assert all(
+        sentinel.encode() not in database_file.read_bytes()
+        for database_file in settings.data_dir.glob("test.db*")
+    )

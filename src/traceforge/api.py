@@ -6,7 +6,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import AsyncIterator, MutableMapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -33,6 +33,7 @@ from traceforge.config import Settings
 from traceforge.context import ContextManager
 from traceforge.events import EventBroker
 from traceforge.model_context import resolve_model_context
+from traceforge.model_reasoning import CATALOG_VERSION, resolve_reasoning_capability
 from traceforge.models import (
     ApprovalMode,
     ApprovalRequest,
@@ -44,6 +45,7 @@ from traceforge.models import (
     ProjectRecord,
     ProofPack,
     ProviderConfig,
+    ReasoningEffort,
     RunEvent,
     RunRecord,
     RunState,
@@ -66,6 +68,7 @@ class CreateRunRequest(BaseModel):
     verifier_enabled: bool = True
     mode: InteractionMode = InteractionMode.AGENT
     approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC
+    reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO
     project_id: str | None = None
     workspace: str | None = Field(default=None, max_length=4_096)
     create_direct_workspace: bool = False
@@ -120,6 +123,12 @@ class ProviderConfigView(BaseModel):
     context_window: int | None
     resolved_context_window: int
     context_window_source: Literal["configured", "catalog", "fallback"]
+    supported_reasoning_efforts: list[ReasoningEffort]
+    default_reasoning_effort: ReasoningEffort | None
+    reasoning_effort_source: Literal[
+        "openai_catalog", "deepseek_catalog", "provider_default"
+    ]
+    reasoning_effort_catalog_version: str
     updated_at: datetime
 
 
@@ -141,6 +150,7 @@ class FollowUpRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20_000)
     mode: InteractionMode = InteractionMode.AGENT
     approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC
+    reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO
 
 
 class OpenWorkspaceResponse(BaseModel):
@@ -161,6 +171,7 @@ class RunView(BaseModel):
     state: RunState
     mode: InteractionMode
     approval_mode: ApprovalMode
+    reasoning_effort: ReasoningEffort
     turns: list[ConversationTurn]
     verifier_enabled: bool
     plan: TaskPlan | None
@@ -178,7 +189,14 @@ class RunView(BaseModel):
 
     @classmethod
     def from_record(cls, run: RunRecord) -> RunView:
-        public = run.model_dump(exclude={"messages", "plan_approved", "interrupted_from"})
+        public = run.model_dump(
+            exclude={
+                "messages",
+                "plan_approved",
+                "interrupted_from",
+                "provider_reasoning_cleanup_pending",
+            }
+        )
         public["context_tokens"] = ContextManager(run.context_limit).estimated_tokens(
             run.messages
         )
@@ -297,6 +315,9 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             configured_window=selected.context_window,
             fallback_window=settings.context_limit,
         )
+        reasoning = resolve_reasoning_capability(
+            selected.model, base_url=selected.base_url
+        )
         if selected.credential_file:
             source = "file"
         elif settings.api_key:
@@ -312,6 +333,10 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             context_window=selected.context_window,
             resolved_context_window=model_context.context_window,
             context_window_source=model_context.source,
+            supported_reasoning_efforts=list(reasoning.supported_efforts),
+            default_reasoning_effort=reasoning.default_effort,
+            reasoning_effort_source=reasoning.source,
+            reasoning_effort_catalog_version=CATALOG_VERSION,
             updated_at=selected.updated_at,
         )
 
@@ -394,6 +419,8 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 raise ValueError("The fixed demo only runs in its disposable demo workspace")
             if body.approval_mode is not ApprovalMode.AUTOMATIC:
                 raise ValueError("The fixed demo only supports automatic approval mode")
+            if body.reasoning_effort is not ReasoningEffort.AUTO:
+                raise ValueError("The fixed demo only supports model-default reasoning")
         project_id = body.project_id
         created_workspace: Path | None = None
         if settings.demo_mode:
@@ -417,6 +444,9 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 mode=(InteractionMode.PLAN if settings.demo_mode else body.mode),
                 approval_mode=(
                     ApprovalMode.AUTOMATIC if settings.demo_mode else body.approval_mode
+                ),
+                reasoning_effort=(
+                    ReasoningEffort.AUTO if settings.demo_mode else body.reasoning_effort
                 ),
             )
         except Exception:
@@ -519,6 +549,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             body.prompt,
             mode=body.mode,
             approval_mode=body.approval_mode,
+            reasoning_effort=body.reasoning_effort,
         )
         return RunView.from_record(run)
 
@@ -621,7 +652,8 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             ]
             for task in pending_tasks:
                 task.cancel()
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
+            with suppress(asyncio.CancelledError):
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
             broker.unsubscribe(run_id, queue)
 
     _mount_frontend(app)

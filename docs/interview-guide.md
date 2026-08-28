@@ -9,8 +9,10 @@ freshness, persistence, recovery, rollback, and independent completion review. A
 action-permission profile provides Manual, deterministic Automatic, and workspace-scoped Full
 access without conflating approval with the OS sandbox. Agent mode is the
 low-friction default; optional Plan mode pauses whenever implementation is needed. Greetings and
-read-only questions end as a distinct answer instead of fabricating a plan or proof. The visual workbench
-keeps multi-turn conversation primary while exposing the same persisted Trace used for recovery and
+read-only questions end as a distinct answer instead of fabricating a plan or proof. Per-turn
+reasoning effort appears only when the exact endpoint/model supports it, without turning
+provider-private reasoning into UI or evidence. The visual workbench keeps multi-turn conversation
+primary while exposing the same persisted Trace used for recovery and
 a downloadable Proof Pack. The project's deliberate tradeoff is one reliable writer plus one
 read-only verifier instead of many parallel agents.
 
@@ -96,6 +98,16 @@ Startup changes active runs to `interrupted` and records the previous phase. Res
 replays a command. If the stored assistant message lacks a matching tool result, TraceForge inserts
 a synthetic interruption result and asks the builder to inspect current state.
 
+### How does reasoning effort work, and do you expose chain of thought?
+
+It is a fourth, orthogonal per-turn control: Agent/Plan decides whether the plan pauses, action
+permission decides which tools ask, the sandbox limits commands, and reasoning effort only selects
+the model protocol level. TraceForge advertises levels from an exact official endpoint/model
+catalog; `auto` omits the field and unknown routes stay default-only. One selection is frozen across
+planner, builder, repairs, and verifier. DeepSeek's required `reasoning_content` is replayed only as
+private protocol state, then scrubbed on terminal paths; UI, events, verifier evidence, and Proof
+Pack show the requested level but never the hidden reasoning text.
+
 ### Why SQLite and WebSocket events?
 
 SQLite makes runs, snapshots, and event sequence durable without external services. Each event is
@@ -105,7 +117,7 @@ recoverable view of the same source of truth rather than a best-effort stream.
 ### What would you build next?
 
 The fixed quality corpus and two low-frequency real-model scenarios now cover the main claims.
-Next: model reasoning-effort routing and richer language-aware patch validation. After that: optional stronger Linux profiles
+Next: richer language-aware patch validation. After that: optional stronger Linux profiles
 and signed evidence.
 Parallel writers and plugins come later because they complicate attribution and recovery more than
 they improve this v0.1 demo.

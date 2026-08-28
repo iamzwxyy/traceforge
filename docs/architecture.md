@@ -15,6 +15,7 @@ flowchart TB
     API --> Runtime[AgentRuntime workspace router]
     Runtime --> Manager[AgentManager per active workspace]
     Manager --> Provider[ModelProvider]
+    Provider --> Capability[Exact route/model capability catalog]
     Manager --> Gate[Interaction mode + scope assessment]
     Manager --> Tools[ToolRegistry]
     Manager --> Context[ContextManager]
@@ -27,7 +28,10 @@ flowchart TB
     DB --> Proof[Proof Pack projection]
 ```
 
-- `ModelProvider` only translates OpenAI-compatible tool calls. It does not own the loop.
+- `ModelProvider` only translates OpenAI-compatible tool calls and the selected route's reasoning
+  controls. It does not own the loop or choose an effort level.
+- `resolve_reasoning_capability` matches the official HTTPS endpoint and exact model ID before it
+  advertises any non-default effort. Unknown compatible routes omit the field instead of guessing.
 - `AgentRuntime` resolves canonical workspace roots and lazily creates one manager per directory,
   allowing independent workspaces to progress concurrently without overlapping writers.
 - `AgentManager` is the product core: phases, approvals, retries, evidence freshness, repair
@@ -89,7 +93,9 @@ workspace Full access all reuse the same optional `awaiting_action_approval` gat
 incomplete tool call. On resume, any unmatched assistant tool call receives a synthetic failure
 result before the model is called again, preserving the provider protocol. A persisted pending
 approval is first resolved as `abandoned` and cleared, so an old approval ID cannot authorize a
-new or reconstructed action.
+new or reconstructed action. Resume also validates the interrupted turn's frozen reasoning effort
+against the newly configured route. An incompatible route leaves the run interrupted rather than
+silently downgrading the request.
 
 ## Answer, clarify, plan, build, verify
 
@@ -196,6 +202,43 @@ the cumulative snapshot paths remain covered by the existing top-level `changed_
 artifact that signs per-turn attribution must use a new schema version instead of silently changing
 v1 hashes.
 
+Action-permission and reasoning-effort fields follow the same compatibility rule: the current
+projection and Markdown display them, while the v1 stable evidence digest excludes the later-added
+turn hints. Their `turn.started`, `turn.completed`, `tool.completed`, and `model.requested` events
+remain covered by the event-chain digest.
+
+## Reasoning effort and provider-private replay
+
+`ReasoningEffort` is a per-turn input, separate from Agent/Plan interaction mode and action
+permission. The API validates it before starting a worker, stores it on both the run mirror and the
+immutable active-turn snapshot, and the manager reads the turn as the authority for every planner,
+builder, retry, repair, and verifier request.
+
+The capability resolver returns an ordered supported set, known provider default, catalog source,
+and transport for one exact endpoint/model route. `auto` is universally safe and omits the wire
+field. Recognized OpenAI Chat Completions routes send the chosen `reasoning_effort` unchanged.
+The exact OpenAI catalog includes the `gpt-5.6` alias and Sol/Terra/Luna variants, `gpt-5.5`,
+`gpt-5.4`/Mini/Nano, `gpt-5.3-codex`, and `gpt-5`; malformed endpoints and catalog misses remain
+auto-only.
+Recognized DeepSeek routes map `none` to `thinking.type=disabled`; low/high/max enable thinking and
+send the matching effort. DeepSeek tool-call continuation omits `tool_choice`, preserves non-null
+empty assistant content, and replays the response's `reasoning_content` exactly as its protocol
+requires. There is no rejection-driven fallback that could change semantics between attempts.
+
+Raw reasoning is provider-private transport state, not application evidence. It may be held in the
+internal message history while an active DeepSeek turn needs it for a subsequent request. It is
+removed for every non-DeepSeek transport, excluded from public run views/events/Proof Pack, and
+scrubbed and saved while the run is still non-terminal. A checked WAL truncate must then succeed
+before the terminal state is persisted. Checkpoint lock waits are disabled and retries have a
+short bounded deadline. A busy WAL persists an internal cleanup-pending flag, moves the run to
+`interrupted`, and prevents resume from calling the model until cleanup succeeds; there is no dead
+worker paired with an apparently active row. Startup also resolves pending cleanup and scrubs
+legacy terminal rows before serving them. Credential-like
+private text fails the turn without persistence rather than being redacted into protocol-invalid
+replay. `model.requested` exposes only safe metadata: turn, phase, attempt, model, requested level,
+wire level or omission, thinking on/off/default, and capability source. The Proof Pack projects the
+requested per-turn level but not wire omission or thinking state.
+
 ## Context management
 
 TraceForge resolves a context window for each route using a validated user override, an exact
@@ -203,10 +246,12 @@ official-endpoint/model catalog entry, or a conservative fallback, and snapshots
 run. It estimates tokens deterministically from serialized UTF-8 bytes, including the current tool
 schemas. At 80% pressure it retains the first two messages, selects a recent tail within 16% of the
 window, and inserts a bounded evidence-oriented summary of the middle. Assistant tool calls remain
-paired with their following tool results; hidden reasoning is neither requested nor displayed.
+paired with their following tool results. Provider-private reasoning replay is never summarized or
+projected to the UI and is scrubbed when the turn terminates.
 
 A run is also a durable conversation. `ConversationTurn` records the request, selected Agent/Plan
-mode, selected action-permission mode, outcome, completion summary, native-edit files, and timestamps. A terminal answered, successful, failed, or
+mode, selected action-permission mode, selected reasoning effort, outcome, completion summary,
+native-edit files, and timestamps. A terminal answered, successful, failed, or
 cancelled run can transition back to `created` for a follow-up. The next planner receives the last six completed
 turn requests and summaries while keeping the same run id, project, workspace snapshots, event
 ledger, and rollback boundary. Model protocol messages reset per turn so stale tool-call state is
@@ -216,7 +261,8 @@ not mixed into a new request.
 
 SQLite uses WAL mode and six tables:
 
-- `runs`: public state, optional project association, current interaction and action-permission modes, conversation turns,
+- `runs`: public state, optional project association, current interaction, action-permission, and
+  reasoning-effort mirrors, conversation turns,
   internal messages, plan and scope assessment, approval state, and interrupted origin;
 - `events`: per-run monotonically increasing sequence and JSON payload;
 - `snapshots`: original bytes, mode, original hash, and last agent-written hash per path.
@@ -253,7 +299,7 @@ post-agent user change.
 ## HTTP and event surface
 
 The same-origin service defaults to `127.0.0.1`. REST manages direct-task directories, projects,
-provider references, connection probes, and run controls; it returns current state/diff/events,
+provider references, exact reasoning-capability metadata, connection probes, and run controls; it returns current state/diff/events,
 adds follow-up turns, downloads Markdown plans, and resolves plan or action decisions. The
 run-scoped `POST /api/runs/{id}/open-workspace` accepts no path from the browser: it re-resolves the
 persisted canonical workspace, rejects symlink retargeting, and invokes Finder or `xdg-open` with a

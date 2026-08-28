@@ -13,6 +13,7 @@ or deliberately bypassed.
 - Commands may execute project code and are therefore higher risk than reads.
 - The browser UI is local, but REST/WebSocket input is still validated.
 - API credentials are configuration, never task context.
+- Provider-private reasoning is protocol state, never user-visible evidence or a permission signal.
 
 ## File boundary
 
@@ -141,14 +142,51 @@ also redacted for the configured credential and token-shaped `sk-...` values bef
 are emitted. The CI scanner examines Git-tracked UTF-8 files for private-key headers and common
 credential literals.
 
+Provider exceptions are converted to bounded categories such as timeout, connection, rate limit,
+request rejection, and contract failure. Raw SDK exception text is not copied into run errors,
+because it may contain request bodies, credentials, or hidden provider fields.
+
 If a credential is ever committed, deleting the file is insufficient: revoke the credential,
 replace it, and remove it from history before publishing.
+
+## Provider-private reasoning
+
+Reasoning effort is an explicit per-turn request setting, not permission to reveal chain of thought.
+The public API and settings panel advertise only levels known for an exact official endpoint/model
+pair. `auto` omits the protocol field; unfamiliar OpenAI-compatible routes are default-only. This
+prevents a deceptive hostname, port, query, userinfo, or family-looking model ID from gaining
+provider-specific behavior.
+
+DeepSeek thinking with native tools requires the assistant's `reasoning_content` to be replayed on
+the next model request. TraceForge keeps that value only in its internal message record while the
+turn is active or recoverable. It never enters a public event, REST run view, UI text, completion
+summary, verifier evidence, or Proof Pack. Cross-provider message preparation removes it, so a
+later OpenAI-compatible route cannot receive stale DeepSeek-private state. If the value matches a
+configured credential or token-shaped `sk-...` pattern, the turn fails with a generic error before
+the value is persisted; TraceForge never mutates the field and then replays corrupted protocol
+state. Terminal answer, success, failure, cancellation, and rollback paths scrub and save the field
+while the row is still non-terminal, then require a successful truncated SQLite WAL checkpoint
+before persisting the terminal state. The checkpoint temporarily disables SQLite's multi-second
+lock wait and uses a bounded short retry budget. A busy WAL records cleanup-pending state and moves
+the task to recoverable `interrupted`; resume cannot call the model until cleanup succeeds, while
+Stop can retry the cleanup without a process restart. Startup resolves pending cleanup and scrubs
+legacy terminal rows left by older ordering. Adversarial tests cover sentinel reasoning,
+token-shaped private state, terminal ordering, worker/state convergence, legacy cleanup, and an
+external reader that keeps the WAL busy.
+
+The safe `model.requested` event records the requested level, whether the wire field was omitted,
+and whether DeepSeek thinking was enabled or disabled. It records no reasoning text. A selected
+level is frozen across planner, builder, repairs, and verifier; if an interrupted run is pointed at
+an incompatible route, resume is rejected before a model call instead of silently downgrading it.
 
 ## Persistence and rollback
 
 SQLite and snapshots live in the platform user-data directory in real mode and in a temporary
 directory in demo mode. They can contain task text, file snapshots, diffs, and command output. File
-permissions follow the local user account; TraceForge does not encrypt this database.
+permissions are hardened to owner-only (`0700` directory and `0600` database/WAL/shared-memory
+files) on POSIX. SQLite `secure_delete` is enabled and terminal reasoning scrubs force a truncated
+WAL checkpoint whose busy result is checked, but TraceForge does not encrypt the database and does not claim forensic erasure
+from SSDs, backups, or filesystem snapshots.
 
 Rollback is hash-conditional. A file changed by the user after the agent wrote it is reported as a
 conflict and preserved. This prevents recovery from becoming a second destructive action.
@@ -187,6 +225,11 @@ controls chosen by the user.
 - A benign repository may contain secrets in ordinary source files that the user asked the model
   to inspect.
 - SQLite data remains until the platform data directory is removed.
+- A process crash can leave provider-private reasoning in the owner-only database for an active or
+  interrupted DeepSeek turn because protocol-correct resume may need it. A terminal transition is
+  not persisted until the scrub checkpoint succeeds; an external long-lived SQLite reader can
+  therefore move the task to a visible cleanup-pending interruption or defer startup instead of
+  letting TraceForge claim cleanup prematurely.
 - The risk assessment is deliberately conservative but still syntactic; Plan mode approval and
   planned file scope do not establish semantic safety.
 - Proof Pack hashes are not signatures or remote attestations.

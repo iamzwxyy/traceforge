@@ -54,6 +54,10 @@ Its differentiator is a defensible engineering loop with useful human control.
   override, an exact official-endpoint model entry, or a conservative fallback. Compaction counts
   tool schemas, keeps tool requests paired with their results, and never assigns a large window
   from a fuzzy model-name match.
+- **Per-turn, model-aware reasoning effort.** The composer shows only the effort levels supported
+  by the exact official endpoint/model route. Model default omits the wire field, unknown compatible
+  routes remain default-only, and one frozen choice is used by planner, builder, and verifier
+  without exposing provider-private reasoning.
 
 ## Try the complete demo
 
@@ -105,6 +109,11 @@ the API or UI. Advanced users may instead reference an existing one-line owner-o
 file or set a model's documented context window. Leaving the context field empty uses an exact
 catalog entry only for a recognized model on its official endpoint; all other routes use the
 configurable conservative fallback. The resolved value and its source remain visible in settings.
+Settings also advertise the exact route's reasoning-effort options and catalog source. This is a
+small allowlist, not model-name guessing: an unknown model or custom gateway offers only **模型默认**
+and TraceForge sends no `reasoning_effort` field. The OpenAI allowlist covers the exact `gpt-5.6`
+alias and Sol/Terra/Luna variants, `gpt-5.5`, `gpt-5.4`/Mini/Nano, `gpt-5.3-codex`, and `gpt-5`;
+the DeepSeek allowlist covers the official V4 Flash/Pro/Flash Vision Exp routes.
 
 Click **新建任务** to enter only the request; press Enter to submit or Shift+Enter for a newline.
 The optional **计划模式** toggle is off by default. Leave it off for the normal Agent flow, or
@@ -114,6 +123,13 @@ also exposes a separate action-permission picker: **手动审批** confirms ever
 workspace-scoped edits while retaining the path guard. It removes unknown-command prompts only
 when an OS sandbox is enforced; on a policy-only host, those commands fall back to human
 confirmation. Full access is per-turn and never becomes the next turn's silent default.
+The adjacent **思考强度** picker is independent from those controls. A supported explicit level is
+frozen for the whole turn and carried through planning, building, and completion review; follow-up
+turns may choose again. OpenAI routes receive the exact Chat Completions value. DeepSeek routes map
+**关闭** to disabled thinking and supported non-default levels to enabled thinking. TraceForge does
+not silently retry with a lower or omitted level when the route rejects the request. DeepSeek's
+private replay field never appears in the UI or Proof Pack; terminal persistence is allowed only
+after the field is scrubbed and SQLite confirms that the WAL was truncated.
 TraceForge creates a unique task directory beneath the visible default root. Click **添加项目** to select a
 reusable project root in the application, then use the plus button beside that folder for
 project-scoped tasks. Direct runs stay at the top level. After a
@@ -195,11 +211,13 @@ uv run python scripts/evaluate_quality.py
 uv run python scripts/evaluate_quality.py --require-os-sandbox
 
 # Optional low-frequency provider acceptance; never runs in CI
-uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
+uv run python scripts/evaluate_real_model.py \
+  --credential-file /absolute/path/to/key \
+  --reasoning-effort high
 ```
 
-The current suite has 179 backend tests at 87.90% coverage (with a hard 85% gate), eight frontend
-unit tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 231 backend tests at 88.03% coverage (with a hard 85% gate), ten frontend
+unit tests, and four serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 

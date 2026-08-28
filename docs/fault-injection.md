@@ -7,6 +7,8 @@ tests below inject failures at the boundaries most likely to matter during a liv
 | --- | --- | --- | --- |
 | Process disappears during an unfinished run | Startup changes the run to `interrupted` without guessing that it completed | `state.changed` records the previous state and `cause=process_restart` | `test_mark_active_runs_interrupted` and `test_mark_all_active_runs_interrupted` |
 | Model connection, timeout, rate limit, or temporary server failure persists across bounded retries | Preserve the workspace and history in `interrupted`; allow connection settings to change and resume without starting over | `model.retry` records every application-owned retry; recoverable `error`, `state.changed`, and `run.resumed` record the pause and continuation | `test_transient_model_outage_pauses_and_resumes_without_losing_run` and `test_api_allows_provider_repair_then_resume_after_transient_outage` |
+| An interrupted turn with explicit reasoning effort is pointed at a route that does not support it | Keep the run `interrupted`, preserve the frozen turn setting, and reject resume before any model request instead of silently downgrading | Existing turn and `reasoning_effort` remain unchanged; no false `run.resumed` event or provider call is created | `test_resume_preserves_effort_and_blocks_an_incompatible_new_route` |
+| An external SQLite reader prevents private-reasoning WAL truncation | Bound the cleanup wait, keep the scrubbed row recoverable in `interrupted`, block further model calls while cleanup is pending, and allow Stop to retry after the reader closes | `error` and `state.changed` record `cause=provider_reasoning_cleanup_pending`; the internal pending flag survives until a verified checkpoint | `test_secure_checkpoint_rejects_busy_wal_then_succeeds_after_reader_closes` and `test_cleanup_checkpoint_failure_interrupts_worker_without_a_ghost_run` |
 | Provider violates its response contract or throws an unexpected exception | End with an explicit failure and completion event; never leave a ghost run stuck in an active phase | `error`, terminal `state.changed`, and `run.completed` | `test_unexpected_provider_exception_never_leaves_a_ghost_run` |
 | Provider history ends with an unmatched tool call | Resume closes the protocol gap with a synthetic failure and never replays the unknown side effect | `run.resumed` records the prior phase, selected strategy, and repaired call count | `test_resume_closes_an_incomplete_tool_call_without_replaying_it` |
 | Process stops or user cancels while an action approval is open | Clear the persisted approval ID, record abandonment, and never let a stale decision authorize a later action | `approval.resolved` records `outcome=abandoned` plus `process_shutdown` or `user_cancelled` | `test_restart_abandons_pending_approval_without_replaying_action` and `test_cancel_abandons_pending_approval_and_stale_id_cannot_resolve_it` |
@@ -17,6 +19,9 @@ tests below inject failures at the boundaries most likely to matter during a liv
 TraceForge disables the OpenAI SDK's hidden retries, applies a bounded per-attempt timeout, and
 records its own retry decisions. Exhausting a retryable failure pauses rather than fails the run;
 an interrupted run has no live worker, so the user may repair provider settings and then resume.
+Resume first validates the active turn's frozen reasoning effort against the newly selected exact
+route/model capability. Provider repair may change the endpoint or model, but it cannot silently
+change the semantic request made by the interrupted turn.
 
 `run.resumed` is emitted before resumed work continues. Its strategy is application-selected:
 clarification and Plan-mode approvals return to their human gate, a persisted Agent auto-continue
@@ -25,8 +30,9 @@ instruction. Pending action approvals are different: they are abandoned before i
 can proceed because the process cannot prove that the exact call is still current. `repair.started` records the bounded cycle number and the verifier finding that caused
 it. Both events enter the same append-only sequence hashed by the Proof Pack.
 
-These tests intentionally avoid timing-based assertions. They inspect SQLite state, exact event
+These tests primarily inspect SQLite state, exact event
 payloads, model-visible protocol repair, file contents, and command-event counts, so failures are
-reproducible without an API key. Event-broker pressure is also adversarially covered: a slow
+reproducible without an API key. The WAL-busy case additionally uses a generous upper bound to
+catch accidental reintroduction of SQLite's multi-second lock wait. Event-broker pressure is also adversarially covered: a slow
 subscriber may lose bounded in-memory queue entries, but cannot fail execution, and WebSocket
 sequence gaps are replayed from the authoritative SQLite ledger.

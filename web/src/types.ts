@@ -16,6 +16,15 @@ export type RunState =
 export type CheckStatus = "pending" | "running" | "passed" | "failed" | "waived";
 export type InteractionMode = "agent" | "plan";
 export type ApprovalMode = "manual" | "automatic" | "full_access";
+export type ReasoningEffort =
+  | "auto"
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
 
 export interface QuestionOption {
   id: string;
@@ -107,6 +116,7 @@ export interface Run {
   state: RunState;
   mode: InteractionMode;
   approval_mode: ApprovalMode;
+  reasoning_effort: ReasoningEffort;
   turns: ConversationTurn[];
   verifier_enabled: boolean;
   plan: TaskPlan | null;
@@ -128,6 +138,7 @@ export interface ConversationTurn {
   request: string;
   mode: InteractionMode;
   approval_mode: ApprovalMode;
+  reasoning_effort: ReasoningEffort;
   outcome: "in_progress" | "answered" | "succeeded" | "failed" | "cancelled";
   summary: string;
   changed_files: string[];
@@ -184,6 +195,10 @@ export interface ProviderConfig {
   context_window: number | null;
   resolved_context_window: number;
   context_window_source: "configured" | "catalog" | "fallback";
+  supported_reasoning_efforts: ReasoningEffort[];
+  default_reasoning_effort: ReasoningEffort | null;
+  reasoning_effort_source: "openai_catalog" | "deepseek_catalog" | "provider_default";
+  reasoning_effort_catalog_version: string;
   updated_at: string;
 }
 

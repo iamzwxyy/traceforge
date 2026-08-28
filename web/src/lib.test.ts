@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   buildActivityChapters,
   mergeEvents,
+  modelRequestDetail,
   parseDiff,
   preferNewerRun,
   presentState,
+  reasoningErrorLabel,
   shouldSubmitPrompt,
 } from "./lib";
 import type { Run, RunEvent } from "./types";
@@ -49,6 +51,31 @@ describe("mission control helpers", () => {
     expect(shouldSubmitPrompt({ key: "Enter", shiftKey: true, isComposing: false })).toBe(false);
     expect(shouldSubmitPrompt({ key: "Enter", shiftKey: false, isComposing: true })).toBe(false);
     expect(shouldSubmitPrompt({ key: "a", shiftKey: false, isComposing: false })).toBe(false);
+  });
+
+  it("describes disabled thinking before the omitted effort field", () => {
+    expect(modelRequestDetail({ thinking: "disabled", omitted: true }, "none"))
+      .toBe("已明确关闭思考模式");
+    expect(modelRequestDetail({ thinking: "provider_default", omitted: true }, "auto"))
+      .toBe("未发送强度字段，沿用模型默认");
+    expect(modelRequestDetail({ wire_effort: "high", omitted: false }, "high"))
+      .toBe("协议档位 high");
+  });
+
+  it("turns reasoning capability failures into actionable Chinese guidance", () => {
+    expect(reasoningErrorLabel(
+      "Reasoning effort 'max' is not supported by this exact model route; choose one of: auto",
+    )).toBe("当前精确模型路由不支持所选思考强度；请改选页面提供的档位。");
+    expect(reasoningErrorLabel(
+      "The paused turn's reasoning effort is incompatible with the current exact model route.",
+    )).toBe("中断轮次的思考强度与当前精确模型路由不兼容；请恢复兼容的模型设置后再继续。");
+    expect(reasoningErrorLabel(
+      "Provider-private cleanup is still waiting for an external SQLite reader.",
+    )).toBe("SQLite WAL 仍被外部读取占用；请先关闭外部数据库读取程序，再继续此任务。");
+    expect(reasoningErrorLabel(
+      "Provider-private replay state was removed from the active record, but cleanup is pending.",
+    )).toBe("模型私有推理已从当前记录清除，但 SQLite WAL 正被外部读取占用。请关闭外部数据库读取程序，然后停止或继续此任务。");
+    expect(reasoningErrorLabel("Model request timed out")).toBeNull();
   });
 
   it("groups persisted activity into progressive-disclosure chapters", () => {

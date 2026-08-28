@@ -65,6 +65,31 @@ export function shouldSubmitPrompt(event: {
   return event.key === "Enter" && !event.shiftKey && !event.isComposing;
 }
 
+export function modelRequestDetail(
+  payload: Record<string, unknown>,
+  requestedEffort: string,
+): string {
+  if (payload.thinking === "disabled") return "已明确关闭思考模式";
+  if (payload.omitted === true) return "未发送强度字段，沿用模型默认";
+  return `协议档位 ${String(payload.wire_effort ?? requestedEffort)}`;
+}
+
+export function reasoningErrorLabel(message: string): string | null {
+  if (message.startsWith("Provider-private replay state was removed")) {
+    return "模型私有推理已从当前记录清除，但 SQLite WAL 正被外部读取占用。请关闭外部数据库读取程序，然后停止或继续此任务。";
+  }
+  if (message.startsWith("Provider-private cleanup is still waiting")) {
+    return "SQLite WAL 仍被外部读取占用；请先关闭外部数据库读取程序，再继续此任务。";
+  }
+  if (message.startsWith("The paused turn's reasoning effort is incompatible")) {
+    return "中断轮次的思考强度与当前精确模型路由不兼容；请恢复兼容的模型设置后再继续。";
+  }
+  if (message.startsWith("Reasoning effort '")) {
+    return "当前精确模型路由不支持所选思考强度；请改选页面提供的档位。";
+  }
+  return null;
+}
+
 export type ActivityPhase = "planning" | "building" | "verifying";
 
 export interface ActivityChapter {
@@ -80,6 +105,7 @@ const activityEventTypes = new Set([
   "plan.gated",
   "verification.completed",
   "repair.started",
+  "model.requested",
   "model.retry",
   "run.resumed",
   "error",

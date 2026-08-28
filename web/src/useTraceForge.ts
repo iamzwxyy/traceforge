@@ -10,6 +10,7 @@ import type {
   ProofPack,
   ProviderConfig,
   ProviderProbe,
+  ReasoningEffort,
   ProviderUpdate,
   Run,
   RunEvent,
@@ -173,11 +174,18 @@ export function useTraceForge() {
       task: string,
       mode: InteractionMode,
       approvalMode: ApprovalMode,
+      reasoningEffort: ReasoningEffort,
       target: RunTarget,
     ) => {
       setError(null);
       try {
-        const created = await api.createRun(task, mode, approvalMode, target);
+        const created = await api.createRun(
+          task,
+          mode,
+          approvalMode,
+          reasoningEffort,
+          target,
+        );
         setRuns((current) => [created, ...current]);
         selectRun(created.id);
         setStatus(await api.status());
@@ -280,8 +288,18 @@ export function useTraceForge() {
     selectedRunId,
     selectRun,
     createRun,
-    followUp: (prompt: string, mode: InteractionMode, approvalMode: ApprovalMode) =>
-      run && perform(() => api.followUp(run.id, prompt, mode, approvalMode)),
+    followUp: (
+      prompt: string,
+      mode: InteractionMode,
+      approvalMode: ApprovalMode,
+      reasoningEffort: ReasoningEffort,
+    ) => run && perform(() => api.followUp(
+      run.id,
+      prompt,
+      mode,
+      approvalMode,
+      reasoningEffort,
+    )),
     createProject,
     saveProvider,
     testProvider,

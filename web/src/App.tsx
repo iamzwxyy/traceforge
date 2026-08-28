@@ -49,7 +49,14 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import ReactMarkdown from "react-markdown";
-import { isActiveState, parseDiff, presentState, shouldSubmitPrompt } from "./lib";
+import {
+  isActiveState,
+  modelRequestDetail,
+  parseDiff,
+  presentState,
+  reasoningErrorLabel,
+  shouldSubmitPrompt,
+} from "./lib";
 import type {
   ApprovalMode,
   ClarificationAnswer,
@@ -61,6 +68,7 @@ import type {
   ProviderConfig,
   ProviderProbe,
   ProviderUpdate,
+  ReasoningEffort,
   Run,
   RunEvent,
   RunState,
@@ -79,6 +87,7 @@ const RIGHT_PANEL_MIN = 300;
 const RIGHT_PANEL_MAX = 560;
 const RIGHT_PANEL_DEFAULT = 390;
 const APPROVAL_MODE_PREFERENCE_KEY = "traceforge:approval-mode:v1";
+const DEFAULT_REASONING_EFFORTS: ReasoningEffort[] = ["auto"];
 
 function storedApprovalMode(): ApprovalMode {
   try {
@@ -374,11 +383,18 @@ export default function App() {
               defaultWorkspace={forge.status?.workspace ?? ""}
               project={composerProject}
               demoMode={forge.status?.mode === "demo"}
+              provider={forge.provider}
               providerReady={Boolean(forge.provider?.api_key_configured)}
               onOpenSettings={() => setShowSettings(true)}
               onCancel={() => setShowComposer(false)}
-              onSubmit={async (task, mode, approvalMode, target) => {
-                await forge.createRun(task, mode, approvalMode, target);
+              onSubmit={async (task, mode, approvalMode, reasoningEffort, target) => {
+                await forge.createRun(
+                  task,
+                  mode,
+                  approvalMode,
+                  reasoningEffort,
+                  target,
+                );
                 setShowComposer(false);
               }}
               canCancel={Boolean(forge.run)}
@@ -387,6 +403,7 @@ export default function App() {
             <RunStage
               run={forge.run}
               events={forge.events}
+              provider={forge.provider}
               followUpEnabled={forge.status?.mode !== "demo"}
               onAnswer={(answers) => void forge.answerQuestions(answers)}
               onPlan={(decision, feedback) => void forge.decidePlan(decision, feedback)}
@@ -399,8 +416,8 @@ export default function App() {
                 void forge.loadProofPack(forge.run!.id);
               }}
               onOpenWorkspace={() => forge.openWorkspace(forge.run!.id)}
-              onFollowUp={async (prompt, mode, approvalMode) => {
-                await forge.followUp(prompt, mode, approvalMode);
+              onFollowUp={async (prompt, mode, approvalMode, reasoningEffort) => {
+                await forge.followUp(prompt, mode, approvalMode, reasoningEffort);
               }}
             />
           )}
@@ -803,6 +820,7 @@ function TaskComposer({
   defaultWorkspace,
   project,
   demoMode,
+  provider,
   providerReady,
   onOpenSettings,
   onSubmit,
@@ -813,12 +831,14 @@ function TaskComposer({
   defaultWorkspace: string;
   project: Project | null;
   demoMode: boolean;
+  provider: ProviderConfig | null;
   providerReady: boolean;
   onOpenSettings: () => void;
   onSubmit: (
     task: string,
     mode: InteractionMode,
     approvalMode: ApprovalMode,
+    reasoningEffort: ReasoningEffort,
     target: RunTarget,
   ) => Promise<void>;
   onCancel: () => void;
@@ -829,7 +849,13 @@ function TaskComposer({
   const [approvalMode, setApprovalMode] = useState<ApprovalMode>(
     demoMode ? "automatic" : storedApprovalMode,
   );
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("auto");
   const [submitting, setSubmitting] = useState(false);
+  const supportedReasoning = provider?.supported_reasoning_efforts
+    ?? DEFAULT_REASONING_EFFORTS;
+  useEffect(() => {
+    if (!supportedReasoning.includes(reasoningEffort)) setReasoningEffort("auto");
+  }, [reasoningEffort, supportedReasoning]);
   const targetLabel = project ? project.name : demoMode ? "固定演示" : "直接任务";
   return (
     <div className="composer-wrap">
@@ -859,6 +885,7 @@ function TaskComposer({
             task.trim(),
             planMode ? "plan" : "agent",
             demoMode ? "automatic" : approvalMode,
+            demoMode ? "auto" : reasoningEffort,
             target,
           )
             .catch(() => undefined)
@@ -918,6 +945,12 @@ function TaskComposer({
             <span className="toggle" />
             <span><strong>计划模式</strong><small>先生成完整方案，确认后再实施</small></span>
           </label>
+          <ReasoningEffortSelect
+            value={reasoningEffort}
+            onChange={setReasoningEffort}
+            provider={provider}
+            disabled={demoMode}
+          />
           <div className="composer-safeguards" aria-label="任务保障">
             <span><ShieldCheck size={13} /><strong>{approvalModeLabel(approvalMode)}</strong> · {approvalModeShortDescription(approvalMode)}</span>
             <span><CheckCircle2 size={13} /><strong>完成后复核</strong> · 独立只读审查</span>
@@ -992,6 +1025,39 @@ function ApprovalModePicker({
         ))}
       </div>
     </fieldset>
+  );
+}
+
+function ReasoningEffortSelect({
+  value,
+  onChange,
+  provider,
+  disabled = false,
+}: {
+  value: ReasoningEffort;
+  onChange: (value: ReasoningEffort) => void;
+  provider: ProviderConfig | null;
+  disabled?: boolean;
+}) {
+  const efforts = provider?.supported_reasoning_efforts ?? DEFAULT_REASONING_EFFORTS;
+  return (
+    <label className="reasoning-effort-select">
+      <span><Gauge size={13} /> 思考强度</span>
+      <select
+        aria-label="本轮思考强度"
+        value={efforts.includes(value) ? value : "auto"}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value as ReasoningEffort)}
+        title={reasoningCapabilityDescription(provider)}
+      >
+        {efforts.map((effort) => (
+          <option value={effort} key={effort}>
+            {reasoningEffortOptionLabel(effort, provider)}
+          </option>
+        ))}
+      </select>
+      <small>{reasoningCapabilityDescription(provider)}</small>
+    </label>
   );
 }
 
@@ -1207,6 +1273,8 @@ function ProviderDialog({
     context_window: contextWindowValid ? parsedContextWindow : null,
     ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
   };
+  const routeDraftChanged = model.trim() !== provider.model
+    || (baseUrl.trim() || null) !== provider.base_url;
 
   return (
     <div className="modal-backdrop" role="presentation">
@@ -1224,6 +1292,13 @@ function ProviderDialog({
         </div>
         <label className="field-label"><span>模型</span><input value={model} onChange={(event) => setModel(event.target.value)} data-dialog-initial-focus /></label>
         <label className="field-label"><span>OpenAI 兼容接口地址</span><input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.deepseek.com" /></label>
+        <div className={`reasoning-capability-note ${provider.reasoning_effort_source}`}>
+          <Gauge size={16} />
+          <span>
+            <strong>当前已保存配置 · 思考强度：{provider.supported_reasoning_efforts.length > 1 ? "精确模型能力已识别" : "仅跟随模型默认"}</strong>
+            <small>{routeDraftChanged ? "模型或接口草稿已变化；保存后才会重新解析能力。 · " : ""}{reasoningCapabilityDescription(provider)} · 目录 {provider.reasoning_effort_catalog_version}</small>
+          </span>
+        </div>
         <label className="field-label">
           <span>API Key</span>
           <input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={provider.api_key_configured ? "已配置；留空则保持不变" : "输入模型服务的 API Key"} />
@@ -1304,6 +1379,7 @@ function ProviderDialog({
 function RunStage({
   run,
   events,
+  provider,
   onAnswer,
   onPlan,
   onAction,
@@ -1317,6 +1393,7 @@ function RunStage({
 }: {
   run: Run;
   events: RunEvent[];
+  provider: ProviderConfig | null;
   followUpEnabled: boolean;
   onAnswer: (answers: ClarificationAnswer[]) => void;
   onPlan: (decision: "approve" | "revise", feedback?: string) => void;
@@ -1330,6 +1407,7 @@ function RunStage({
     prompt: string,
     mode: InteractionMode,
     approvalMode: ApprovalMode,
+    reasoningEffort: ReasoningEffort,
   ) => Promise<void>;
 }) {
   const [confirmRollback, setConfirmRollback] = useState(false);
@@ -1344,6 +1422,7 @@ function RunStage({
             <StateBadge state={run.state} />
             {run.mode === "plan" && run.plan_gate && <PlanGateBadge gate={run.plan_gate} />}
             <ApprovalModeBadge mode={run.approval_mode} />
+            <ReasoningEffortBadge effort={run.reasoning_effort} />
             <span>{run.mode === "plan" ? "计划模式" : "普通 Agent"} · 第 {Math.max(run.turns.length, 1)} 轮</span>
             <span>任务 {run.id.slice(0, 8).toUpperCase()}</span>
           </div>
@@ -1406,7 +1485,10 @@ function RunStage({
         {run.state === "succeeded" && <CompletionSummary run={run} onProof={onProof} />}
         {followUpEnabled && ["answered", "succeeded", "failed", "cancelled"].includes(run.state) && (
           <FollowUpComposer
+            key={`${run.id}:${run.turns.length}`}
             defaultApprovalMode={run.approval_mode}
+            defaultReasoningEffort={run.reasoning_effort}
+            provider={provider}
             onSubmit={onFollowUp}
           />
         )}
@@ -1462,6 +1544,7 @@ function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
       "plan.gated",
       "verification.completed",
       "repair.started",
+      "model.requested",
       "model.retry",
       "run.resumed",
       "error",
@@ -1481,7 +1564,8 @@ function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
       {conversation.map((event) => {
         if (event.type === "turn.started") {
           const approvalMode = String(event.payload.approval_mode ?? "automatic") as ApprovalMode;
-          return <article className="conversation-turn user-turn" key={event.seq}><span>你 · 第 {String(event.payload.index ?? "?")} 轮 · {approvalModeLabel(approvalMode)}</span><p>{String(event.payload.request ?? "")}</p></article>;
+          const reasoningEffort = String(event.payload.reasoning_effort ?? "auto") as ReasoningEffort;
+          return <article className="conversation-turn user-turn" key={event.seq}><span>你 · 第 {String(event.payload.index ?? "?")} 轮 · {approvalModeLabel(approvalMode)} · {reasoningEffortLabel(reasoningEffort)}</span><p>{String(event.payload.request ?? "")}</p></article>;
         }
         if (event.type === "turn.completed") {
           const index = Number(event.payload.index ?? 0);
@@ -1579,6 +1663,15 @@ function ActivityItem({ event }: { event: RunEvent }) {
       <article className="activity evidence-activity repair-activity">
         <div className="activity-icon"><Wrench size={15} /></div>
         <div><span className="activity-label">有界修复</span><strong>第 {String(event.payload.cycle ?? "?")} / {String(event.payload.limit ?? "?")} 轮</strong><p>{String(event.payload.summary ?? "完成后复核要求进行修复。")}</p></div>
+      </article>
+    );
+  }
+  if (event.type === "model.requested") {
+    const effort = String(event.payload.requested_effort ?? "auto") as ReasoningEffort;
+    return (
+      <article className="activity evidence-activity model-request-activity">
+        <div className="activity-icon"><Gauge size={15} /></div>
+        <div><span className="activity-label">模型请求</span><strong>{String(event.payload.model ?? "模型")} · {reasoningEffortLabel(effort)}</strong><p>{modelRequestDetail(event.payload, effort)}</p></div>
       </article>
     );
   }
@@ -1711,13 +1804,18 @@ function CompletionSummary({ run, onProof }: { run: Run; onProof: () => void }) 
 
 function FollowUpComposer({
   defaultApprovalMode,
+  defaultReasoningEffort,
+  provider,
   onSubmit,
 }: {
   defaultApprovalMode: ApprovalMode;
+  defaultReasoningEffort: ReasoningEffort;
+  provider: ProviderConfig | null;
   onSubmit: (
     prompt: string,
     mode: InteractionMode,
     approvalMode: ApprovalMode,
+    reasoningEffort: ReasoningEffort,
   ) => Promise<void>;
 }) {
   const [prompt, setPrompt] = useState("");
@@ -1725,7 +1823,17 @@ function FollowUpComposer({
   const [approvalMode, setApprovalMode] = useState<ApprovalMode>(
     defaultApprovalMode === "full_access" ? "automatic" : defaultApprovalMode,
   );
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(
+    provider?.supported_reasoning_efforts.includes(defaultReasoningEffort)
+      ? defaultReasoningEffort
+      : "auto",
+  );
   const [submitting, setSubmitting] = useState(false);
+  const supportedReasoning = provider?.supported_reasoning_efforts
+    ?? DEFAULT_REASONING_EFFORTS;
+  useEffect(() => {
+    if (!supportedReasoning.includes(reasoningEffort)) setReasoningEffort("auto");
+  }, [reasoningEffort, supportedReasoning]);
   return (
     <form
       className="follow-up-composer"
@@ -1735,7 +1843,12 @@ function FollowUpComposer({
         if (!request || submitting) return;
         setSubmitting(true);
         persistApprovalMode(approvalMode);
-        void onSubmit(request, planMode ? "plan" : "agent", approvalMode)
+        void onSubmit(
+          request,
+          planMode ? "plan" : "agent",
+          approvalMode,
+          reasoningEffort,
+        )
           .then(() => setPrompt(""))
           .catch(() => undefined)
           .finally(() => setSubmitting(false));
@@ -1780,6 +1893,11 @@ function FollowUpComposer({
             <option value="full_access">完全访问（工作区）</option>
           </select>
         </label>
+        <ReasoningEffortSelect
+          value={reasoningEffort}
+          onChange={setReasoningEffort}
+          provider={provider}
+        />
         <span className="follow-up-hint">Enter 发送 · Shift+Enter 换行</span>
         <button className="button primary" type="submit" disabled={!prompt.trim() || submitting}>
           {submitting ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}
@@ -1884,6 +2002,17 @@ function ApprovalModeBadge({ mode }: { mode: ApprovalMode }) {
   );
 }
 
+function ReasoningEffortBadge({ effort }: { effort: ReasoningEffort }) {
+  return (
+    <span
+      className={`reasoning-effort-badge ${effort}`}
+      title={reasoningEffortDescription(effort)}
+    >
+      <Gauge size={10} />{reasoningEffortLabel(effort)}
+    </span>
+  );
+}
+
 function PlanGateSummary({ gate }: { gate: PlanGate }) {
   const automatic = gate.decision !== "approval_required";
   const title = gate.decision === "agent_continues"
@@ -1902,7 +2031,7 @@ function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; run
         <div className="modal-heading"><div><p className="eyebrow">可审计完成记录</p><h2 id="proof-title">证据包</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭证据包"><X size={17} /></button></div>
         {!pack ? <div className="proof-loading"><LoaderCircle className="spin" size={18} /> 正在汇总持久化证据…</div> : <>
           <div className={`proof-verdict ${pack.proof_status}`}><div className="evidence-seal"><Fingerprint size={22} /></div><div><span>证明状态</span><strong>{proofStatusLabel(pack.proof_status)}</strong><small>{pack.verification?.summary ?? "仍在汇总证据。"}</small></div><div><span>新鲜检查</span><strong>{pack.checks_fresh ? "是" : "否"}</strong></div></div>
-          <div className="proof-grid"><article><span>工作边界</span><strong>{pack.plan_gate ? planDecisionLabel(pack.plan_gate.decision) : "未评估"}</strong><small>{pack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>动作权限</span><strong>{approvalModeLabel(pack.turns.at(-1)?.approval_mode ?? "automatic")}</strong><small>逐轮冻结 · 实际授权与 bypass 写入工具事件</small></article><article><span>变更范围</span><strong>{pack.changed_files.length} 个文件</strong><small>{pack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(pack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(pack.command_sandbox.status)}</strong><small>{pack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {pack.command_sandbox.sandboxed_commands} 个已强制隔离 · {pack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(pack.rollback.status)}</strong><small>{pack.rollback.conflicts.length ? `保留 ${pack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>{pack.event_count} 条事件</strong><small>{pack.step_count} 个工具步骤 · {pack.repair_cycles} 轮修复</small></article></div>
+          <div className="proof-grid"><article><span>工作边界</span><strong>{pack.plan_gate ? planDecisionLabel(pack.plan_gate.decision) : "未评估"}</strong><small>{pack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>动作权限</span><strong>{approvalModeLabel(pack.turns.at(-1)?.approval_mode ?? "automatic")}</strong><small>逐轮冻结 · 实际授权与 bypass 写入工具事件</small></article><article><span>思考强度</span><strong>{reasoningEffortLabel(pack.turns.at(-1)?.reasoning_effort ?? "auto")}</strong><small>逐轮冻结 · 仅记录请求档位，不展示隐藏推理</small></article><article><span>变更范围</span><strong>{pack.changed_files.length} 个文件</strong><small>{pack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(pack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(pack.command_sandbox.status)}</strong><small>{pack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {pack.command_sandbox.sandboxed_commands} 个已强制隔离 · {pack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(pack.rollback.status)}</strong><small>{pack.rollback.conflicts.length ? `保留 ${pack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>{pack.event_count} 条事件</strong><small>{pack.step_count} 个工具步骤 · {pack.repair_cycles} 轮修复</small></article></div>
           <div className="proof-section"><div className="section-kicker">原始任务</div><p>{pack.task}</p></div>
           <div className="proof-section"><div className="section-kicker">验收证据</div>{pack.plan?.acceptance_checks.map((check) => <div className="proof-check" key={check.id}><CheckCircle2 size={14} /><span><strong>{check.label}</strong><small>{check.evidence || check.command?.join(" ") || "等待证据"}</small></span><em>{checkStatusLabel(check.status)}</em></div>) ?? <p className="muted">尚无完成契约。</p>}</div>
           <div className="digest-card"><Fingerprint size={15} /><span><small>稳定证据 SHA-256</small><code>{pack.evidence_sha256}</code></span></div>
@@ -1974,6 +2103,62 @@ function approvalModeDescription(mode: ApprovalMode): string {
     automatic: "本地确定性规则自动放行计划内动作，未知或越界动作转人工。",
     full_access: "工作区与 OS 沙箱内不询问；不可关闭的高危命令和路径边界仍会拦截。",
   }[mode];
+}
+
+function reasoningEffortLabel(effort: string): string {
+  return labelFromMap(effort, {
+    auto: "模型默认",
+    none: "关闭",
+    minimal: "最小",
+    low: "低",
+    medium: "中",
+    high: "高",
+    xhigh: "极高",
+    max: "最大",
+  });
+}
+
+function reasoningEffortOptionLabel(
+  effort: ReasoningEffort,
+  provider: ProviderConfig | null,
+): string {
+  if (effort === "auto") {
+    const knownDefault = provider?.default_reasoning_effort;
+    return knownDefault
+      ? `模型默认（当前已知：${reasoningEffortLabel(knownDefault)}）`
+      : "模型默认（不发送强度字段）";
+  }
+  return {
+    none: "关闭",
+    minimal: "最小（最低延迟）",
+    low: "低（更快）",
+    medium: "中（平衡）",
+    high: "高（更深入）",
+    xhigh: "极高（更慢、用量更高）",
+    max: "最大（最慢、用量最高）",
+  }[effort];
+}
+
+function reasoningEffortDescription(effort: ReasoningEffort): string {
+  if (effort === "auto") return "完全省略强度字段，由当前模型采用自己的默认值。";
+  if (effort === "none") return "明确关闭当前模型的思考模式（仅在模型声明支持时可选）。";
+  if (["xhigh", "max"].includes(effort)) {
+    return "适合最难任务，通常增加延迟与 token/额度用量，并不保证结果一定更好。";
+  }
+  if (effort === "high") return "为复杂任务请求更深入的推理，通常会增加延迟与用量。";
+  if (effort === "medium") return "在质量、延迟与用量之间取平衡。";
+  return "为简单或延迟敏感任务减少推理用量。";
+}
+
+function reasoningCapabilityDescription(provider: ProviderConfig | null): string {
+  if (!provider) return "正在读取当前模型的精确能力。";
+  if (provider.supported_reasoning_efforts.length === 1) {
+    return "当前精确路由没有可信档位目录，只使用模型默认且不盲发参数。";
+  }
+  const source = provider.reasoning_effort_source === "deepseek_catalog"
+    ? "DeepSeek 官方模型目录"
+    : "OpenAI 官方模型目录";
+  return `${source}：只显示该模型明确支持的档位；更高不等于必然更好。`;
 }
 
 function permissionOutcomeLabel(
@@ -2072,6 +2257,8 @@ function sandboxDetailLabel(detail: string): string {
 }
 
 function systemMessageLabel(message: string): string {
+  const reasoningLabel = reasoningErrorLabel(message);
+  if (reasoningLabel) return reasoningLabel;
   const exact: Record<string, string> = {
     "Scripted provider is ready.": "脚本化模型服务已就绪。",
     "Connection and native tool calling verified.": "连接和原生工具调用已验证。",
@@ -2089,6 +2276,7 @@ function systemMessageLabel(message: string): string {
     "The local file manager could not be opened": "无法启动本地文件管理器",
     "The local file manager could not open this workspace": "本地文件管理器无法打开此工作目录",
     "The recorded workspace path no longer points to its original directory": "任务记录的工作目录已被替换，已拒绝打开",
+    "Provider-private replay state could not be stored safely": "模型返回的私有推理状态无法安全保存，任务已停止且未保留该内容。",
   };
   if (exact[message]) return exact[message];
   const prefixes: Array<[string, string]> = [
@@ -2184,6 +2372,9 @@ function eventSummary(event: RunEvent): string {
   }
   if (event.type === "repair.started") {
     return `修复轮次 ${String(event.payload.cycle ?? "?")} 已开始`;
+  }
+  if (event.type === "model.requested") {
+    return `模型请求 · ${reasoningEffortLabel(String(event.payload.requested_effort ?? "auto"))}`;
   }
   if (event.type === "model.retry") {
     return `模型重试：第 ${String(event.payload.next_attempt ?? "?")} / ${String(event.payload.max_attempts ?? "?")} 次`;

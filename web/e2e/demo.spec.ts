@@ -27,6 +27,9 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByRole("radio", { name: /手动审批/ })).toBeDisabled();
   await expect(page.getByRole("radio", { name: /自动审批/ })).toBeChecked();
   await expect(page.getByRole("radio", { name: /完全访问（工作区）/ })).toBeDisabled();
+  await expect(page.getByLabel("本轮思考强度")).toBeDisabled();
+  await expect(page.getByLabel("本轮思考强度")).toHaveValue("auto");
+  await expect(page.getByText(/当前精确路由没有可信档位目录/).first()).toBeVisible();
   await expect(page.getByText("与计划模式独立", { exact: true })).toBeVisible();
   await expect(page.getByText("本地就绪", { exact: true })).toBeVisible();
   await expect(page.locator(".sandbox-status")).toContainText(/seatbelt|bubblewrap|仅策略限制/i);
@@ -62,6 +65,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await page.getByRole("button", { name: "批准并执行" }).click();
 
   await expect(page.getByText("本轮已完成", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator(".reasoning-effort-badge")).toContainText("模型默认");
   await expect(page.getByRole("region", { name: "第 1 轮由编辑工具更改的文件" }))
     .toContainText("src/tenant_cache_api/cache.py");
   await expect(page.getByRole("region", { name: "第 1 轮由编辑工具更改的文件" }))
@@ -98,6 +102,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(proofDialog.getByText("稳定证据 SHA-256")).toBeVisible();
   await expect(proofDialog).toContainText("4 passed");
   await expect(proofDialog.getByText("命令沙箱")).toBeVisible();
+  await expect(proofDialog.getByText("思考强度")).toBeVisible();
   await expect(proofDialog.getByText(/\d+ 个已强制隔离 · 0 个运行前拦截/)).toBeVisible();
   await expectNoWcagViolations(page, "proof pack dialog");
   await expect(page.getByRole("link", { name: "下载 Markdown" }))

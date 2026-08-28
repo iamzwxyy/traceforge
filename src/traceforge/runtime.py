@@ -14,7 +14,13 @@ from traceforge.agent import AgentManager, RunConflictError
 from traceforge.config import Settings
 from traceforge.events import EventBroker
 from traceforge.model_context import ResolvedModelContext, resolve_model_context
-from traceforge.models import ApprovalMode, InteractionMode, ProviderConfig, RunRecord
+from traceforge.models import (
+    ApprovalMode,
+    InteractionMode,
+    ProviderConfig,
+    ReasoningEffort,
+    RunRecord,
+)
 from traceforge.provider import ModelProvider, OpenAICompatibleProvider, ProviderError
 from traceforge.storage import Storage
 
@@ -168,6 +174,7 @@ class AgentRuntime:
         project_id: str | None = None,
         mode: InteractionMode = InteractionMode.AGENT,
         approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
     ) -> RunRecord:
         manager = self.manager_for_workspace(workspace)
         return await manager.start_run(
@@ -176,6 +183,7 @@ class AgentRuntime:
             project_id=project_id,
             mode=mode,
             approval_mode=approval_mode,
+            reasoning_effort=reasoning_effort,
         )
 
     def manager_for_run(self, run_id: str) -> AgentManager:
@@ -236,8 +244,14 @@ class AgentRuntime:
         if config.base_url is not None:
             config.base_url = config.base_url.strip() or None
         if config.base_url is not None:
-            parsed = urlparse(config.base_url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            try:
+                parsed = urlparse(config.base_url)
+                hostname, _port = parsed.hostname, parsed.port
+            except ValueError as exc:
+                raise ValueError(
+                    "Base URL must be an absolute http:// or https:// URL"
+                ) from exc
+            if parsed.scheme not in {"http", "https"} or not hostname:
                 raise ValueError("Base URL must be an absolute http:// or https:// URL")
         if api_key is not None:
             if config.credential_file:

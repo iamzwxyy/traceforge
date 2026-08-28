@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
-from urllib.parse import urlparse
+
+from traceforge.model_reasoning import is_official_deepseek_endpoint
 
 ContextWindowSource = Literal["configured", "catalog", "fallback"]
 
@@ -44,23 +45,7 @@ def resolve_model_context(
         return ResolvedModelContext(configured_window, "configured")
 
     normalized = model.strip().casefold()
-    if _is_official_deepseek_endpoint(base_url):
+    if is_official_deepseek_endpoint(base_url):
         if context_window := _KNOWN_CONTEXT_WINDOWS.get(normalized):
             return ResolvedModelContext(context_window, "catalog")
     return ResolvedModelContext(fallback_window, "fallback")
-
-
-def _is_official_deepseek_endpoint(base_url: str | None) -> bool:
-    if not base_url:
-        return False
-    parsed = urlparse(base_url.strip())
-    path = parsed.path.rstrip("/")
-    return (
-        parsed.scheme == "https"
-        and parsed.hostname == "api.deepseek.com"
-        and parsed.port is None
-        and path in {"", "/v1"}
-        and not parsed.query
-        and not parsed.fragment
-        and parsed.username is None
-    )

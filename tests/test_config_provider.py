@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import stat
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +9,7 @@ import pytest
 import traceforge.config as config_module
 import traceforge.provider as provider_module
 from traceforge.config import Settings
-from traceforge.models import ToolCall
+from traceforge.models import ReasoningEffort, ToolCall
 from traceforge.provider import (
     ModelResponse,
     OpenAICompatibleProvider,
@@ -150,6 +151,157 @@ async def test_openai_compatible_provider_parses_with_explicit_transport_policy(
 
 
 @pytest.mark.asyncio
+async def test_openai_reasoning_auto_omits_wire_field_and_explicit_effort_is_exact(
+    settings, monkeypatch
+) -> None:
+    completions = _FakeCompletions([_response(), _response()])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    monkeypatch.setattr(provider_module, "AsyncOpenAI", lambda **kwargs: client)
+    provider = OpenAICompatibleProvider(
+        replace(settings, model="gpt-5.6-sol", base_url=None)
+    )
+
+    await provider.complete([{"role": "user", "content": "auto"}])
+    await provider.complete(
+        [{"role": "user", "content": "hard"}],
+        reasoning_effort=ReasoningEffort.HIGH,
+    )
+
+    assert "reasoning_effort" not in completions.kwargs[0]
+    assert completions.kwargs[1]["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_unknown_route_rejects_explicit_effort_before_network(
+    settings, monkeypatch
+) -> None:
+    completions = _FakeCompletions([_response()])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    monkeypatch.setattr(provider_module, "AsyncOpenAI", lambda **kwargs: client)
+    provider = OpenAICompatibleProvider(settings)
+
+    with pytest.raises(ValueError, match="not supported"):
+        await provider.complete([], reasoning_effort=ReasoningEffort.HIGH)
+    assert completions.kwargs == []
+
+
+@pytest.mark.asyncio
+async def test_non_deepseek_routes_strip_private_reasoning_replay_state(
+    settings, monkeypatch
+) -> None:
+    completions = _FakeCompletions([_response()])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    monkeypatch.setattr(provider_module, "AsyncOpenAI", lambda **kwargs: client)
+    provider = OpenAICompatibleProvider(settings)
+
+    await provider.complete(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "PRIVATE-CROSS-PROVIDER-SENTINEL",
+                "tool_calls": [],
+            }
+        ]
+    )
+
+    assert "reasoning_content" not in completions.kwargs[0]["messages"][0]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_reasoning_replays_private_state_without_tool_choice(
+    settings, monkeypatch
+) -> None:
+    first_message = SimpleNamespace(
+        content=None,
+        tool_calls=[
+            SimpleNamespace(
+                id="call-1",
+                function=SimpleNamespace(name="read_file", arguments='{"path":"a.py"}'),
+            )
+        ],
+        reasoning_content="PRIVATE-REPLAY-SENTINEL",
+    )
+    second_message = SimpleNamespace(
+        content="done", tool_calls=[], reasoning_content="PRIVATE-FINAL-SENTINEL"
+    )
+    completions = _FakeCompletions(
+        [
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=first_message, finish_reason="tool_calls")]
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=second_message, finish_reason="stop")]
+            ),
+        ]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    monkeypatch.setattr(provider_module, "AsyncOpenAI", lambda **kwargs: client)
+    deepseek_settings = replace(
+        settings,
+        model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com/v1",
+    )
+    provider = OpenAICompatibleProvider(deepseek_settings)
+
+    first = await provider.complete(
+        [{"role": "user", "content": "inspect"}],
+        [{"type": "function"}],
+        reasoning_effort=ReasoningEffort.HIGH,
+    )
+    assistant = first.as_assistant_message()
+    await provider.complete(
+        [
+            {"role": "user", "content": "inspect"},
+            assistant,
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "content": "ok",
+            },
+        ],
+        [{"type": "function"}],
+        reasoning_effort=ReasoningEffort.HIGH,
+    )
+
+    assert completions.kwargs[0]["reasoning_effort"] == "high"
+    assert completions.kwargs[0]["extra_body"] == {
+        "thinking": {"type": "enabled"}
+    }
+    assert "tool_choice" not in completions.kwargs[0]
+    assert assistant["content"] == ""
+    assert assistant["reasoning_content"] == "PRIVATE-REPLAY-SENTINEL"
+    assert (
+        completions.kwargs[1]["messages"][1]["reasoning_content"]
+        == "PRIVATE-REPLAY-SENTINEL"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_none_disables_thinking_without_sending_effort(
+    settings, monkeypatch
+) -> None:
+    completions = _FakeCompletions([_response()])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    monkeypatch.setattr(provider_module, "AsyncOpenAI", lambda **kwargs: client)
+    provider = OpenAICompatibleProvider(
+        replace(
+            settings,
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+        )
+    )
+
+    await provider.complete([], reasoning_effort=ReasoningEffort.NONE)
+
+    assert "reasoning_effort" not in completions.kwargs[0]
+    assert completions.kwargs[0]["extra_body"] == {
+        "thinking": {"type": "disabled"}
+    }
+
+
+@pytest.mark.asyncio
 async def test_provider_rejects_bad_tool_json_and_exhaustion(settings, monkeypatch) -> None:
     completions = _FakeCompletions([_response(arguments="not-json")])
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -208,3 +360,4 @@ async def test_provider_wraps_non_retryable_api_errors(settings, monkeypatch) ->
 
     assert raised.value.retryable is False
     assert len(completions.kwargs) == 1
+    assert "invalid model" not in str(raised.value)

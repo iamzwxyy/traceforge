@@ -85,6 +85,9 @@ def test_context_resolver_rejects_unsafe_capacities(
         "https://api.deepseek.com:8443/v1",
         "https://gateway.example/v1",
         "https://api.deepseek.com/v1/models",
+        "https://api.deepseek.com:bad/v1",
+        "https://api.deepseek.com:99999/v1",
+        "https://[api.deepseek.com/v1",
     ],
 )
 def test_official_model_id_on_other_endpoints_does_not_inherit_catalog(

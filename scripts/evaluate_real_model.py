@@ -21,7 +21,13 @@ from traceforge.agent import PlanDecision
 from traceforge.config import Settings
 from traceforge.demo import DEMO_TASK
 from traceforge.events import EventBroker
-from traceforge.models import ClarificationAnswer, InteractionMode, ProviderConfig, RunState
+from traceforge.models import (
+    ClarificationAnswer,
+    InteractionMode,
+    ProviderConfig,
+    ReasoningEffort,
+    RunState,
+)
 from traceforge.proof import build_proof_pack
 from traceforge.runtime import AgentRuntime, validate_credential_file
 from traceforge.storage import Storage
@@ -187,6 +193,7 @@ async def _drive_run(
     credential_file: Path,
     model: str,
     base_url: str,
+    reasoning_effort: ReasoningEffort,
     timeout_seconds: int,
 ) -> dict[str, Any]:
     baseline_pytest = _run_host_check(workspace, [sys.executable, "-m", "pytest", "-q"])
@@ -218,7 +225,12 @@ async def _drive_run(
     started = time.perf_counter()
 
     try:
-        run = await runtime.start_run(scenario.task, workspace, mode=scenario.mode)
+        run = await runtime.start_run(
+            scenario.task,
+            workspace,
+            mode=scenario.mode,
+            reasoning_effort=reasoning_effort,
+        )
         manager = runtime.manager_for_run(run.id)
         async with asyncio.timeout(timeout_seconds):
             while True:
@@ -341,6 +353,7 @@ async def _drive_run(
             "steps": completed.step_count,
             "repair_cycles": completed.repair_cycles,
             "event_count": proof.event_count,
+            "reasoning_effort": completed.reasoning_effort.value,
             "clarification_rounds": clarification_rounds,
             "plan_reviews": plan_reviews,
             "action_prompts": action_prompts,
@@ -361,6 +374,7 @@ async def evaluate(
     credential_file: Path,
     model: str,
     base_url: str,
+    reasoning_effort: ReasoningEffort,
     timeout_seconds: int,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
@@ -376,6 +390,7 @@ async def evaluate(
                     credential_file=credential_file,
                     model=model,
                     base_url=base_url,
+                    reasoning_effort=reasoning_effort,
                     timeout_seconds=timeout_seconds,
                 )
         except TimeoutError:
@@ -403,6 +418,7 @@ async def evaluate(
         "overall": "passed" if all(item["status"] == "passed" for item in results) else "failed",
         "model": model,
         "base_url": base_url,
+        "reasoning_effort": reasoning_effort.value,
         "credential_source": "owner-only file reference",
         "scenarios": results,
     }
@@ -413,6 +429,13 @@ def main() -> int:
     parser.add_argument("--credential-file", type=Path)
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", DEFAULT_MODEL))
     parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL", DEFAULT_BASE_URL))
+    parser.add_argument(
+        "--reasoning-effort",
+        type=ReasoningEffort,
+        choices=tuple(ReasoningEffort),
+        default=ReasoningEffort.AUTO,
+        help="per-turn reasoning effort; auto omits the provider field",
+    )
     parser.add_argument(
         "--scenario",
         action="append",
@@ -444,6 +467,7 @@ def main() -> int:
             credential_file=credential_file,
             model=args.model,
             base_url=args.base_url,
+            reasoning_effort=args.reasoning_effort,
             timeout_seconds=args.timeout_seconds,
         )
     )

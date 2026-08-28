@@ -49,6 +49,17 @@ class ApprovalMode(StrEnum):
     FULL_ACCESS = "full_access"
 
 
+class ReasoningEffort(StrEnum):
+    AUTO = "auto"
+    NONE = "none"
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+
+
 class CheckStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -79,6 +90,7 @@ class EventType(StrEnum):
     DIFF_UPDATED = "diff.updated"
     VERIFICATION_COMPLETED = "verification.completed"
     REPAIR_STARTED = "repair.started"
+    MODEL_REQUESTED = "model.requested"
     MODEL_RETRY = "model.retry"
     RUN_RESUMED = "run.resumed"
     ERROR = "error"
@@ -290,6 +302,7 @@ class ConversationTurn(BaseModel):
     request: str = Field(min_length=1, max_length=20_000)
     mode: InteractionMode = InteractionMode.AGENT
     approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC
+    reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO
     outcome: Literal["in_progress", "answered", "succeeded", "failed", "cancelled"] = (
         "in_progress"
     )
@@ -362,6 +375,7 @@ class RunRecord(BaseModel):
     state: RunState = RunState.CREATED
     mode: InteractionMode = InteractionMode.AGENT
     approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC
+    reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO
     turns: list[ConversationTurn] = Field(default_factory=list)
     verifier_enabled: bool = True
     plan: TaskPlan | None = None
@@ -370,6 +384,7 @@ class RunRecord(BaseModel):
     verification: VerificationReport | None = None
     plan_gate: PlanGate | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
+    provider_reasoning_cleanup_pending: bool = False
     plan_approved: bool = False
     interrupted_from: RunState | None = None
     step_count: int = 0

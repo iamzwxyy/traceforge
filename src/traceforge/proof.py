@@ -42,11 +42,12 @@ def build_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
         "workspace": run.workspace,
         "project_id": run.project_id,
         "mode": run.mode.value,
-        # v1 predates per-turn UI navigation and permission hints. Keep its stable
-        # digest surface unchanged; permission choices remain covered by the event chain.
+        # v1 predates per-turn UI navigation, permission, and reasoning-setting hints. Keep its
+        # stable digest surface unchanged; those choices remain covered by the event chain.
         "turns": [
             turn.model_dump(
-                mode="json", exclude={"changed_files", "approval_mode"}
+                mode="json",
+                exclude={"changed_files", "approval_mode", "reasoning_effort"},
             )
             for turn in run.turns
         ],
@@ -89,6 +90,10 @@ def proof_pack_markdown(pack: ProofPack) -> str:
             "- Current action-permission profile: "
             f"`{pack.turns[-1].approval_mode.value if pack.turns else 'automatic'}`"
         ),
+        (
+            "- Current requested reasoning effort: "
+            f"`{pack.turns[-1].reasoning_effort.value if pack.turns else 'auto'}`"
+        ),
         f"- Evidence SHA-256: `{pack.evidence_sha256}`",
         f"- Event chain SHA-256: `{pack.event_chain_sha256}` ({pack.event_count} events)",
         f"- Diff source: `{pack.diff_source}`",
@@ -107,7 +112,8 @@ def proof_pack_markdown(pack: ProofPack) -> str:
                 [
                     (
                         f"### Turn {turn.index} · {turn.mode.value} · "
-                        f"{turn.approval_mode.value} approvals"
+                        f"{turn.approval_mode.value} approvals · "
+                        f"{turn.reasoning_effort.value} reasoning"
                     ),
                     "",
                     turn.request,

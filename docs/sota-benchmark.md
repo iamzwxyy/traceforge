@@ -7,29 +7,31 @@ TraceForge 不应复刻 Codex 或 DeepSeek Harness 的完整产品面。课程�
 TraceForge 自己的主线应保持鲜明：**每次改动都能给出“计划 → 差异 → 新鲜检查 → 独立验证 → 可冲突回滚”的证据闭环**。这个能力比宠物、庞大插件市场或多智能体动画更能体现工程质量，也更适合作为答辩时可现场验证的亮点。产品上可将它命名为 **Proof Pack（交付证据包）**。
 
 截至 2026-08-28，Phase A、默认 Agent / 可选计划模式、三种逐轮动作权限、同任务多轮、Proof Pack、对话 +
-折叠 Trace、故障恢复、OS 沙箱与固定质量语料均已落地；两条真实 DeepSeek 代表任务也已
+折叠 Trace、故障恢复、OS 沙箱、按模型逐轮思考强度与固定质量语料均已落地；两条真实 DeepSeek 代表任务也已
 脚本化并通过。当前工作重点转为可用性细节、完整回归和现场演示稳定性，而不是继续扩张功能面。
 
 ## 对标范围
 
 本次结论固定在以下源码版本，避免把会持续变化的 `main` 当作稳定事实：
 
-- DeepSeek Harness：[`b150a55`](https://github.com/deepseek-ai/deepseek-harness/tree/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e)
+- DeepSeek Harness：[`cd5ef81`](https://github.com/deepseek-ai/deepseek-harness/tree/cd5ef8148158c3a752a658978873241fdf8e2bbc)
 - OpenAI Codex：[`6be2a6ca`](https://github.com/openai/codex/tree/6be2a6ca952ac9f70676ce4dd07fda27175aa9dd)
 - 天枢交互：[`3e830de`](https://github.com/dmql98/tianshu/tree/3e830de4709f1b1336e97f7f1dd396630ee0beb9)
-- OpenAI 官方说明：[Codex App Server](https://developers.openai.com/codex/app-server)、[Sandbox](https://learn.chatgpt.com/docs/sandboxing)、[Approvals security](https://learn.chatgpt.com/docs/agent-approvals-security)
+- OpenAI 官方说明：[Codex App Server](https://developers.openai.com/codex/app-server)、[Latest model guide](https://developers.openai.com/api/docs/guides/latest-model)、[Sandbox](https://learn.chatgpt.com/docs/sandboxing)、[Approvals security](https://learn.chatgpt.com/docs/agent-approvals-security)
+- DeepSeek 官方说明：[Thinking mode](https://api-docs.deepseek.com/guides/thinking_mode/)、[Chat completion](https://api-docs.deepseek.com/api/create-chat-completion/)
 
-对标只覆盖与本项目直接相关的六个维度：执行循环、工具协议、上下文、审批与隔离、项目/任务模型、可观测性与测试。不把商业协作、插件生态、云执行、多智能体和装饰性功能列入 v1。
+对标只覆盖与本项目直接相关的七个维度：执行循环、工具协议、上下文、模型推理协议、审批与隔离、项目/任务模型、可观测性与测试。不把商业协作、插件生态、云执行、多智能体和装饰性功能列入 v1。
 天枢只用于交互层补充：借鉴对话/轨迹同级与工具渐进披露，不复制固定多栏、默认展开 reasoning、
 启发式文件清单或角色中心导航；具体取舍见 [UI benchmark](ui-benchmark.md)。
 
-## 六维对标
+## 七维对标
 
 | 维度 | SOTA 源码中的成熟做法 | TraceForge 现状 | 取舍 |
 | --- | --- | --- | --- |
 | 执行生命周期 | Codex 使用 Thread → Turn → Item，并流式发布 item/turn 事件；DeepSeek 将一次 turn 拆成多次 model step，持久事件承担恢复和投影 | Run 状态机清晰，规划、执行、验证、恢复均有显式状态；但 `messages_json` 仍是可变主记录 | 保留简单 Run 模型；补充更细的 step/item 事件和稳定投影，不为 v1 重写成完整事件溯源系统 |
 | 工具调度 | DeepSeek 以“可并发调用 + 独占屏障”调度，执行可重叠但结果按模型顺序提交；Codex 用读写锁让并发工具共享读锁、独占工具占写锁 | 同一模型响应中的工具逐个执行，稳定但浪费只读检查时间 | 仅并发 `list_files`、`read_file`、`search_text`；写文件、命令、计划更新和完成动作都是屏障；结果仍按原 tool-call 顺序进入历史 |
 | 上下文管理 | Codex 规范化 call/output 配对、截断工具输出并做可恢复 compaction；DeepSeek 把 runtime context 和 compaction 作为可持久替换事件 | 固定保留头部/尾部并生成确定性中段摘要，简单但长期任务会丢失关键因果 | 先做两级压缩：裁剪旧工具大输出，再生成结构化摘要；计划、文件改动、检查证据和未解决风险进入不可丢的 evidence ledger |
+| 模型推理协议 | OpenAI 按精确模型声明不同 `reasoning_effort` 集合与默认值；DeepSeek 用 thinking 开关和 effort，并要求工具调用续轮回传 `reasoning_content` | UI 按官方 endpoint + 精确 model 广告档位；选择逐轮冻结并安全记录；DeepSeek 私有推理只内部回放 | `auto` 完全省略字段；未知兼容路由不猜测；不静默降级；隐藏推理不进入 UI、事件、Verifier 或 Proof Pack |
 | 审批与隔离 | Codex 分开 sandbox、approval policy 和 reviewer；当前 Ask/auto-review 保持 workspace sandbox，真正 Full Access 才组合 danger-full-access + never；DeepSeek 对审批失败关闭并清理子进程凭据 | Agent/Plan 与逐轮 Manual/Automatic/workspace Full access 正交；基础硬策略先执行，Full 只在强制沙箱中免未知命令弹窗；Seatbelt/Bubblewrap、降级和只读复核另成层 | 保持各层边界和准确文案；不伪装独立 auto-review，不把工作区 Full 冒充宿主机 danger-full-access |
 | 项目与任务 | Codex 的 Project 是独立实体，Thread 可选 `project_id`；DeepSeek Workspace 使用规范路径对应稳定 ID，同时允许未分组 session | 已支持可空 `project_id`、直接任务、最近目录和可复用项目根目录，多工作区运行时按规范路径隔离 | 保持 Project 只是分组与稳定根目录，不引入远程 host、工作树 handoff 等平台复杂度 |
 | 观测与测试 | DeepSeek 要求用户/模型可见变更同时有可无 key 回放快照，并用真实 API E2E 验证 provider；Codex 对 turn/item/tool/compaction 都有事件和历史投影 | 已有持久事件、断线续传、fake provider 全闭环、故障注入、固定质量语料、真实 DeepSeek 双场景、独立 verifier 与可下载 Proof Pack | 保留确定性 CI 与低频真实模型双层证据；真实 API 不进入日常 CI，避免密钥、成本和模型漂移造成不稳定 |
@@ -38,13 +40,13 @@ TraceForge 自己的主线应保持鲜明：**每次改动都能给出“计划 
 
 ### 1. 并发只读工具，写操作保持屏障
 
-DeepSeek Harness 的 [`tool-calls.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/tool-calls.ts) 使用有界并发池，同时把独占工具作为屏障；Codex 的 [`parallel.rs`](https://github.com/openai/codex/blob/6be2a6ca952ac9f70676ce4dd07fda27175aa9dd/codex-rs/core/src/tools/parallel.rs) 也把可并发工具与独占工具放进同一读写门。
+DeepSeek Harness 的 [`tool-calls.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/cd5ef8148158c3a752a658978873241fdf8e2bbc/packages/core/agent-loop/src/tool-calls.ts) 使用有界并发池，同时把独占工具作为屏障；Codex 的 [`parallel.rs`](https://github.com/openai/codex/blob/6be2a6ca952ac9f70676ce4dd07fda27175aa9dd/codex-rs/core/src/tools/parallel.rs) 也把可并发工具与独占工具放进同一读写门。
 
 TraceForge 只需要其中最小且安全的子集：三个读工具并发，任何可能改变文件、证据或控制状态的工具独占。并发数应有小上限，取消时要收敛已启动任务，并为未启动调用生成有序失败结果。
 
 ### 2. 项目是分组，任务可以不属于项目
 
-Codex 的 [`project.rs`](https://github.com/openai/codex/blob/6be2a6ca952ac9f70676ce4dd07fda27175aa9dd/codex-rs/app-server-protocol/src/protocol/v2/project.rs) 将项目定义为拥有名称、根目录和元数据的独立对象，线程只保存可选项目关联。DeepSeek 的 [`workspace` 类型](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/workspace/workspace/src/types.ts) 也把 workspace 注册与 session 本身分开。
+Codex 的 [`project.rs`](https://github.com/openai/codex/blob/6be2a6ca952ac9f70676ce4dd07fda27175aa9dd/codex-rs/app-server-protocol/src/protocol/v2/project.rs) 将项目定义为拥有名称、根目录和元数据的独立对象，线程只保存可选项目关联。DeepSeek 的 [`workspace` 类型](https://github.com/deepseek-ai/deepseek-harness/blob/cd5ef8148158c3a752a658978873241fdf8e2bbc/packages/workspace/workspace/src/types.ts) 也把 workspace 注册与 session 本身分开。
 
 TraceForge 应采用同样的关系而不是复制完整 API：
 
@@ -67,17 +69,28 @@ TraceForge 不需要复制全部机制，但必须把以下信息从普通聊天
 
 ### 4. API key 不得隐式进入模型生成的子进程
 
-DeepSeek 的 [`subprocess` 环境实现](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/subprocess/subprocess/src/index.ts) 会从 ambient env 中移除名称含 `KEY`、`PASSWORD`、`SECRET`、`TOKEN` 的变量，只有可信调用方显式加入的值才会进入子进程。
+DeepSeek 的 [`subprocess` 环境实现](https://github.com/deepseek-ai/deepseek-harness/blob/cd5ef8148158c3a752a658978873241fdf8e2bbc/packages/subprocess/subprocess/src/index.ts) 会从 ambient env 中移除名称含 `KEY`、`PASSWORD`、`SECRET`、`TOKEN` 的变量，只有可信调用方显式加入的值才会进入子进程。
 
 TraceForge 当前模型客户端与命令执行器同处一个服务进程，因此这是 P0 修复：provider 可以读取 API key，但模型生成的测试命令默认不应继承它。还需用对抗测试证明清理生效。
 
 ### 5. 测试用户真正看到的闭环
 
-DeepSeek Harness 的 [`AGENTS.md`](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/AGENTS.md) 要求非平凡的用户/模型可见改动具有可无 key 回放的 assembled snapshot；mock 单测与真实 API E2E 各自解决不同问题，不能相互替代。
+DeepSeek Harness 的 [`AGENTS.md`](https://github.com/deepseek-ai/deepseek-harness/blob/cd5ef8148158c3a752a658978873241fdf8e2bbc/AGENTS.md) 要求非平凡的用户/模型可见改动具有可无 key 回放的 assembled snapshot；mock 单测与真实 API E2E 各自解决不同问题，不能相互替代。
 
 TraceForge 已具备 fake-provider 闭环、固定产品质量语料和两条真实 DeepSeek 代表场景。
 真实运行先后暴露了检查变体审批疲劳与结构化计划容错问题，两者都已形成回归测试；日常
 回归保持无 key、确定性，发布前再运行真实模型脚本。
+
+### 6. 思考强度必须是精确能力，不是模糊模型名开关
+
+OpenAI 的当前模型文档显示，不同 GPT/Codex 模型支持的档位和默认值并不相同；DeepSeek 的
+当前协议则把“是否 thinking”和 effort 分开，并要求工具调用续轮保留完整
+`reasoning_content`。因此一个全局 Low/Medium/High 下拉框会制造错误能力，也可能破坏工具协议。
+
+TraceForge 使用小型、带版本的 exact route/model 目录：已知官方 OpenAI 路由发送原值；已知
+DeepSeek 路由只展示真正不同的关闭/低/高/最大，并正确设置 thinking；未知模型或自定义网关
+只保留 `auto` 且不发送字段。选择冻结到当前 turn，恢复时重新校验路由兼容性，但不会偷偷改档。
+Provider 私有推理仅为 DeepSeek 协议续轮回放，公共事件只记录请求档位和开关状态。
 
 ## 明确不复制的部分
 
@@ -103,6 +116,7 @@ TraceForge 已具备 fake-provider 闭环、固定产品质量语料和两条真
 3. assembled transcript golden tests；真实模型代表场景脚本标准化。
 4. Agent / Plan 双模式（已完成）：普通 Agent 默认继续；需要实施时计划模式始终等待确认；问候和只读请求可直接答复；两种模式的越界写入和未知命令仍单独审批。
 5. 三种动作权限（已完成）：Manual 逐项确认，Automatic 使用本地确定性策略，workspace Full 在强制 OS 沙箱中自动处理软 `ask`；硬拒绝、真实路径和凭证边界不可升级。
+6. 按模型逐轮思考强度（已完成）：精确 endpoint/model 能力、默认省略、OpenAI/DeepSeek 协议映射、恢复兼容检查与隐藏推理隔离。
 
 ### Phase C：答辩亮点
 
@@ -119,3 +133,4 @@ TraceForge 已具备 fake-provider 闭环、固定产品质量语料和两条真
 3. 项目/直接任务、provider 自检和同任务多轮优先于并发多 Agent、插件市场等平台扩张。
 4. “已答复”与“已证实”分离：自然答复不生成计划、Verifier 结论或 Proof Pack。
 5. “完全访问”在 TraceForge 中必须显示“工作区”限定；没有强制 OS 沙箱时，未知命令降级为人工确认，且该选择不成为下一轮默认值。
+6. 思考强度与 Agent/Plan、动作权限和 Verifier 正交；只记录请求档位，不展示或暗示隐藏推理内容。

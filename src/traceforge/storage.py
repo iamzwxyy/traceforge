@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +22,7 @@ from traceforge.models import (
     PlanGate,
     ProjectRecord,
     ProviderConfig,
+    ReasoningEffort,
     RunEvent,
     RunRecord,
     RunState,
@@ -39,26 +43,92 @@ class SnapshotRecord:
     last_agent_hash: str | None
 
 
+class SecureCheckpointError(RuntimeError):
+    """A WAL truncation needed for provider-private cleanup could not be confirmed."""
+
+
 class Storage:
     """Small synchronous SQLite repository protected for async web usage."""
 
     def __init__(self, database_path: Path) -> None:
-        database_path.parent.mkdir(parents=True, exist_ok=True)
+        database_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            database_path.parent.chmod(0o700)
+        self._database_path = database_path
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
-        self._initialize()
+        try:
+            cleanup_pending = self._initialize()
+            if cleanup_pending:
+                self.secure_checkpoint()
+                with self._lock, self._connection:
+                    self._connection.execute(
+                        "UPDATE runs SET provider_reasoning_cleanup_pending = 0 "
+                        "WHERE provider_reasoning_cleanup_pending = 1"
+                    )
+            self._secure_database_files()
+        except BaseException:
+            self._secure_database_files()
+            self._connection.close()
+            raise
 
     def close(self) -> None:
         with self._lock:
+            self._secure_database_files()
             self._connection.close()
 
-    def _initialize(self) -> None:
+    def secure_checkpoint(
+        self, *, attempts: int = 10, retry_delay: float = 0.01
+    ) -> None:
+        """Flush and truncate WAL, failing if private-state cleanup cannot be confirmed."""
+
+        if attempts < 1:
+            raise ValueError("Checkpoint attempts must be at least one")
+        if retry_delay < 0:
+            raise ValueError("Checkpoint retry delay cannot be negative")
+        with self._lock:
+            timeout_row = self._connection.execute("PRAGMA busy_timeout").fetchone()
+            previous_timeout = int(timeout_row[0]) if timeout_row is not None else 0
+            self._connection.execute("PRAGMA busy_timeout = 0")
+            try:
+                for attempt in range(attempts):
+                    row = self._connection.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    ).fetchone()
+                    if row is not None and int(row[0]) == 0:
+                        self._secure_database_files()
+                        return
+                    if attempt + 1 < attempts:
+                        time.sleep(retry_delay)
+                self._secure_database_files()
+                raise SecureCheckpointError(
+                    "SQLite WAL remained busy; private-state cleanup could not be confirmed"
+                )
+            finally:
+                self._connection.execute(
+                    f"PRAGMA busy_timeout = {previous_timeout}"
+                )
+
+    def _secure_database_files(self) -> None:
+        if os.name != "posix":
+            return
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{self._database_path}{suffix}")
+            try:
+                metadata = candidate.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                candidate.chmod(0o600)
+
+    def _initialize(self) -> bool:
         with self._lock, self._connection:
             self._connection.executescript(
                 """
                 PRAGMA journal_mode = WAL;
                 PRAGMA foreign_keys = ON;
+                PRAGMA secure_delete = ON;
 
                 CREATE TABLE IF NOT EXISTS runs (
                     id TEXT PRIMARY KEY,
@@ -68,6 +138,7 @@ class Storage:
                     state TEXT NOT NULL,
                     mode TEXT NOT NULL DEFAULT 'agent',
                     approval_mode TEXT NOT NULL DEFAULT 'automatic',
+                    reasoning_effort TEXT NOT NULL DEFAULT 'auto',
                     turns_json TEXT NOT NULL DEFAULT '[]',
                     verifier_enabled INTEGER NOT NULL,
                     plan_json TEXT,
@@ -76,6 +147,7 @@ class Storage:
                     verification_json TEXT,
                     plan_gate_json TEXT,
                     messages_json TEXT NOT NULL DEFAULT '[]',
+                    provider_reasoning_cleanup_pending INTEGER NOT NULL DEFAULT 0,
                     plan_approved INTEGER NOT NULL DEFAULT 0,
                     interrupted_from TEXT,
                     step_count INTEGER NOT NULL DEFAULT 0,
@@ -146,8 +218,10 @@ class Storage:
                 "plan_gate_json": "TEXT",
                 "mode": "TEXT NOT NULL DEFAULT 'agent'",
                 "approval_mode": "TEXT NOT NULL DEFAULT 'automatic'",
+                "reasoning_effort": "TEXT NOT NULL DEFAULT 'auto'",
                 "turns_json": "TEXT NOT NULL DEFAULT '[]'",
                 "context_limit": "INTEGER NOT NULL DEFAULT 64000",
+                "provider_reasoning_cleanup_pending": "INTEGER NOT NULL DEFAULT 0",
             }
             for column, declaration in migrations.items():
                 if column not in columns:
@@ -168,6 +242,36 @@ class Storage:
                 "CREATE INDEX IF NOT EXISTS idx_runs_project_updated "
                 "ON runs(project_id, updated_at DESC)"
             )
+            self._scrub_terminal_reasoning_rows()
+            row = self._connection.execute(
+                "SELECT 1 FROM runs WHERE provider_reasoning_cleanup_pending = 1 LIMIT 1"
+            ).fetchone()
+            return row is not None
+
+    def _scrub_terminal_reasoning_rows(self) -> None:
+        """Remove private provider replay fields left by older terminal-run ordering."""
+
+        terminal = tuple(state.value for state in RunState if state.terminal)
+        placeholders = ",".join("?" for _ in terminal)
+        rows = self._connection.execute(
+            f"SELECT id, messages_json FROM runs WHERE state IN ({placeholders})",
+            terminal,
+        ).fetchall()
+        for row in rows:
+            messages = json.loads(row["messages_json"])
+            if not isinstance(messages, list):
+                continue
+            changed = False
+            for message in messages:
+                if isinstance(message, dict) and "reasoning_content" in message:
+                    message.pop("reasoning_content")
+                    changed = True
+            if changed:
+                self._connection.execute(
+                    "UPDATE runs SET messages_json = ?, "
+                    "provider_reasoning_cleanup_pending = 1 WHERE id = ?",
+                    (json.dumps(messages, ensure_ascii=False), row["id"]),
+                )
 
     def mark_active_runs_interrupted(self, workspace: Path) -> int:
         return self._mark_runs_interrupted("workspace = ?", (str(workspace),))
@@ -236,12 +340,14 @@ class Storage:
             self._connection.execute(
                 """
                 INSERT INTO runs (
-                    id, task, workspace, project_id, state, mode, approval_mode, turns_json,
+                    id, task, workspace, project_id, state, mode, approval_mode,
+                    reasoning_effort, turns_json,
                     verifier_enabled, plan_json,
                     clarification_json, pending_approval_json, verification_json,
-                    plan_gate_json, messages_json, plan_approved, interrupted_from,
+                    plan_gate_json, messages_json, provider_reasoning_cleanup_pending,
+                    plan_approved, interrupted_from,
                     step_count, repair_cycles, context_limit, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._run_values(run),
             )
@@ -254,10 +360,11 @@ class Storage:
                 """
                 UPDATE runs SET
                     task = ?, workspace = ?, project_id = ?, state = ?, mode = ?,
-                    approval_mode = ?, turns_json = ?, verifier_enabled = ?,
+                    approval_mode = ?, reasoning_effort = ?, turns_json = ?, verifier_enabled = ?,
                     plan_json = ?, clarification_json = ?, pending_approval_json = ?,
                     verification_json = ?, plan_gate_json = ?, messages_json = ?,
-                    plan_approved = ?, interrupted_from = ?, step_count = ?,
+                    provider_reasoning_cleanup_pending = ?, plan_approved = ?,
+                    interrupted_from = ?, step_count = ?,
                     repair_cycles = ?, context_limit = ?, error = ?, created_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -542,6 +649,7 @@ class Storage:
             run.state.value,
             run.mode.value,
             run.approval_mode.value,
+            run.reasoning_effort.value,
             json.dumps([turn.model_dump(mode="json") for turn in run.turns], ensure_ascii=False),
             int(run.verifier_enabled),
             _dump_model(run.plan),
@@ -550,6 +658,7 @@ class Storage:
             _dump_model(run.verification),
             _dump_model(run.plan_gate),
             json.dumps(run.messages, ensure_ascii=False),
+            int(run.provider_reasoning_cleanup_pending),
             int(run.plan_approved),
             run.interrupted_from.value if run.interrupted_from else None,
             run.step_count,
@@ -570,6 +679,7 @@ class Storage:
             state=RunState(row["state"]),
             mode=InteractionMode(row["mode"]),
             approval_mode=ApprovalMode(row["approval_mode"]),
+            reasoning_effort=ReasoningEffort(row["reasoning_effort"]),
             turns=json.loads(row["turns_json"]),
             verifier_enabled=bool(row["verifier_enabled"]),
             plan=_load_model(TaskPlan, row["plan_json"]),
@@ -578,6 +688,9 @@ class Storage:
             verification=_load_model(VerificationReport, row["verification_json"]),
             plan_gate=_load_model(PlanGate, row["plan_gate_json"]),
             messages=json.loads(row["messages_json"]),
+            provider_reasoning_cleanup_pending=bool(
+                row["provider_reasoning_cleanup_pending"]
+            ),
             plan_approved=bool(row["plan_approved"]),
             interrupted_from=(
                 RunState(row["interrupted_from"]) if row["interrupted_from"] else None

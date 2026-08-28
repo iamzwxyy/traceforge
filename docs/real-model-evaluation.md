@@ -43,10 +43,16 @@ uv run python scripts/evaluate_real_model.py \
   --credential-file /absolute/path/to/provider-key \
   --model deepseek-v4-flash-vision-exp \
   --base-url https://api.deepseek.com \
+  --reasoning-effort high \
   --output /tmp/traceforge-real-model-report.json
 ```
 
 Use `--scenario single-file-fast-path` or `--scenario multi-file-review-path` to isolate one case.
+`--reasoning-effort` defaults to `auto`, which omits the wire field and leaves the provider in
+control. An explicit value is accepted only when the exact official endpoint/model capability
+catalog advertises it; the evaluator report records the requested level, not hidden reasoning.
+For the DeepSeek route above, `none` disables thinking and `low`, `high`, or `max` enable the
+corresponding protocol mode. The evaluator never prints or exports `reasoning_content`.
 The command is intentionally absent from CI: endpoint availability, cost, rate limits, and model
 drift should not make deterministic pull-request checks flaky.
 

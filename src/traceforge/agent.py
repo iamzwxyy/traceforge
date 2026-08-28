@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from traceforge.config import Settings
 from traceforge.context import ContextManager
 from traceforge.events import EventBroker
+from traceforge.model_reasoning import ReasoningCapability, resolve_reasoning_capability
 from traceforge.models import (
     ApprovalMode,
     ApprovalRequest,
@@ -23,6 +24,7 @@ from traceforge.models import (
     EventType,
     InteractionMode,
     PlanGate,
+    ReasoningEffort,
     RunEvent,
     RunRecord,
     RunState,
@@ -36,7 +38,7 @@ from traceforge.models import (
 from traceforge.planning import assess_plan_gate
 from traceforge.prompts import BUILDER_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT
 from traceforge.provider import ModelProvider, ModelResponse, ProviderError
-from traceforge.storage import Storage
+from traceforge.storage import SecureCheckpointError, Storage
 from traceforge.tools import PermissionDecision, PermissionResolution, ToolRegistry
 from traceforge.workspace import RollbackResult, Workspace
 
@@ -168,12 +170,14 @@ class AgentManager:
         project_id: str | None = None,
         mode: InteractionMode = InteractionMode.AGENT,
         approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
     ) -> RunRecord:
         clean_task = task.strip()
         if not clean_task:
             raise ValueError("Task must not be empty")
         if self.storage.has_active_run(self.settings.workspace):
             raise RunConflictError("This workspace already has an active or interrupted run")
+        self._reasoning_capability().validate(reasoning_effort)
         run = RunRecord(
             id=uuid4().hex,
             task=clean_task,
@@ -181,6 +185,7 @@ class AgentManager:
             project_id=project_id,
             mode=mode,
             approval_mode=approval_mode,
+            reasoning_effort=reasoning_effort,
             verifier_enabled=verifier_enabled,
             context_limit=self.settings.context_limit,
             turns=[
@@ -189,6 +194,7 @@ class AgentManager:
                     request=clean_task,
                     mode=mode,
                     approval_mode=approval_mode,
+                    reasoning_effort=reasoning_effort,
                 )
             ],
         )
@@ -207,6 +213,7 @@ class AgentManager:
                 "request": clean_task,
                 "mode": mode.value,
                 "approval_mode": approval_mode.value,
+                "reasoning_effort": reasoning_effort.value,
             },
         )
         self._spawn(run.id, resume=False)
@@ -219,6 +226,7 @@ class AgentManager:
         *,
         mode: InteractionMode = InteractionMode.AGENT,
         approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
     ) -> RunRecord:
         clean_prompt = prompt.strip()
         if not clean_prompt:
@@ -235,16 +243,19 @@ class AgentManager:
             raise RunConflictError("This workspace already has an active or interrupted run")
         if run_id in self._tasks and not self._tasks[run_id].done():
             raise RunConflictError("Run is already active")
+        self._reasoning_capability().validate(reasoning_effort)
 
         index = len(run.turns) + 1
         run.mode = mode
         run.approval_mode = approval_mode
+        run.reasoning_effort = reasoning_effort
         run.turns.append(
             ConversationTurn(
                 index=index,
                 request=clean_prompt,
                 mode=mode,
                 approval_mode=approval_mode,
+                reasoning_effort=reasoning_effort,
             )
         )
         run.plan = None
@@ -268,6 +279,7 @@ class AgentManager:
                 "request": clean_prompt,
                 "mode": mode.value,
                 "approval_mode": approval_mode.value,
+                "reasoning_effort": reasoning_effort.value,
             },
         )
         self._spawn(run.id, resume=False)
@@ -329,8 +341,8 @@ class AgentManager:
                 pass
         elif run.state is RunState.INTERRUPTED:
             await self._abandon_pending_approval(run, cause="user_cancelled")
-            await self._transition(run, RunState.CANCELLED)
-            await self._close_turn(run, "cancelled", "The user stopped this turn.")
+            if await self._transition(run, RunState.CANCELLED):
+                await self._close_turn(run, "cancelled", "The user stopped this turn.")
         return self.storage.get_run(run_id)
 
     async def resume(self, run_id: str) -> RunRecord:
@@ -339,6 +351,24 @@ class AgentManager:
             raise InvalidRunAction("Only interrupted runs can be resumed")
         if run_id in self._tasks and not self._tasks[run_id].done():
             raise RunConflictError("Run is already active")
+        if run.provider_reasoning_cleanup_pending:
+            try:
+                self.storage.secure_checkpoint()
+            except SecureCheckpointError as exc:
+                raise InvalidRunAction(
+                    "Provider-private cleanup is still waiting for an external SQLite reader. "
+                    "Close external database readers before resuming."
+                ) from exc
+            run.provider_reasoning_cleanup_pending = False
+            self.storage.save_run(run)
+        effort = self._active_turn(run).reasoning_effort
+        try:
+            self._reasoning_capability().validate(effort)
+        except ValueError as exc:
+            raise InvalidRunAction(
+                "The paused turn's reasoning effort is incompatible with the current exact "
+                f"model route. Restore a compatible model setting before resuming. {exc}"
+            ) from exc
         self._controls[run_id] = _Control()
         self._spawn(run_id, resume=True)
         return run
@@ -446,13 +476,15 @@ class AgentManager:
                     current.interrupted_from = current.state
                     await self._transition(current, RunState.INTERRUPTED)
                 else:
-                    await self._transition(current, RunState.CANCELLED)
-                    await self._close_turn(
-                        current, "cancelled", "The user stopped this turn."
-                    )
-                    await self.broker.emit(
-                        run_id, EventType.RUN_COMPLETED, {"state": RunState.CANCELLED.value}
-                    )
+                    if await self._transition(current, RunState.CANCELLED):
+                        await self._close_turn(
+                            current, "cancelled", "The user stopped this turn."
+                        )
+                        await self.broker.emit(
+                            run_id,
+                            EventType.RUN_COMPLETED,
+                            {"state": RunState.CANCELLED.value},
+                        )
             raise
         except ProviderError as exc:
             current = self.storage.get_run(run_id)
@@ -1072,7 +1104,8 @@ class AgentManager:
             for step in run.plan.steps:
                 step.status = "completed"
         self.storage.save_run(run)
-        await self._transition(run, RunState.SUCCEEDED)
+        if not await self._transition(run, RunState.SUCCEEDED):
+            return
         await self._close_turn(
             run,
             "succeeded",
@@ -1089,7 +1122,8 @@ class AgentManager:
         )
 
     async def _complete_answer(self, run: RunRecord, content: str) -> None:
-        await self._transition(run, RunState.ANSWERED)
+        if not await self._transition(run, RunState.ANSWERED):
+            return
         await self._close_turn(run, "answered", content)
         await self.broker.emit(
             run.id,
@@ -1101,7 +1135,8 @@ class AgentManager:
         run.error = error
         self.storage.save_run(run)
         await self.broker.emit(run.id, EventType.ERROR, {"message": error})
-        await self._transition(run, RunState.FAILED)
+        if not await self._transition(run, RunState.FAILED):
+            return
         await self._close_turn(run, "failed", error)
         await self.broker.emit(
             run.id,
@@ -1139,9 +1174,53 @@ class AgentManager:
     ) -> ModelResponse:
         attempts = self.settings.model_retry_attempts
         delay = self.settings.model_retry_delay
+        capability = self._reasoning_capability()
+        effort = self._active_turn(run).reasoning_effort
+        capability.validate(effort)
+        wire_effort = (
+            None
+            if effort is ReasoningEffort.AUTO
+            or (
+                capability.transport == "deepseek_chat"
+                and effort is ReasoningEffort.NONE
+            )
+            else effort.value
+        )
         for attempt in range(1, attempts + 1):
             try:
-                response = await self.provider.complete(messages, tools)
+                await self.broker.emit(
+                    run.id,
+                    EventType.MODEL_REQUESTED,
+                    {
+                        "turn_index": self._active_turn(run).index,
+                        "phase": run.state.value,
+                        "attempt": attempt,
+                        "model": self.settings.model,
+                        "requested_effort": effort.value,
+                        "wire_effort": wire_effort,
+                        "omitted": wire_effort is None,
+                        "thinking": (
+                            "disabled"
+                            if capability.transport == "deepseek_chat"
+                            and effort is ReasoningEffort.NONE
+                            else (
+                                "enabled"
+                                if capability.transport == "deepseek_chat"
+                                and effort is not ReasoningEffort.AUTO
+                                else "provider_default"
+                            )
+                        ),
+                        "capability_source": capability.source,
+                    },
+                )
+                if effort is ReasoningEffort.AUTO:
+                    response = await self.provider.complete(messages, tools)
+                else:
+                    response = await self.provider.complete(
+                        messages,
+                        tools,
+                        reasoning_effort=effort,
+                    )
                 if not isinstance(response, ModelResponse):
                     raise ProviderError(
                         "Model provider returned an invalid response object",
@@ -1309,12 +1388,29 @@ class AgentManager:
             },
         )
 
-    async def _transition(self, run: RunRecord, new_state: RunState) -> None:
-        if run.state is new_state:
-            self.storage.save_run(run)
-            return
-        if new_state not in _ALLOWED_TRANSITIONS[run.state]:
+    async def _transition(self, run: RunRecord, new_state: RunState) -> bool:
+        same_state = run.state is new_state
+        if not same_state and new_state not in _ALLOWED_TRANSITIONS[run.state]:
             raise RuntimeError(f"Invalid run transition: {run.state.value} -> {new_state.value}")
+        if new_state.terminal:
+            # Persist and physically checkpoint the scrub while the row is still recoverable.
+            # A crash or busy WAL can then leave an interrupted run, never a terminal row that
+            # still contains provider-private replay state.
+            scrubbed = self._scrub_provider_reasoning(run)
+            run.provider_reasoning_cleanup_pending = (
+                run.provider_reasoning_cleanup_pending or scrubbed
+            )
+            self.storage.save_run(run)
+            if run.provider_reasoning_cleanup_pending:
+                try:
+                    self.storage.secure_checkpoint()
+                except SecureCheckpointError:
+                    await self._interrupt_for_reasoning_cleanup(run, new_state)
+                    return False
+                run.provider_reasoning_cleanup_pending = False
+                self.storage.save_run(run)
+        if same_state:
+            return True
         previous = run.state
         run.state = new_state
         self.storage.save_run(run)
@@ -1322,6 +1418,40 @@ class AgentManager:
             run.id,
             EventType.STATE_CHANGED,
             {"state": new_state.value, "previous": previous.value},
+        )
+        return True
+
+    async def _interrupt_for_reasoning_cleanup(
+        self, run: RunRecord, intended_state: RunState
+    ) -> None:
+        previous = run.state
+        run.interrupted_from = previous
+        run.state = RunState.INTERRUPTED
+        run.error = (
+            "Provider-private replay state was removed from the active record, but SQLite "
+            "WAL cleanup is waiting for an external reader. Close external database readers, "
+            "then stop or resume this task."
+        )
+        self.storage.save_run(run)
+        await self.broker.emit(
+            run.id,
+            EventType.ERROR,
+            {
+                "message": run.error,
+                "cause": "provider_reasoning_cleanup_pending",
+                "category": "storage_cleanup",
+                "recoverable": True,
+                "intended_state": intended_state.value,
+            },
+        )
+        await self.broker.emit(
+            run.id,
+            EventType.STATE_CHANGED,
+            {
+                "state": RunState.INTERRUPTED.value,
+                "previous": previous.value,
+                "cause": "provider_reasoning_cleanup_pending",
+            },
         )
 
     def _append_clarification_answers(
@@ -1366,8 +1496,18 @@ class AgentManager:
         )
 
     def _assistant_message_for_storage(self, response: ModelResponse) -> dict[str, Any]:
-        serialized = json.dumps(response.as_assistant_message(), ensure_ascii=False)
-        return cast(dict[str, Any], json.loads(self._redact(serialized)))
+        message = response.as_assistant_message()
+        private_reasoning = message.pop("reasoning_content", None)
+        serialized = json.dumps(message, ensure_ascii=False)
+        stored = cast(dict[str, Any], json.loads(self._redact(serialized)))
+        if private_reasoning is not None:
+            if self._redact(private_reasoning) != private_reasoning:
+                raise ProviderError(
+                    "Provider-private replay state could not be stored safely",
+                    category="provider_contract",
+                )
+            stored["reasoning_content"] = private_reasoning
+        return stored
 
     def _event_for_model(self, event: RunEvent) -> dict[str, Any]:
         payload = event.model_dump(mode="json")
@@ -1531,6 +1671,7 @@ class AgentManager:
             request=run.task,
             mode=run.mode,
             approval_mode=run.approval_mode,
+            reasoning_effort=run.reasoning_effort,
         )
         run.turns.append(turn)
         return turn
@@ -1574,6 +1715,7 @@ class AgentManager:
         limit = 20_000 if outcome == "answered" else 4_000
         turn.summary = self._redact(summary)[:limit]
         turn.completed_at = utc_now()
+        self._scrub_provider_reasoning(run)
         self.storage.save_run(run)
         await self.broker.emit(
             run.id,
@@ -1584,8 +1726,23 @@ class AgentManager:
                 "summary": turn.summary,
                 "changed_files": turn.changed_files,
                 "approval_mode": turn.approval_mode.value,
+                "reasoning_effort": turn.reasoning_effort.value,
             },
         )
+
+    def _reasoning_capability(self) -> ReasoningCapability:
+        return resolve_reasoning_capability(
+            self.settings.model, base_url=self.settings.base_url
+        )
+
+    @staticmethod
+    def _scrub_provider_reasoning(run: RunRecord) -> bool:
+        scrubbed = False
+        for message in run.messages:
+            if "reasoning_content" in message:
+                message.pop("reasoning_content")
+                scrubbed = True
+        return scrubbed
 
     def _clarification_round(self, run_id: str) -> int:
         count = 0
