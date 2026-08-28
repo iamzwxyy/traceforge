@@ -222,7 +222,7 @@ def _read_api_key(settings: Settings, config: ProviderConfig) -> str:
             raise ValueError("Credential file must contain exactly one non-empty line")
         return value
     if settings.api_key:
-        return settings.api_key
+        return _normalized_api_key(settings.api_key)[0]
     raise ValueError("Configure a credential file or set OPENAI_API_KEY before starting a run")
 
 
@@ -245,6 +245,16 @@ class AgentRuntime:
         self._provider_lock = asyncio.Lock()
         self._resumed_runs: set[str] = set()
         self._resume_watchers: set[asyncio.Task[None]] = set()
+        try:
+            environment_key = _normalized_api_key(settings.api_key)[0]
+        except ValueError:
+            environment_key = ""
+        self.storage.register_credential_guard(environment_key)
+        try:
+            configured_key = _read_api_key(settings, self.provider_config)
+        except ValueError:
+            configured_key = ""
+        self.storage.register_credential_guard(configured_key)
 
     @property
     def provider_config(self) -> ProviderConfig:
@@ -264,13 +274,13 @@ class AgentRuntime:
 
     def credential_configured(self, config: ProviderConfig | None = None) -> bool:
         selected = config or self.provider_config
-        if selected.credential_file:
-            try:
-                _read_api_key(self.settings, selected)
-            except ValueError:
-                return False
+        if self.provider_override is not None:
             return True
-        return bool(self.settings.api_key) or self.provider_override is not None
+        try:
+            _read_api_key(self.settings, selected)
+        except ValueError:
+            return False
+        return True
 
     def connection_verified(self) -> bool:
         if self.provider_override is not None:
@@ -448,10 +458,14 @@ class AgentRuntime:
         if api_key is not None:
             if config.credential_file:
                 raise ValueError("Choose either an API key or a credential file, not both")
-            return _normalized_api_key(api_key)[0]
+            selected = _normalized_api_key(api_key)[0]
+            self.storage.register_credential_guard(selected)
+            return selected
         if self.provider_override is not None:
             return ""
-        return _read_api_key(self.settings, config)
+        selected = _read_api_key(self.settings, config)
+        self.storage.register_credential_guard(selected)
+        return selected
 
     @staticmethod
     def _same_provider_config(left: ProviderConfig, right: ProviderConfig) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,16 @@ def test_credential_readiness_rejects_empty_or_multiline_files(
     assert runtime.credential_configured(config) is False
     credential.write_text("one-line-value\n")
     assert runtime.credential_configured(config) is True
+
+
+def test_environment_credential_must_also_be_exactly_one_line(
+    settings, storage: Storage
+) -> None:
+    multiline = "\n".join(("first", "second"))
+    invalid = replace(settings, api_key=multiline)
+    runtime = AgentRuntime(invalid, storage, EventBroker(storage))
+
+    assert runtime.credential_configured() is False
 
 
 @pytest.mark.asyncio

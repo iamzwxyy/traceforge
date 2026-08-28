@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +35,75 @@ def contains_redactable_secret(text: str, *, api_key: str = "") -> bool:
     """
 
     return bool(_redaction_intervals(text, api_key=api_key))
+
+
+def contains_secret_representation(text: str, *, api_key: str = "") -> bool:
+    """Detect a credential in raw or repeatedly JSON-escaped form.
+
+    Nested protocol messages can contain JSON encoded as a string. A key containing quotes,
+    backslashes, or control characters therefore changes representation at every nesting level.
+    Generate exactly the variants that can fit in ``text`` instead of assuming one escape pass.
+    """
+
+    if contains_redactable_secret(text, api_key=api_key):
+        return True
+    if not api_key:
+        return False
+    candidate = api_key
+    seen: set[str] = set()
+    while candidate and candidate not in seen and len(candidate) <= len(text):
+        seen.add(candidate)
+        candidate = json.dumps(candidate, ensure_ascii=False)[1:-1]
+        if candidate in text:
+            return True
+    return False
+
+
+def contains_redactable_json_secret(value: Any, *, api_key: str = "") -> bool:
+    """Return whether any string key or value in JSON-like data contains a credential."""
+
+    if isinstance(value, str):
+        return contains_redactable_secret(value, api_key=api_key)
+    if isinstance(value, (list, tuple)):
+        return any(
+            contains_redactable_json_secret(item, api_key=api_key) for item in value
+        )
+    if isinstance(value, dict):
+        return any(
+            (
+                isinstance(key, str)
+                and contains_redactable_secret(key, api_key=api_key)
+            )
+            or contains_redactable_json_secret(item, api_key=api_key)
+            for key, item in value.items()
+        )
+    return False
+
+
+def boundary_safe_json_dumps(value: Any, *, sort_keys: bool = False) -> str:
+    """Serialize JSON with a newline at every semantic token boundary.
+
+    Provider credentials are required to be single-line values. The newline framing prevents a
+    credential from being synthesized only after adjacent values, keys, or JSON punctuation are
+    joined. Callers still have to inspect source leaves and the finished serialization.
+    """
+
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        indent=0,
+        separators=(",", ":\n"),
+        sort_keys=sort_keys,
+    )
+
+
+def contains_redactable_serialized_json_secret(
+    value: Any, *, api_key: str = ""
+) -> bool:
+    """Inspect the exact boundary-safe JSON bytes, including nested escaped keys."""
+
+    serialized = boundary_safe_json_dumps(value)
+    return contains_secret_representation(serialized, api_key=api_key)
 
 
 def redact_json_value(value: Any, *, api_key: str = "") -> Any:

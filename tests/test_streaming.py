@@ -26,6 +26,10 @@ from traceforge.provider import (
 from traceforge.storage import Storage
 from traceforge.streaming import (
     StableStreamingRedactor,
+    boundary_safe_json_dumps,
+    contains_redactable_json_secret,
+    contains_redactable_serialized_json_secret,
+    contains_secret_representation,
     json_string_field_prefix,
     redact_text,
 )
@@ -945,6 +949,44 @@ def test_redaction_marker_collision_never_releases_configured_key() -> None:
     assert redactor.finish(content) == expected
 
 
+def test_nested_json_secret_detection_includes_object_keys_and_token_shapes() -> None:
+    configured = 'owner"secret\\tail\tsegment'
+
+    assert contains_redactable_json_secret(
+        {"safe": [{configured: "value"}]}, api_key=configured
+    )
+    assert contains_redactable_json_secret(
+        {"safe": ("prefix sk-abcdefghijklmnop suffix",)}, api_key=""
+    )
+    assert not contains_redactable_json_secret(
+        {"safe": [False, 0, None, "ordinary text"]}, api_key=configured
+    )
+
+
+def test_boundary_safe_json_cannot_synthesize_a_single_line_key_from_structure() -> None:
+    configured = 'foo", "start_line": 1'
+    value = {"path": "foo", "start_line": 1}
+
+    assert not contains_redactable_json_secret(value, api_key=configured)
+    assert configured in json.dumps(value, ensure_ascii=False)
+    assert configured not in boundary_safe_json_dumps(value)
+    assert not contains_redactable_serialized_json_secret(
+        value, api_key=configured
+    )
+
+
+def test_nested_json_escape_levels_are_detected_without_a_fixed_depth() -> None:
+    configured = 'owner"secret\\tail\tsegment'
+    candidate = configured
+    for _ in range(12):
+        candidate = json.dumps(candidate, ensure_ascii=False)[1:-1]
+
+    assert contains_secret_representation(candidate, api_key=configured)
+    assert contains_redactable_serialized_json_secret(
+        {"nested_json": candidate}, api_key=configured
+    )
+
+
 def test_assistant_storage_redacts_escaped_credentials_before_json_serialization(
     settings: Settings,
     storage: Storage,
@@ -1552,7 +1594,7 @@ class _UnsafeReasoningStreamingProvider:
 
 
 @pytest.mark.asyncio
-async def test_post_stream_private_reasoning_rejection_aborts_the_durable_draft(
+async def test_post_stream_private_reasoning_rejection_aborts_before_provider_completion(
     settings: Settings,
     storage: Storage,
 ) -> None:
@@ -1568,11 +1610,8 @@ async def test_post_stream_private_reasoning_rejection_aborts_the_durable_draft(
     event_types = [event.type for event in events]
 
     assert completed.state is RunState.FAILED
-    assert EventType.ASSISTANT_OUTPUT_COMPLETED in event_types
+    assert EventType.ASSISTANT_OUTPUT_COMPLETED not in event_types
     assert EventType.ASSISTANT_OUTPUT_ABORTED in event_types
-    assert event_types.index(EventType.ASSISTANT_OUTPUT_COMPLETED) < event_types.index(
-        EventType.ASSISTANT_OUTPUT_ABORTED
-    )
     assert storage.list_open_assistant_output_streams(run.id) == []
 
 

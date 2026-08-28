@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import time
@@ -760,6 +761,128 @@ def test_websocket_replays_persisted_events(settings: Settings) -> None:
             first = websocket.receive_json()
             assert first["seq"] == 1
             assert first["type"] == "state.changed"
+
+
+def test_rest_and_websocket_redact_legacy_credential_payloads(
+    settings: Settings,
+) -> None:
+    configured = 'owner"secret\\tail\tsegment'
+    protected = replace(settings, api_key=configured)
+    app = create_app(protected, provider=ScriptedProvider([]))
+    run = RunRecord(
+        id="legacy-secret-output",
+        task="Inspect safely",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.AWAITING_ACTION_APPROVAL,
+    )
+    app.state.storage.create_run(run)
+    approval = {
+        "id": "legacy-approval",
+        "tool_call": {
+            "id": "legacy-call",
+            "name": "run_command",
+            "arguments": {"argv": ["python", "-c", configured]},
+        },
+        "summary": "Legacy action",
+        "reason": "Approval required",
+        "risk": "elevated",
+        "approval_mode": "automatic",
+        "policy_decision": "ask",
+        "sandbox_bypass_on_approve": False,
+    }
+    event_payload = {
+        "id": "legacy-call",
+        "name": "run_command",
+        "arguments": {"argv": ["python", "-c", configured]},
+    }
+    with sqlite3.connect(settings.data_dir / "traceforge.db") as legacy_writer:
+        legacy_writer.execute(
+            "UPDATE runs SET pending_approval_json = ? WHERE id = ?",
+            (json.dumps(approval, ensure_ascii=False), run.id),
+        )
+        legacy_writer.execute(
+            """
+            INSERT INTO events(run_id, seq, type, payload_json, created_at)
+            VALUES (?, 1, ?, ?, '2026-08-28T00:00:00+00:00')
+            """,
+            (
+                run.id,
+                EventType.TOOL_REQUESTED.value,
+                json.dumps(event_payload, ensure_ascii=False),
+            ),
+        )
+
+    escaped = json.dumps(configured, ensure_ascii=False)[1:-1].encode()
+    with TestClient(app) as client:
+        run_response = client.get(f"/api/runs/{run.id}")
+        event_response = client.get(f"/api/runs/{run.id}/events")
+        for response in (run_response, event_response):
+            assert response.status_code == 200
+            assert configured.encode() not in response.content
+            assert escaped not in response.content
+        assert event_response.json()[0]["payload"]["arguments"]["argv"][-1] == "█" * 10
+
+        with client.websocket_connect(f"/api/runs/{run.id}/events") as websocket:
+            raw = websocket.receive_text().encode()
+            assert configured.encode() not in raw
+            assert escaped not in raw
+
+
+def test_rest_and_websocket_json_do_not_synthesize_a_configured_key(
+    settings: Settings,
+) -> None:
+    configured = 'foo", "start_line": 1'
+    protected = replace(settings, api_key=configured)
+    app = create_app(protected, provider=ScriptedProvider([]))
+    run = RunRecord(
+        id="structural-output",
+        task="Inspect safely",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+    )
+    app.state.storage.create_run(run)
+    app.state.storage.append_event(
+        run.id,
+        EventType.TOOL_REQUESTED,
+        {"path": "foo", "start_line": 1},
+    )
+
+    with TestClient(app) as client:
+        response = client.get(f"/api/runs/{run.id}/events")
+        assert response.status_code == 200
+        assert configured.encode() not in response.content
+        assert response.json()[0]["payload"] == {"path": "foo", "start_line": 1}
+        with client.websocket_connect(f"/api/runs/{run.id}/events") as websocket:
+            raw = websocket.receive_text().encode()
+            assert configured.encode() not in raw
+            assert json.loads(raw)["payload"] == {"path": "foo", "start_line": 1}
+
+
+@pytest.mark.parametrize(
+    ("configured", "path", "expected_status"),
+    [
+        ('openapi":"3.1.0","info', "/api/openapi.json", 200),
+        ('detail":"Not Found', "/api/missing-route", 404),
+    ],
+)
+def test_framework_generated_rest_json_uses_the_public_credential_boundary(
+    settings: Settings,
+    configured: str,
+    path: str,
+    expected_status: int,
+) -> None:
+    app = create_app(
+        replace(settings, api_key=configured),
+        provider=ScriptedProvider([]),
+    )
+
+    with TestClient(app) as client:
+        response = client.get(path)
+
+    assert response.status_code == expected_status
+    assert configured.encode() not in response.content
+    assert isinstance(response.json(), dict)
 
 
 def test_projects_direct_tasks_and_directory_browser(settings: Settings, tmp_path) -> None:

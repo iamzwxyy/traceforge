@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import stat
 from dataclasses import replace
 from types import SimpleNamespace
@@ -101,7 +102,8 @@ def test_model_response_serializes_tool_calls() -> None:
     assert plain.as_assistant_message() == {"role": "assistant", "content": "done"}
     serialized = called.as_assistant_message()
     assert serialized["content"] is None
-    assert serialized["tool_calls"][0]["function"]["arguments"] == '{"path": "a.py"}'
+    arguments = serialized["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(arguments) == {"path": "a.py"}
 
 
 class _FakeCompletions:

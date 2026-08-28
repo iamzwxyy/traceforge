@@ -28,7 +28,12 @@ from traceforge.models import (
     ToolResult,
 )
 from traceforge.proof import build_proof_pack, build_success_proof_pack
-from traceforge.storage import SecureCheckpointError, SnapshotRecord, Storage
+from traceforge.storage import (
+    CredentialPersistenceError,
+    SecureCheckpointError,
+    SnapshotRecord,
+    Storage,
+)
 
 
 def test_run_and_events_round_trip(storage: Storage, settings: Settings) -> None:
@@ -1125,6 +1130,146 @@ def test_storage_files_are_owner_only(storage: Storage, settings: Settings) -> N
     assert settings.data_dir.stat().st_mode & 0o077 == 0
     for database_file in settings.data_dir.glob("test.db*"):
         assert database_file.stat().st_mode & 0o077 == 0
+
+
+def test_registered_credential_guard_rejects_run_event_and_snapshot_writes(
+    storage: Storage, settings: Settings
+) -> None:
+    configured = 'owner"secret\\tail\tsegment'
+    storage.register_credential_guard(configured)
+
+    with pytest.raises(CredentialPersistenceError):
+        storage.create_run(
+            RunRecord(
+                id="unsafe-run",
+                task=f"Inspect {configured}",
+                workspace=str(settings.workspace),
+            )
+        )
+
+    storage.create_run(
+        RunRecord(id="safe-run", task="Inspect safely", workspace=str(settings.workspace))
+    )
+    with pytest.raises(CredentialPersistenceError):
+        storage.append_event(
+            "safe-run",
+            EventType.MESSAGE,
+            {"content": configured},
+        )
+    with pytest.raises(CredentialPersistenceError):
+        storage.save_snapshot_if_absent(
+            SnapshotRecord(
+                run_id="safe-run",
+                path="unsafe.txt",
+                existed=True,
+                content=configured.encode(),
+                mode=0o600,
+                original_hash=None,
+                last_agent_hash=None,
+            )
+        )
+
+    assert [run.id for run in storage.list_runs()] == ["safe-run"]
+    assert storage.get_events("safe-run") == []
+    assert storage.list_snapshots("safe-run") == []
+    escaped = json.dumps(configured, ensure_ascii=False)[1:-1].encode()
+    for database_file in settings.data_dir.glob("test.db*"):
+        database_bytes = database_file.read_bytes()
+        assert configured.encode() not in database_bytes
+        assert escaped not in database_bytes
+
+
+def test_boundary_safe_storage_and_public_json_prevent_structural_synthesis(
+    storage: Storage, settings: Settings
+) -> None:
+    configured = 'foo", "start_line": 1'
+    storage.register_credential_guard(configured)
+    storage.create_run(
+        RunRecord(id="structured", task="Inspect safely", workspace=str(settings.workspace))
+    )
+
+    event = storage.append_event(
+        "structured",
+        EventType.TOOL_REQUESTED,
+        {"path": "foo", "start_line": 1},
+    )
+    rendered = storage.render_public_json(event.model_dump(mode="json"))
+    storage.secure_checkpoint()
+
+    assert json.loads(rendered)["payload"] == {"path": "foo", "start_line": 1}
+    assert configured.encode() not in rendered
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert configured.encode() not in database_file.read_bytes()
+
+
+def test_upgrade_abandons_pre_boundary_active_action_decisions(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-action.db"
+    repository = Storage(database)
+    approval = ApprovalRequest(
+        id="legacy-approval",
+        tool_call=ToolCall(
+            id="legacy-call",
+            name="run_command",
+            arguments={"argv": ["git", "status"]},
+        ),
+        summary="Inspect status",
+        reason="Approval required",
+        risk="elevated",
+    )
+    run = RunRecord(
+        id="legacy-action",
+        task="Inspect",
+        workspace=str(tmp_path),
+        state=RunState.EXECUTING,
+        pending_approval=approval,
+        messages=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "legacy-call",
+                        "type": "function",
+                        "function": {
+                            "name": "run_command",
+                            "arguments": '{"argv":["git","status"]}',
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    repository.create_run(run)
+    run.state = RunState.AWAITING_ACTION_APPROVAL
+    repository.open_decision(
+        run,
+        previous_state=RunState.EXECUTING,
+        request_id=approval.id,
+        kind=DecisionKind.ACTION,
+        turn_index=1,
+        subject=approval.model_dump(mode="json"),
+        requested_event_type=EventType.APPROVAL_REQUESTED,
+        requested_payload=approval.model_dump(mode="json"),
+    )
+    with sqlite3.connect(database) as legacy_writer:
+        legacy_writer.execute(
+            "DELETE FROM schema_migrations WHERE name = 'credential-boundary-v1'"
+        )
+    repository.close()
+
+    migrated = Storage(database)
+    try:
+        migrated_run = migrated.get_run(run.id)
+        assert migrated_run.pending_approval is None
+        assert migrated_run.messages == []
+        assert migrated.get_active_decision(run.id) is None
+        assert migrated.get_decision(run.id, approval.id).status is DecisionStatus.ABANDONED
+        assert migrated.get_events(run.id)[-1].payload == {
+            "kind": DecisionKind.ACTION.value,
+            "cause": "credential_boundary_upgrade",
+        }
+    finally:
+        migrated.close()
 
 
 def test_startup_scrubs_private_reasoning_from_legacy_terminal_rows(

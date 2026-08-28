@@ -138,6 +138,22 @@ closes the SDK transport on timeout/cancellation/boundary failure, honors bounde
 surfaces refusal text, validates chunk types and finish reasons, and applies both per-field and
 whole-stream budgets.
 
+Before the returned `ModelResponse` can enter phase logic, `AgentManager` constructs a fresh
+canonical response. Public prose and terminal presentation arguments are deep-redacted. Tool-call
+IDs/names, private replay state, and non-terminal arguments are behavior-bearing, so a credential
+match rejects the response before durable stream completion, history, approval, or dispatch. The
+same boundary canonicalizes local `ToolResult` output/error/metadata before any event or model
+history write. User-authored task and decision payloads cross an equivalent pre-persistence guard.
+
+JSON then has one wire invariant across provider history, SQLite, REST, and WebSocket: a newline is
+inserted at every semantic token boundary and the exact serialized string is checked for raw and
+repeatedly escaped registered credentials plus token-shaped secrets. This second pass matters
+because an adversarial key can otherwise be synthesized only when separately safe fields meet JSON
+punctuation. `Storage` owns the in-memory credential set, the final persistence assertion, and the
+public redaction/serialization projection; the key values themselves never enter SQLite. Snapshot
+BLOBs are checked before insertion, while native edits check both old and proposed UTF-8 content
+before snapshot or mutation.
+
 The UI rebuilds each stream from persisted `(stream_id, segment_index)` identities, uses the full
 completed content as a convergence record, and projects the linked terminal event into one stable
 conversation item. Reconnect replay and duplicate events are idempotent. Older non-streaming runs
@@ -369,7 +385,11 @@ SQLite uses WAL mode. Its core tables include:
   path persists it as unverified;
 - `preferences`: small local UI choices such as the last direct-task workspace.
 
-Startup migrations add compatible columns to early v0.1 databases. WebSocket clients request
+Startup migrations add compatible columns to early v0.1 databases. The credential-boundary
+migration abandons every pre-boundary pending/accepted action decision and clears its pending
+subject plus replay messages, so an old approval cannot become executable after restart. Historical
+events and immutable Proof Packs are not rewritten because their hashes are evidence; public reads
+still redact the currently registered key and standard token shapes. WebSocket clients request
 events after their last sequence; the server replays persisted rows before subscribing to new
 ones. One workspace permits one active or interrupted run to avoid overlapping writes; different
 workspaces use separate managers and may run concurrently. Before constructing FastAPI or opening

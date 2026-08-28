@@ -36,6 +36,12 @@ from traceforge.models import (
     VerificationReport,
     utc_now,
 )
+from traceforge.streaming import (
+    boundary_safe_json_dumps,
+    contains_secret_representation,
+    redact_json_value,
+    redact_text,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +63,10 @@ class DecisionConflictError(RuntimeError):
     """A durable user-decision request was stale, conflicting, or invalid."""
 
 
+class CredentialPersistenceError(RuntimeError):
+    """Credential-like data reached a durable or public serialization boundary."""
+
+
 class Storage:
     """Small synchronous SQLite repository protected for async web usage."""
 
@@ -68,6 +78,7 @@ class Storage:
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        self._guarded_credentials: set[str] = set()
         try:
             cleanup_pending = self._initialize()
             if cleanup_pending:
@@ -82,6 +93,94 @@ class Storage:
             self._secure_database_files()
             self._connection.close()
             raise
+
+    def register_credential_guard(self, api_key: str) -> None:
+        """Keep a credential in memory so later writes and public projections fail closed."""
+
+        if not api_key:
+            return
+        if "\n" in api_key or "\r" in api_key:
+            raise ValueError("Provider credentials must contain exactly one line")
+        with self._lock:
+            self._guarded_credentials.add(api_key)
+
+    def redact_public_value(self, value: Any) -> Any:
+        """Return a deep redacted copy suitable for a REST or WebSocket response."""
+
+        safe = value
+        try:
+            safe = redact_json_value(safe, api_key="")
+            with self._lock:
+                credentials = tuple(self._guarded_credentials)
+            for api_key in credentials:
+                safe = redact_json_value(safe, api_key=api_key)
+        except ValueError as exc:
+            raise CredentialPersistenceError(
+                "Public data could not be redacted without changing its structure"
+            ) from exc
+        self._assert_safe_value(safe)
+        return safe
+
+    def redact_public_text(self, value: str) -> str:
+        safe = redact_text(value, api_key="")
+        with self._lock:
+            credentials = tuple(self._guarded_credentials)
+        for api_key in credentials:
+            safe = redact_text(safe, api_key=api_key)
+        self._assert_safe_text(safe)
+        return safe
+
+    def render_public_json(self, value: Any) -> bytes:
+        safe = self.redact_public_value(value)
+        rendered = boundary_safe_json_dumps(safe)
+        self._assert_safe_text(rendered)
+        return rendered.encode("utf-8")
+
+    def _assert_safe_text(self, value: str) -> None:
+        if contains_secret_representation(value, api_key=""):
+            raise CredentialPersistenceError(
+                "Credential-like data cannot cross this serialization boundary"
+            )
+        with self._lock:
+            credentials = tuple(self._guarded_credentials)
+        if any(
+            contains_secret_representation(value, api_key=api_key)
+            for api_key in credentials
+        ):
+            raise CredentialPersistenceError(
+                "Credential-like data cannot cross this serialization boundary"
+            )
+
+    def _assert_safe_value(self, value: Any) -> None:
+        if isinstance(value, BaseModel):
+            self._assert_safe_value(value.model_dump(mode="json"))
+            return
+        if isinstance(value, str):
+            self._assert_safe_text(value)
+            return
+        if isinstance(value, bytes):
+            self._assert_safe_text(value.decode("utf-8", errors="ignore"))
+            with self._lock:
+                credentials = tuple(self._guarded_credentials)
+            if any(api_key.encode("utf-8") in value for api_key in credentials):
+                raise CredentialPersistenceError(
+                    "Credential-like data cannot cross this serialization boundary"
+                )
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                self._assert_safe_value(key)
+                self._assert_safe_value(item)
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                self._assert_safe_value(item)
+
+    def _json_dumps(self, value: Any, *, sort_keys: bool = False) -> str:
+        self._assert_safe_value(value)
+        rendered = boundary_safe_json_dumps(value, sort_keys=sort_keys)
+        self._assert_safe_text(rendered)
+        return rendered
 
     def close(self) -> None:
         with self._lock:
@@ -329,11 +428,83 @@ class Storage:
                     "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
                     ("proof-packs-v2", utc_now().isoformat()),
                 )
+            credential_migration = self._connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                ("credential-boundary-v1",),
+            ).fetchone()
+            if credential_migration is None:
+                self._invalidate_pre_boundary_action_decisions()
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+                    ("credential-boundary-v1", utc_now().isoformat()),
+                )
             self._scrub_terminal_reasoning_rows()
             row = self._connection.execute(
                 "SELECT 1 FROM runs WHERE provider_reasoning_cleanup_pending = 1 LIMIT 1"
             ).fetchone()
             return row is not None
+
+    def _invalidate_pre_boundary_action_decisions(self) -> None:
+        """Never execute an action approval persisted before provider-ingress hardening."""
+
+        rows = self._connection.execute(
+            """
+            SELECT DISTINCT run_id FROM decision_requests
+            WHERE kind = ? AND status IN (?, ?)
+            """,
+            (
+                DecisionKind.ACTION.value,
+                DecisionStatus.PENDING.value,
+                DecisionStatus.ACCEPTED.value,
+            ),
+        ).fetchall()
+        if not rows:
+            return
+        now = utc_now()
+        for row in rows:
+            run_id = str(row["run_id"])
+            self._connection.execute(
+                """
+                UPDATE decision_requests
+                SET status = ?, consumed_at = ?
+                WHERE run_id = ? AND kind = ? AND status IN (?, ?)
+                """,
+                (
+                    DecisionStatus.ABANDONED.value,
+                    now.isoformat(),
+                    run_id,
+                    DecisionKind.ACTION.value,
+                    DecisionStatus.PENDING.value,
+                    DecisionStatus.ACCEPTED.value,
+                ),
+            )
+            self._connection.execute(
+                """
+                UPDATE runs
+                SET pending_approval_json = NULL, messages_json = ?
+                WHERE id = ?
+                """,
+                (boundary_safe_json_dumps([]), run_id),
+            )
+            sequence = self._next_event_seq_locked(run_id)
+            self._connection.execute(
+                """
+                INSERT INTO events(run_id, seq, type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    sequence,
+                    EventType.DECISION_ABANDONED.value,
+                    boundary_safe_json_dumps(
+                        {
+                            "kind": DecisionKind.ACTION.value,
+                            "cause": "credential_boundary_upgrade",
+                        }
+                    ),
+                    now.isoformat(),
+                ),
+            )
 
     def _scrub_terminal_reasoning_rows(self) -> None:
         """Remove private provider replay fields left by older terminal-run ordering."""
@@ -357,7 +528,7 @@ class Storage:
                 self._connection.execute(
                     "UPDATE runs SET messages_json = ?, "
                     "provider_reasoning_cleanup_pending = 1 WHERE id = ?",
-                    (json.dumps(messages, ensure_ascii=False), row["id"]),
+                    (boundary_safe_json_dumps(messages), row["id"]),
                 )
 
     def mark_active_runs_interrupted(self, workspace: Path) -> int:
@@ -412,13 +583,12 @@ class Storage:
                         row["id"],
                         sequence,
                         EventType.STATE_CHANGED.value,
-                        json.dumps(
+                        boundary_safe_json_dumps(
                             {
                                 "state": RunState.INTERRUPTED.value,
                                 "previous": row["state"],
                                 "cause": "process_restart",
-                            },
-                            ensure_ascii=False,
+                            }
                         ),
                         now.isoformat(),
                     ),
@@ -546,6 +716,7 @@ class Storage:
         return row is not None
 
     def create_project(self, project: ProjectRecord) -> None:
+        self._assert_safe_value(project)
         try:
             with self._lock, self._connection:
                 self._connection.execute(
@@ -619,6 +790,7 @@ class Storage:
         self, config: ProviderConfig, *, verified_at: datetime | None = None
     ) -> None:
         config.updated_at = utc_now()
+        self._assert_safe_value(config)
         with self._lock, self._connection:
             self._connection.execute(
                 """
@@ -653,6 +825,7 @@ class Storage:
         return None if row is None else str(row["value"])
 
     def set_preference(self, key: str, value: str) -> None:
+        self._assert_safe_value({key: value})
         with self._lock, self._connection:
             self._connection.execute(
                 """
@@ -838,7 +1011,7 @@ class Storage:
         """Persist a decision before HTTP acknowledges it; exact retries are idempotent."""
 
         payload_sha256 = decision_payload_sha256(payload)
-        rendered = _canonical_json(payload)
+        rendered = self._json_dumps(payload, sort_keys=True)
         now = utc_now()
         with self._lock, self._connection:
             row = self._connection.execute(
@@ -1008,6 +1181,7 @@ class Storage:
         *,
         event_type: EventType,
         event_payload: dict[str, Any],
+        include_request_id: bool = True,
     ) -> tuple[DecisionRequest, RunEvent]:
         """Atomically clear a decision's run subject, close its inbox row, and audit it."""
 
@@ -1046,8 +1220,8 @@ class Storage:
                 type=event_type,
                 payload={
                     **event_payload,
-                    "request_id": request_id,
                     "kind": record.kind.value,
+                    **({"request_id": request_id} if include_request_id else {}),
                 },
                 created_at=now,
             )
@@ -1102,7 +1276,7 @@ class Storage:
                     event.run_id,
                     event.seq,
                     event.type.value,
-                    json.dumps(event.payload, ensure_ascii=False),
+                    self._json_dumps(event.payload),
                     event.created_at.isoformat(),
                 ),
             )
@@ -1497,15 +1671,16 @@ class Storage:
     def _save_proof_pack_if_absent_locked(
         self, run_id: str, turn_index: int, pack: ProofPack
     ) -> ProofPack:
-        pack = ProofPack.model_validate_json(pack.model_dump_json())
+        pack = ProofPack.model_validate(pack.model_dump(mode="json"))
         self._validate_proof_pack_key(pack, run_id, turn_index)
+        rendered = self._json_dumps(pack.model_dump(mode="json"))
         self._connection.execute(
             """
             INSERT OR IGNORE INTO proof_packs(
                 run_id, turn_index, proof_json, created_at
             ) VALUES (?, ?, ?, ?)
             """,
-            (run_id, turn_index, pack.model_dump_json(), utc_now().isoformat()),
+            (run_id, turn_index, rendered, utc_now().isoformat()),
         )
         row = self._connection.execute(
             """
@@ -1537,6 +1712,15 @@ class Storage:
             raise ValueError("Proof Pack event boundary is inconsistent")
 
     def save_snapshot_if_absent(self, snapshot: SnapshotRecord) -> bool:
+        self._assert_safe_value(
+            {
+                "run_id": snapshot.run_id,
+                "path": snapshot.path,
+                "content": snapshot.content,
+                "original_hash": snapshot.original_hash,
+                "last_agent_hash": snapshot.last_agent_hash,
+            }
+        )
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 """
@@ -1583,8 +1767,16 @@ class Storage:
             for row in rows
         ]
 
-    @staticmethod
-    def _run_values(run: RunRecord) -> tuple[Any, ...]:
+    def _run_values(self, run: RunRecord) -> tuple[Any, ...]:
+        self._assert_safe_value(
+            {
+                "id": run.id,
+                "task": run.task,
+                "workspace": run.workspace,
+                "project_id": run.project_id,
+                "error": run.error,
+            }
+        )
         return (
             run.id,
             run.task,
@@ -1594,14 +1786,14 @@ class Storage:
             run.mode.value,
             run.approval_mode.value,
             run.reasoning_effort.value,
-            json.dumps([turn.model_dump(mode="json") for turn in run.turns], ensure_ascii=False),
+            self._json_dumps([turn.model_dump(mode="json") for turn in run.turns]),
             int(run.verifier_enabled),
-            _dump_model(run.plan),
-            _dump_model(run.clarification),
-            _dump_model(run.pending_approval),
-            _dump_model(run.verification),
-            _dump_model(run.plan_gate),
-            json.dumps(run.messages, ensure_ascii=False),
+            self._dump_model(run.plan),
+            self._dump_model(run.clarification),
+            self._dump_model(run.pending_approval),
+            self._dump_model(run.verification),
+            self._dump_model(run.plan_gate),
+            self._json_dumps(run.messages),
             int(run.provider_reasoning_cleanup_pending),
             int(run.plan_approved),
             run.interrupted_from.value if run.interrupted_from else None,
@@ -1612,6 +1804,11 @@ class Storage:
             run.created_at.isoformat(),
             run.updated_at.isoformat(),
         )
+
+    def _dump_model(self, value: BaseModel | None) -> str | None:
+        if value is None:
+            return None
+        return self._json_dumps(value.model_dump(mode="json"))
 
     def _update_run_locked(
         self, run: RunRecord, *, expected_state: RunState | None = None
@@ -1723,7 +1920,7 @@ class Storage:
                 event.run_id,
                 event.seq,
                 event.type.value,
-                json.dumps(event.payload, ensure_ascii=False),
+                self._json_dumps(event.payload),
                 event.created_at.isoformat(),
             ),
         )
@@ -1744,7 +1941,11 @@ class Storage:
                 decision.turn_index,
                 decision.subject_sha256,
                 decision.status.value,
-                _canonical_json(decision.payload) if decision.payload is not None else None,
+                (
+                    self._json_dumps(decision.payload, sort_keys=True)
+                    if decision.payload is not None
+                    else None
+                ),
                 decision.payload_sha256,
                 decision.created_at.isoformat(),
                 decision.accepted_at.isoformat() if decision.accepted_at else None,
@@ -1838,12 +2039,6 @@ class Storage:
                 else None
             ),
         )
-
-
-def _dump_model(value: BaseModel | None) -> str | None:
-    if value is None:
-        return None
-    return value.model_dump_json()
 
 
 def _canonical_json(value: dict[str, Any]) -> str:

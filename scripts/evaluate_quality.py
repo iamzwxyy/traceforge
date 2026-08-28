@@ -136,11 +136,12 @@ SCENARIOS = (
     ),
     Scenario(
         id="streaming-integrity",
-        title="Durable and redacted streaming",
+        title="Durable, redacted, and boundary-safe output",
         claim=(
-            "Visible output is incrementally persisted without credential leakage; retries, "
-            "cancellation, and restart remain isolated; malformed streams fail closed; and exactly "
-            "one stream plus its terminal turn is committed atomically as the canonical result."
+            "Visible output is incrementally persisted without credential leakage; semantic "
+            "provider data cannot carry a credential into execution; JSON structure, native "
+            "snapshots, SQLite, REST, and WebSocket fail closed; retries, cancellation, and "
+            "restart remain isolated; and exactly one stream plus its terminal turn is canonical."
         ),
         tests=(
             (
@@ -155,6 +156,38 @@ SCENARIOS = (
             (
                 "tests/test_streaming.py::"
                 "test_assistant_storage_redacts_escaped_credentials_before_json_serialization"
+            ),
+            (
+                "tests/test_streaming.py::"
+                "test_boundary_safe_json_cannot_synthesize_a_single_line_key_from_structure"
+            ),
+            (
+                "tests/test_agent.py::"
+                "test_provider_tool_credentials_fail_before_execution_or_persistence"
+            ),
+            (
+                "tests/test_agent.py::"
+                "test_structural_json_cannot_synthesize_a_credential_in_agent_history"
+            ),
+            (
+                "tests/test_agent.py::"
+                "test_tool_result_metadata_is_recursively_redacted_before_persistence"
+            ),
+            (
+                "tests/test_agent.py::"
+                "test_resume_abandons_an_accepted_legacy_secret_action_without_execution"
+            ),
+            (
+                "tests/test_storage.py::"
+                "test_registered_credential_guard_rejects_run_event_and_snapshot_writes"
+            ),
+            (
+                "tests/test_api.py::"
+                "test_rest_and_websocket_json_do_not_synthesize_a_configured_key"
+            ),
+            (
+                "tests/test_tools.py::"
+                "test_native_mutations_never_snapshot_or_write_credentials"
             ),
             "tests/test_streaming.py::test_openai_stream_rejects_unsafe_protocol_shapes",
             (
@@ -183,7 +216,7 @@ SCENARIOS = (
             ),
             (
                 "tests/test_streaming.py::"
-                "test_post_stream_private_reasoning_rejection_aborts_the_durable_draft"
+                "test_post_stream_private_reasoning_rejection_aborts_before_provider_completion"
             ),
             (
                 "tests/test_streaming.py::"

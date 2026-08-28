@@ -187,11 +187,31 @@ attempt under its own stream ID. Token matching is boundary-independent and happ
 replacement, so adjacent credentials and token values ending in `-` cannot create a newly exposed
 prefix. The replacement glyph is selected outside the configured key's alphabet, so even a key equal
 to a legacy marker—or text on either side of a removed interval—cannot synthesize the key again.
-Provider messages and nested tool arguments are recursively redacted before JSON escaping; private
-reasoning is rejected by source-interval detection rather than marker comparison. There is no
-unredacted or non-stream fallback after public partial output. Adversarial tests split exact,
-adjacent, token-shaped, marker-collision, and JSON-escaped secrets at every relevant boundary and
-scan the resulting SQLite files.
+Every provider response then crosses one canonical ingress before semantic use. Presentation-only
+fields (`respond_to_user.content`, `finish.summary`, and ordinary progress text) are recursively
+redacted. Provider-controlled identities, private reasoning, and every non-terminal tool argument
+are semantic control data: credential-bearing values are rejected before history, events, approval,
+or execution instead of being mutated and then executed. Plans and verifier verdicts therefore fail
+closed too. Tool results apply the presentation policy to output, error, and nested metadata while
+rejecting credential-bearing result identities. User task text, follow-ups, clarification answers,
+and plan feedback are rejected before durable acceptance when they contain the configured key or a
+token-shaped secret.
+
+Leaf inspection is not the last check. Credentials are single-line values, and every durable JSON,
+REST JSON, and WebSocket event uses a serializer that inserts a newline at each semantic JSON token
+boundary. The finished serialization is scanned for raw and repeatedly JSON-escaped forms, so safe
+individual fields cannot combine with quotes, commas, keys, or neighboring values to synthesize a
+credential. SQLite keeps the current credential guard only in process memory; it checks run rows,
+events, decisions, Proof Packs, and snapshot bytes before writes. Public projections recursively
+redact registered keys and `sk-...` values, then scan the exact response bytes. There is no
+unredacted or non-stream fallback after public partial output. Adversarial tests cover exact,
+adjacent, token-shaped, marker-collision, JSON-escaped, nested-metadata, and structural-synthesis
+cases across SQLite, REST, and WebSocket boundaries.
+
+Native file mutations also inspect the proposed content and the existing UTF-8 file before taking a
+rollback snapshot. A configured credential or token-shaped secret stops the operation before either
+snapshot or write. This is an exact current-key/token boundary, not a general source-code secret
+classifier.
 
 An `assistant.output.started` row remains a durable provisional owner until an abort or
 `turn.completed.final_stream_id` closes it. Startup aborts every open owner in the same transaction
@@ -205,8 +225,14 @@ Provider exceptions are converted to bounded categories such as timeout, connect
 request rejection, and contract failure. Raw SDK exception text is not copied into run errors,
 because it may contain request bodies, credentials, or hidden provider fields.
 
-If a credential is ever committed, deleting the file is insufficient: revoke the credential,
-replace it, and remove it from history before publishing.
+On upgrade, every still-pending or durably accepted action approval created before this ingress
+boundary is abandoned, its pending subject and private protocol messages are cleared, and it cannot
+execute after resume. Existing immutable events and Proof Packs are not silently rewritten because
+that would invalidate their evidence hashes. TraceForge can redact the currently configured key and
+standard `sk-...` tokens at public read time, but it cannot infer an arbitrary nonstandard credential
+that was rotated before upgrade. If an older TraceForge version may have committed a credential,
+revoke it, replace it, and remove the old local database/history; deleting only a workspace file is
+insufficient.
 
 ## Provider-private reasoning
 
@@ -336,8 +362,9 @@ ID; a lineage conflict refreshes the parent and task list so the existing succes
 - The macOS profile permits loopback so project tests can bind local servers; another trusted local
   process could still be reachable.
 - Read-only classification is syntactic; aliases/wrappers are treated as unknown, not trusted.
-- A benign repository may contain secrets in ordinary source files that the user asked the model
-  to inspect.
+- A benign repository may contain arbitrary secrets in ordinary source files. TraceForge blocks the
+  currently configured provider key and recognizable `sk-...` values at its durable/public
+  boundaries, but it is not a general secret vault or repository-wide secret scanner.
 - SQLite data remains until the platform data directory is removed.
 - A process crash can leave provider-private reasoning in the owner-only database for an active or
   interrupted DeepSeek turn because protocol-correct resume may need it. A terminal transition is

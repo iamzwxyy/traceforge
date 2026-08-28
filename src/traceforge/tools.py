@@ -18,6 +18,7 @@ from traceforge.models import ApprovalMode, FinishRequest, TaskPlan, ToolCall, T
 from traceforge.patching import FilePatch, PatchError, apply_file_patch, parse_unified_diff
 from traceforge.planning import is_safe_routine_check_variant
 from traceforge.sandbox import CommandSandbox, SandboxStatus
+from traceforge.streaming import contains_redactable_secret
 from traceforge.workspace import Workspace, WorkspaceViolation, digest
 
 OutputCallback = Callable[[str], Awaitable[None]]
@@ -68,6 +69,7 @@ class ToolRegistry:
     def __init__(self, workspace: Workspace, settings: Settings) -> None:
         self.workspace = workspace
         self.settings = settings
+        self.workspace.storage.register_credential_guard(settings.api_key)
         self.sandbox = CommandSandbox(
             workspace.root, credential_file=settings.credential_file
         )
@@ -493,12 +495,14 @@ class ToolRegistry:
             else:
                 path = self.workspace.resolve_write(file_patch.old_path, must_exist=True)
                 original = path.read_text(encoding="utf-8")
+                self._reject_credential_text(original)
             if file_patch.new_path is None:
                 rendered = None
             else:
                 if file_patch.old_path and file_patch.new_path != file_patch.old_path:
                     raise PatchError("File renames are not supported in v1")
                 rendered = apply_file_patch(original, file_patch)
+                self._reject_credential_text(rendered)
             planned.append((file_patch, path, rendered))
         for _file_patch, path, rendered in planned:
             self.workspace.snapshot(run_id, path)
@@ -511,12 +515,20 @@ class ToolRegistry:
         return self.workspace.diff(run_id)
 
     def _create_file(self, run_id: str, path: str, content: str) -> str:
+        self._reject_credential_text(content)
         target = self.workspace.resolve_write(path, must_exist=False)
         self.workspace.snapshot(run_id, target)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         self.workspace.record_agent_version(run_id, target)
         return self.workspace.diff(run_id)
+
+    def _reject_credential_text(self, content: str) -> None:
+        if contains_redactable_secret(content, api_key=self.settings.api_key):
+            raise ValueError(
+                "Native file mutation was rejected because its content contains "
+                "credential-like data"
+            )
 
     async def _run_command(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -39,7 +40,7 @@ from traceforge.proof import build_proof_pack, proof_pack_markdown
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
 from traceforge.sandbox import SandboxStatus
 from traceforge.storage import SecureCheckpointError, Storage
-from traceforge.streaming import redact_text
+from traceforge.streaming import contains_redactable_json_secret, redact_text
 
 
 async def _wait_for_state(
@@ -265,7 +266,8 @@ async def test_direct_response_must_be_a_separate_terminal_tool_call(
     rejected = [
         message
         for message in completed.messages
-        if message.get("role") == "tool" and '"ok":false' in str(message.get("content"))
+        if message.get("role") == "tool"
+        and json.loads(str(message.get("content"))).get("ok") is False
     ]
     assert {message["name"] for message in rejected} == {
         "respond_to_user",
@@ -2712,6 +2714,494 @@ async def test_credential_like_private_reasoning_fails_closed_without_persistenc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "secret_location",
+    ["argument_value", "argument_key", "call_id", "call_name"],
+)
+async def test_provider_tool_credentials_fail_before_execution_or_persistence(
+    settings: Settings,
+    storage: Storage,
+    secret_location: str,
+) -> None:
+    configured = 'owner"secret\\tail\tsegment'
+    arguments = {"path": "missing.txt"}
+    call_id = "unsafe-read"
+    call_name = "read_file"
+    if secret_location == "argument_value":
+        arguments["path"] = configured
+    elif secret_location == "argument_key":
+        arguments[configured] = "provider-controlled"
+    elif secret_location == "call_id":
+        call_id = configured
+    else:
+        call_name = configured
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id=call_id, name=call_name, arguments=arguments)
+                ]
+            ),
+            _direct_response("This fallback must not be requested."),
+        ]
+    )
+    manager = AgentManager(replace(settings, api_key=configured), storage, provider)
+
+    run = await manager.start_run("Inspect a safe path")
+    completed = await manager.wait(run.id)
+    events = storage.get_events(run.id)
+    persisted = json.dumps(
+        {
+            "run": completed.model_dump(mode="json"),
+            "events": [event.model_dump(mode="json") for event in events],
+        },
+        ensure_ascii=False,
+    )
+
+    assert completed.state is RunState.FAILED
+    assert completed.error == (
+        "Provider tool call contained credential-like data and was rejected before "
+        "storage or execution"
+    )
+    assert len(provider.requests) == 1
+    assert not any(
+        event.type in {EventType.TOOL_REQUESTED, EventType.TOOL_STARTED, EventType.TOOL_COMPLETED}
+        for event in events
+    )
+    assert configured not in persisted
+    escaped = json.dumps(configured, ensure_ascii=False)[1:-1].encode()
+    for database_file in settings.data_dir.glob("test.db*"):
+        database_bytes = database_file.read_bytes()
+        assert configured.encode() not in database_bytes
+        assert escaped not in database_bytes
+
+
+@pytest.mark.asyncio
+async def test_structural_json_cannot_synthesize_a_credential_in_agent_history(
+    settings: Settings, storage: Storage
+) -> None:
+    configured = 'foo", "start_line": 1'
+    arguments = {"path": "foo", "start_line": 1}
+    assert configured in json.dumps(arguments)
+    assert not contains_redactable_json_secret(arguments, api_key=configured)
+    (settings.workspace / "foo").write_text("safe evidence\n")
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="inspect", name="read_file", arguments=arguments)
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Reviewed safely"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(replace(settings, api_key=configured), storage, provider)
+
+    run = await manager.start_run("Review foo", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+    storage.secure_checkpoint()
+
+    assert completed.state is RunState.SUCCEEDED
+    assert any(
+        event.type is EventType.TOOL_COMPLETED
+        and event.payload.get("call", {}).get("id") == "inspect"
+        for event in storage.get_events(run.id)
+    )
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert configured.encode() not in database_file.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_tool_result_metadata_is_recursively_redacted_before_persistence(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = "owner-only-key-123456"
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="inspect",
+                        name="read_file",
+                        arguments={"path": "safe.txt"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Reviewed safely"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(replace(settings, api_key=configured), storage, provider)
+
+    async def metadata_result(
+        _run_id: str, call: ToolCall, **_kwargs: object
+    ) -> ToolResult:
+        return ToolResult(
+            tool_call_id=call.id,
+            name=call.name,
+            ok=True,
+            output="safe evidence",
+            metadata={configured: {"nested": configured}},
+        )
+
+    monkeypatch.setattr(manager.tools, "execute", metadata_result)
+    run = await manager.start_run("Review safely", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+    events = storage.get_events(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    serialized = json.dumps(
+        [event.model_dump(mode="json") for event in events], ensure_ascii=False
+    )
+    assert configured not in serialized
+    metadata = next(
+        event.payload["result"]["metadata"]
+        for event in events
+        if event.type is EventType.TOOL_COMPLETED
+        and event.payload["call"]["id"] == "inspect"
+    )
+    assert metadata == {"█" * 10: {"nested": "█" * 10}}
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert configured.encode() not in database_file.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_secret_bearing_builder_call_cannot_mutate_or_open_approval(
+    settings: Settings, storage: Storage
+) -> None:
+    configured = "owner-only-key-123456"
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="unsafe-write",
+                        name="create_file",
+                        arguments={"path": "unsafe.txt", "content": configured},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(replace(settings, api_key=configured), storage, provider)
+
+    run = await manager.start_run("Review without writing credentials", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+    events = storage.get_events(run.id)
+    persisted = json.dumps(
+        {
+            "run": completed.model_dump(mode="json"),
+            "events": [event.model_dump(mode="json") for event in events],
+        },
+        ensure_ascii=False,
+    )
+
+    assert completed.state is RunState.FAILED
+    assert completed.pending_approval is None
+    assert not (settings.workspace / "unsafe.txt").exists()
+    assert not any(
+        event.type is EventType.APPROVAL_REQUESTED
+        or event.payload.get("id") == "unsafe-write"
+        or (
+            isinstance(event.payload.get("call"), dict)
+            and event.payload["call"].get("id") == "unsafe-write"
+        )
+        for event in events
+    )
+    assert configured not in persisted
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert configured.encode() not in database_file.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_secret_bearing_verifier_report_fails_before_publication(
+    settings: Settings, storage: Storage
+) -> None:
+    configured = "owner-only-key-123456"
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Reviewed safely"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="unsafe-verdict",
+                        name="submit_verification",
+                        arguments={
+                            "verdict": "pass",
+                            "summary": configured,
+                            "findings": [],
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(replace(settings, api_key=configured), storage, provider)
+
+    run = await manager.start_run("Review safely")
+    completed = await manager.wait(run.id)
+    events = storage.get_events(run.id)
+
+    assert completed.state is RunState.FAILED
+    assert completed.verification is None
+    assert not any(
+        event.type is EventType.VERIFICATION_COMPLETED for event in events
+    )
+    assert configured not in json.dumps(
+        {
+            "run": completed.model_dump(mode="json"),
+            "events": [event.model_dump(mode="json") for event in events],
+        },
+        ensure_ascii=False,
+    )
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert configured.encode() not in database_file.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_terminal_presentation_credentials_are_redacted_not_executed(
+    settings: Settings, storage: Storage
+) -> None:
+    configured = 'owner"secret\\tail\tsegment'
+    protected_settings = replace(settings, api_key=configured)
+    direct = AgentManager(
+        protected_settings,
+        storage,
+        ScriptedProvider([_direct_response(f"Safe prefix {configured} suffix")]),
+    )
+    direct_run = await direct.start_run("Answer safely")
+    answered = await direct.wait(direct_run.id)
+
+    finish = AgentManager(
+        protected_settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish",
+                            name="finish",
+                            arguments={"summary": f"Reviewed {configured}"},
+                        )
+                    ]
+                ),
+            ]
+        ),
+    )
+    finish_run = await finish.start_run("Review safely", verifier_enabled=False)
+    completed = await finish.wait(finish_run.id)
+
+    assert answered.state is RunState.ANSWERED
+    assert completed.state is RunState.SUCCEEDED
+    assert answered.turns[-1].summary == redact_text(
+        f"Safe prefix {configured} suffix", api_key=configured
+    )
+    assert completed.turns[-1].summary == redact_text(
+        f"Reviewed {configured}", api_key=configured
+    )
+    persisted = json.dumps(
+        {
+            "runs": [run.model_dump(mode="json") for run in storage.list_runs()],
+            "events": {
+                run.id: [
+                    event.model_dump(mode="json") for event in storage.get_events(run.id)
+                ]
+                for run in storage.list_runs()
+            },
+        },
+        ensure_ascii=False,
+    )
+    assert configured not in persisted
+    escaped = json.dumps(configured, ensure_ascii=False)[1:-1].encode()
+    for database_file in settings.data_dir.glob("test.db*"):
+        database_bytes = database_file.read_bytes()
+        assert configured.encode() not in database_bytes
+        assert escaped not in database_bytes
+
+
+@pytest.mark.asyncio
+async def test_user_task_credentials_are_rejected_before_run_creation(
+    settings: Settings, storage: Storage
+) -> None:
+    configured = "owner-only-key-123456"
+    manager = AgentManager(
+        replace(settings, api_key=configured),
+        storage,
+        ScriptedProvider([]),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Task text contains credential-like data; remove it before starting",
+    ):
+        await manager.start_run(f"Please inspect {configured}")
+
+    assert storage.list_runs() == []
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert configured.encode() not in database_file.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_credentials_are_rejected_without_reopening_the_turn(
+    settings: Settings, storage: Storage
+) -> None:
+    configured = "owner-only-key-123456"
+    provider = ScriptedProvider([_direct_response("Safe answer")])
+    manager = AgentManager(replace(settings, api_key=configured), storage, provider)
+    run = await manager.start_run("Answer safely")
+    answered = await manager.wait(run.id)
+
+    with pytest.raises(
+        ValueError,
+        match="Follow-up text contains credential-like data; remove it before continuing",
+    ):
+        await manager.follow_up(run.id, f"Continue with {configured}")
+
+    unchanged = storage.get_run(run.id)
+    assert unchanged.state is RunState.ANSWERED
+    assert unchanged.turns == answered.turns
+    assert len(provider.requests) == 1
+    assert configured not in json.dumps(
+        {
+            "run": unchanged.model_dump(mode="json"),
+            "events": [
+                event.model_dump(mode="json") for event in storage.get_events(run.id)
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_human_decision_credentials_are_rejected_before_durable_acceptance(
+    settings: Settings, storage: Storage
+) -> None:
+    configured = "owner-only-key-123456"
+    protected_settings = replace(settings, api_key=configured)
+
+    clarification_manager = AgentManager(
+        protected_settings,
+        storage,
+        ScriptedProvider([_question_response("question")]),
+    )
+    clarification_run = await clarification_manager.start_run("Clarify safely")
+    await _wait_for_state(
+        storage, clarification_run.id, RunState.AWAITING_CLARIFICATION
+    )
+    clarification_receipt = storage.get_active_decision(clarification_run.id)
+    assert clarification_receipt is not None
+    with pytest.raises(
+        ValueError,
+        match="Clarification answer contains credential-like data",
+    ):
+        await clarification_manager.answer_clarification(
+            clarification_run.id,
+            [ClarificationAnswer(question_id="choice", custom_text=configured)],
+        )
+    assert storage.get_decision(
+        clarification_run.id, clarification_receipt.request_id
+    ).status is DecisionStatus.PENDING
+    await clarification_manager.cancel(clarification_run.id)
+
+    plan_manager = AgentManager(
+        protected_settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ]
+                )
+            ]
+        ),
+    )
+    plan_run = await plan_manager.start_run("Plan safely", mode=InteractionMode.PLAN)
+    await _wait_for_state(storage, plan_run.id, RunState.AWAITING_PLAN_APPROVAL)
+    plan_receipt = storage.get_active_decision(plan_run.id)
+    assert plan_receipt is not None
+    with pytest.raises(
+        ValueError,
+        match="Plan decision contains credential-like data",
+    ):
+        await plan_manager.decide_plan(
+            plan_run.id,
+            PlanDecision(decision="revise", feedback=configured),
+        )
+    assert storage.get_decision(
+        plan_run.id, plan_receipt.request_id
+    ).status is DecisionStatus.PENDING
+    await plan_manager.cancel(plan_run.id)
+
+    persisted = json.dumps(
+        {
+            "runs": [run.model_dump(mode="json") for run in storage.list_runs()],
+            "events": {
+                run.id: [
+                    event.model_dump(mode="json") for event in storage.get_events(run.id)
+                ]
+                for run in storage.list_runs()
+            },
+        },
+        ensure_ascii=False,
+    )
+    assert configured not in persisted
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert configured.encode() not in database_file.read_bytes()
+
+
+@pytest.mark.asyncio
 async def test_builder_reuses_successful_planning_inspection(
     settings: Settings, storage: Storage
 ) -> None:
@@ -2755,7 +3245,11 @@ async def test_builder_reuses_successful_planning_inspection(
     assert completed.state is RunState.SUCCEEDED
     builder_messages = provider.requests[2][0]
     builder_context = str(builder_messages[1]["content"])
-    assert 'read_file({"path": "context.txt"})' in builder_context
+    arguments_start = builder_context.index("### read_file(") + len("### read_file(")
+    arguments_end = builder_context.index(")\n", arguments_start)
+    assert json.loads(builder_context[arguments_start:arguments_end]) == {
+        "path": "context.txt"
+    }
     assert "important evidence" in builder_context
 
 
@@ -3668,6 +4162,184 @@ async def test_restart_reopens_pending_approval_without_replaying_action(
         event.type is EventType.TOOL_STARTED
         and event.payload.get("id") == "pending-command"
         for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_refuses_legacy_secret_bearing_approval_without_execution(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = "owner-only-key-123456"
+    protected_settings = replace(settings, api_key=configured)
+    first = AgentManager(
+        protected_settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="pending-command",
+                            name="run_command",
+                            arguments={"argv": ["python", "app.py"]},
+                        )
+                    ]
+                ),
+            ]
+        ),
+    )
+    run = await first.start_run("Run later", verifier_enabled=False)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    await first.shutdown()
+
+    legacy = storage.get_run(run.id)
+    assert legacy.pending_approval is not None
+    approval_id = legacy.pending_approval.id
+    legacy.pending_approval.tool_call.arguments = {
+        "argv": ["python", "-c", configured]
+    }
+    with sqlite3.connect(settings.data_dir / "test.db") as legacy_writer:
+        legacy_writer.execute(
+            "UPDATE runs SET pending_approval_json = ? WHERE id = ?",
+            (legacy.pending_approval.model_dump_json(), run.id),
+        )
+    baseline_seq = storage.get_events(run.id)[-1].seq
+
+    second = AgentManager(
+        protected_settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="safe-finish",
+                            name="finish",
+                            arguments={"summary": "Recovered without replay"},
+                        )
+                    ]
+                )
+            ]
+        ),
+    )
+    executed: list[ToolCall] = []
+
+    async def execute(_run_id: str, call: ToolCall, **_kwargs: object) -> ToolResult:
+        executed.append(call)
+        raise AssertionError("Unsafe persisted approval must never execute")
+
+    monkeypatch.setattr(second.tools, "execute", execute)
+    with pytest.raises(InvalidRunAction, match="persisted tool call is unsafe"):
+        await second.decide_action(run.id, approval_id, approved=True)
+
+    await second.resume(run.id)
+    completed = await second.wait(run.id)
+    new_events = [
+        event for event in storage.get_events(run.id) if event.seq > baseline_seq
+    ]
+
+    assert completed.state is RunState.SUCCEEDED
+    assert completed.pending_approval is None
+    assert completed.error is None
+    assert storage.get_decision(run.id, approval_id).status is DecisionStatus.ABANDONED
+    assert executed == []
+    assert configured not in json.dumps(
+        [event.model_dump(mode="json") for event in new_events], ensure_ascii=False
+    )
+    assert not any(
+        event.type is EventType.APPROVAL_REQUESTED for event in new_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_abandons_an_accepted_legacy_secret_action_without_execution(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = "owner-only-key-123456"
+    protected_settings = replace(settings, api_key=configured)
+    first = AgentManager(
+        protected_settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="pending-command",
+                            name="run_command",
+                            arguments={"argv": ["python", "app.py"]},
+                        )
+                    ]
+                ),
+            ]
+        ),
+    )
+    run = await first.start_run("Run later", verifier_enabled=False)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    waiting = storage.get_run(run.id)
+    assert waiting.pending_approval is not None
+    approval_id = waiting.pending_approval.id
+    storage.accept_decision(
+        run.id,
+        approval_id,
+        DecisionKind.ACTION,
+        {"approved": True},
+    )
+    await first.shutdown()
+
+    legacy = storage.get_run(run.id)
+    assert legacy.pending_approval is not None
+    legacy.pending_approval.tool_call.arguments = {
+        "argv": ["python", "-c", configured]
+    }
+    with sqlite3.connect(settings.data_dir / "test.db") as legacy_writer:
+        legacy_writer.execute(
+            "UPDATE runs SET pending_approval_json = ? WHERE id = ?",
+            (legacy.pending_approval.model_dump_json(), run.id),
+        )
+    baseline_seq = storage.get_events(run.id)[-1].seq
+
+    second = AgentManager(protected_settings, storage, ScriptedProvider([]))
+    executed: list[ToolCall] = []
+
+    async def execute(_run_id: str, call: ToolCall, **_kwargs: object) -> ToolResult:
+        executed.append(call)
+        raise AssertionError("Unsafe accepted approval must never execute")
+
+    monkeypatch.setattr(second.tools, "execute", execute)
+    await second.resume(run.id)
+    completed = await second.wait(run.id)
+    new_events = [
+        event for event in storage.get_events(run.id) if event.seq > baseline_seq
+    ]
+
+    assert completed.state is RunState.FAILED
+    assert completed.pending_approval is None
+    assert completed.error == (
+        "Persisted action approval contains credential-like data and cannot be resumed"
+    )
+    assert storage.get_decision(run.id, approval_id).status is DecisionStatus.ABANDONED
+    assert executed == []
+    assert configured not in json.dumps(
+        [event.model_dump(mode="json") for event in new_events], ensure_ascii=False
+    )
+    assert not any(
+        event.type in {EventType.APPROVAL_REQUESTED, EventType.TOOL_STARTED}
+        for event in new_events
     )
 
 

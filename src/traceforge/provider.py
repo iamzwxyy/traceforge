@@ -23,6 +23,7 @@ from openai.types.chat import ChatCompletionChunk
 from traceforge.config import Settings
 from traceforge.model_reasoning import resolve_reasoning_capability
 from traceforge.models import ReasoningEffort, ToolCall
+from traceforge.streaming import boundary_safe_json_dumps
 
 
 class ProviderError(RuntimeError):
@@ -145,7 +146,7 @@ class ModelResponse:
                     "type": "function",
                     "function": {
                         "name": call.name,
-                        "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                        "arguments": boundary_safe_json_dumps(call.arguments),
                     },
                 }
                 for call in self.tool_calls
@@ -1079,7 +1080,7 @@ def _scripted_deltas(response: ModelResponse) -> list[ModelStreamDelta]:
     for start in range(0, len(response.content), 32):
         deltas.append(ModelStreamDelta(content=response.content[start : start + 32]))
     for index, call in enumerate(response.tool_calls):
-        arguments = json.dumps(call.arguments, ensure_ascii=False)
+        arguments = boundary_safe_json_dumps(call.arguments)
         pieces = [arguments[start : start + 32] for start in range(0, len(arguments), 32)] or [""]
         for piece_index, piece in enumerate(pieces):
             deltas.append(

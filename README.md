@@ -258,7 +258,7 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 408 backend tests at 87.46% coverage (with a hard 85% gate), 28 frontend
+The current suite has 434 backend tests at 87.62% coverage (with a hard 85% gate), 28 frontend
 unit tests, and 29 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.

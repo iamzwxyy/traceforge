@@ -23,9 +23,12 @@ from fastapi import (
     status,
 )
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import JSONResponse as StarletteJSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.utils import is_body_allowed_for_status_code
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from traceforge import __version__
 from traceforge.agent import InvalidRunAction, PlanDecision, RunConflictError
@@ -63,8 +66,16 @@ from traceforge.provider import ModelProvider
 from traceforge.runtime import AgentRuntime, resolve_workspace
 from traceforge.sandbox import sandbox_status
 from traceforge.storage import Storage
+from traceforge.streaming import boundary_safe_json_dumps
 from traceforge.tools import scrubbed_environment
 from traceforge.workspace import Workspace, WorkspaceViolation
+
+
+class JSONResponse(StarletteJSONResponse):
+    """JSON response whose structural boundaries cannot synthesize a credential."""
+
+    def render(self, content: Any) -> bytes:
+        return boundary_safe_json_dumps(content).encode("utf-8")
 
 
 class CreateRunRequest(BaseModel):
@@ -254,10 +265,18 @@ def create_app(
     if (instance_id is None) != (instance_config_fingerprint is None):
         raise ValueError("Instance identity and configuration fingerprint must be paired")
     storage = Storage(settings.data_dir / "traceforge.db")
-    storage.mark_all_active_runs_interrupted()
-    _backfill_legacy_success_proofs(storage)
-    broker = EventBroker(storage)
-    runtime = AgentRuntime(settings, storage, broker, provider_override=provider)
+    try:
+        broker = EventBroker(storage)
+        runtime = AgentRuntime(settings, storage, broker, provider_override=provider)
+        storage.mark_all_active_runs_interrupted()
+        _backfill_legacy_success_proofs(storage)
+    except BaseException:
+        storage.close()
+        raise
+
+    class PublicJSONResponse(JSONResponse):
+        def render(self, content: Any) -> bytes:
+            return storage.render_public_json(content)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -271,11 +290,27 @@ def create_app(
         lifespan=lifespan,
         docs_url="/api/docs",
         openapi_url="/api/openapi.json",
+        default_response_class=PublicJSONResponse,
     )
     app.state.settings = settings
     app.state.storage = storage
     app.state.runtime = runtime
     app.state.broker = broker
+
+    # FastAPI installs its OpenAPI route before ``default_response_class`` is available and
+    # hard-codes Starlette's compact JSONResponse. Replace only that generated route so the
+    # specification obeys the same final-byte credential boundary as application endpoints.
+    openapi_path = app.openapi_url
+    if openapi_path is not None:
+        app.router.routes = [
+            route
+            for route in app.router.routes
+            if getattr(route, "path", None) != openapi_path
+        ]
+
+        @app.get(openapi_path, include_in_schema=False)
+        async def openapi_schema() -> PublicJSONResponse:
+            return PublicJSONResponse(app.openapi())
     app.state.instance_id = instance_id
     app.state.instance_config_fingerprint = instance_config_fingerprint
 
@@ -307,7 +342,7 @@ def create_app(
             origin = request.headers.get("origin")
             fetch_site = request.headers.get("sec-fetch-site", "").lower()
             if (origin and not _allowed_origin(origin)) or fetch_site == "cross-site":
-                response = JSONResponse(
+                response = PublicJSONResponse(
                     status_code=403, content={"detail": "Cross-site request denied"}
                 )
             else:
@@ -327,19 +362,35 @@ def create_app(
 
     @app.exception_handler(KeyError)
     async def key_error_handler(_request: Request, exc: KeyError) -> JSONResponse:
-        return JSONResponse(status_code=404, content={"detail": str(exc).strip("'")})
+        return PublicJSONResponse(status_code=404, content={"detail": str(exc).strip("'")})
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(
+        _request: Request, exc: StarletteHTTPException
+    ) -> Response:
+        headers = {
+            name: storage.redact_public_text(value)
+            for name, value in (exc.headers or {}).items()
+        }
+        if not is_body_allowed_for_status_code(exc.status_code):
+            return Response(status_code=exc.status_code, headers=headers)
+        return PublicJSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=headers,
+        )
 
     @app.exception_handler(InvalidRunAction)
     async def invalid_action_handler(_request: Request, exc: InvalidRunAction) -> JSONResponse:
-        return JSONResponse(status_code=409, content={"detail": str(exc)})
+        return PublicJSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(RunConflictError)
     async def run_conflict_handler(_request: Request, exc: RunConflictError) -> JSONResponse:
-        return JSONResponse(status_code=409, content={"detail": str(exc)})
+        return PublicJSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.exception_handler(ValueError)
     async def value_error_handler(_request: Request, exc: ValueError) -> JSONResponse:
-        return JSONResponse(status_code=422, content={"detail": str(exc)})
+        return PublicJSONResponse(status_code=422, content={"detail": str(exc)})
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error_handler(
@@ -353,7 +404,7 @@ def create_app(
             }
             for error in exc.errors()
         ]
-        return JSONResponse(status_code=422, content={"detail": errors})
+        return PublicJSONResponse(status_code=422, content={"detail": errors})
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:
@@ -609,7 +660,7 @@ def create_app(
         if run.plan is None:
             raise HTTPException(status_code=404, detail="No plan has been recorded")
         return PlainTextResponse(
-            run.plan.markdown,
+            storage.redact_public_text(run.plan.markdown),
             media_type="text/markdown; charset=utf-8",
             headers={
                 "Content-Disposition": (
@@ -626,7 +677,7 @@ def create_app(
         run, frozen = await frozen_proof(run_id, turn_index)
         pack = _require_frozen_proof_pack(run, frozen, turn_index=turn_index)
         return PlainTextResponse(
-            proof_pack_markdown(pack),
+            storage.redact_public_text(proof_pack_markdown(pack)),
             media_type="text/markdown; charset=utf-8",
             headers={
                 "Cache-Control": "no-store",
@@ -716,7 +767,9 @@ def create_app(
         event_task: asyncio.Task[RunEvent] | None = None
         try:
             for event in storage.get_events(run_id, after_seq=after_seq):
-                await websocket.send_json(event.model_dump(mode="json"))
+                await websocket.send_text(
+                    storage.render_public_json(event.model_dump(mode="json")).decode("utf-8")
+                )
                 last_seq = event.seq
             receive_task = asyncio.create_task(websocket.receive())
             while True:
@@ -743,10 +796,16 @@ def create_app(
                     # A bounded subscriber queue may evict old items for a slow client.
                     # SQLite is authoritative, so repair the gap before continuing live.
                     for persisted in storage.get_events(run_id, after_seq=last_seq):
-                        await websocket.send_json(persisted.model_dump(mode="json"))
+                        await websocket.send_text(
+                            storage.render_public_json(
+                                persisted.model_dump(mode="json")
+                            ).decode("utf-8")
+                        )
                         last_seq = persisted.seq
                 else:
-                    await websocket.send_json(event.model_dump(mode="json"))
+                    await websocket.send_text(
+                        storage.render_public_json(event.model_dump(mode="json")).decode("utf-8")
+                    )
                     last_seq = event.seq
         except (WebSocketDisconnect, asyncio.CancelledError):
             pass

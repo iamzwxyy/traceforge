@@ -67,7 +67,10 @@ from traceforge.storage import (
 )
 from traceforge.streaming import (
     StableStreamingRedactor,
+    boundary_safe_json_dumps,
+    contains_redactable_json_secret,
     contains_redactable_secret,
+    contains_redactable_serialized_json_secret,
     json_string_field_prefix,
     redact_json_value,
     redact_text,
@@ -401,8 +404,11 @@ class AgentManager:
         *,
         broker: EventBroker | None = None,
     ) -> None:
+        if "\n" in settings.api_key or "\r" in settings.api_key:
+            raise ValueError("Provider credentials must contain exactly one line")
         self.settings = settings
         self.storage = storage
+        self.storage.register_credential_guard(settings.api_key)
         self.provider = provider
         self.workspace = Workspace(settings.workspace, storage)
         self.tools = ToolRegistry(self.workspace, settings)
@@ -429,6 +435,7 @@ class AgentManager:
         clean_task = task.strip()
         if not clean_task:
             raise ValueError("Task must not be empty")
+        self._reject_credential_input(clean_task, label="Task text", action="starting")
         if self.storage.has_active_run(self.settings.workspace):
             raise RunConflictError("This workspace already has an active or interrupted run")
         self._reasoning_capability().validate(reasoning_effort)
@@ -509,6 +516,11 @@ class AgentManager:
             clean_prompt = prompt.strip()
             if not clean_prompt:
                 raise ValueError("Follow-up prompt must not be empty")
+            self._reject_credential_input(
+                clean_prompt,
+                label="Follow-up text",
+                action="continuing",
+            )
             parent = self.storage.get_run(run_id)
             if parent.state is not RunState.ROLLED_BACK:
                 raise InvalidRunAction(
@@ -558,6 +570,11 @@ class AgentManager:
         clean_prompt = prompt.strip()
         if not clean_prompt:
             raise ValueError("Follow-up prompt must not be empty")
+        self._reject_credential_input(
+            clean_prompt,
+            label="Follow-up text",
+            action="continuing",
+        )
         run = self.storage.get_run(run_id)
         if run.state not in {
             RunState.ANSWERED,
@@ -621,6 +638,11 @@ class AgentManager:
         *,
         request_id: str | None = None,
     ) -> None:
+        self._reject_credential_input(
+            [answer.model_dump(mode="json") for answer in answers],
+            label="Clarification answer",
+            action="submitting it",
+        )
         request_id = request_id or self._active_decision_id(run_id, DecisionKind.CLARIFICATION)
         payload = {"answers": [answer.model_dump(mode="json") for answer in answers]}
         receipt = self._decision_or_reject(run_id, request_id)
@@ -650,6 +672,11 @@ class AgentManager:
         *,
         request_id: str | None = None,
     ) -> None:
+        self._reject_credential_input(
+            decision.model_dump(mode="json"),
+            label="Plan decision",
+            action="submitting it",
+        )
         request_id = request_id or self._active_decision_id(run_id, DecisionKind.PLAN)
         receipt = self._decision_or_reject(run_id, request_id)
         if receipt.status is DecisionStatus.PENDING:
@@ -674,6 +701,15 @@ class AgentManager:
             run = self.storage.get_run(run_id)
             if run.pending_approval is None or run.pending_approval.id != approval_id:
                 raise InvalidRunAction("Approval is no longer pending")
+            try:
+                self._require_safe_action_approval(run.pending_approval)
+            except ProviderError as exc:
+                await self._abandon_active_decision(
+                    run, cause="unsafe_persisted_action"
+                )
+                raise InvalidRunAction(
+                    "Approval cannot be accepted because its persisted tool call is unsafe"
+                ) from exc
             self._require_decision_subject(receipt, run.pending_approval.model_dump(mode="json"))
         accepted = self._accept_decision_or_reject(
             run_id,
@@ -931,7 +967,8 @@ class AgentManager:
                         "role": "system",
                         "content": (
                             "The independent verifier rejected the current result. Address these "
-                            f"findings and rerun acceptance checks:\n{report.model_dump_json()}"
+                            "findings and rerun acceptance checks:\n"
+                            f"{boundary_safe_json_dumps(report.model_dump(mode='json'))}"
                         ),
                     }
                 )
@@ -1007,6 +1044,14 @@ class AgentManager:
 
     async def _prepare_resume(self, run: RunRecord) -> None:
         previous = run.interrupted_from
+        if run.pending_approval is not None:
+            try:
+                self._require_safe_action_approval(run.pending_approval)
+            except ProviderError:
+                await self._abandon_active_decision(
+                    run, cause="unsafe_persisted_action"
+                )
+                raise
         await self._abandon_open_output_streams(
             run,
             status="discarded",
@@ -1204,7 +1249,7 @@ class AgentManager:
                 await self._emit_message(run, response.content, phase="planning")
             for call in response.tool_calls:
                 if call.name in {"list_files", "read_file", "search_text"}:
-                    result = await self.tools.execute(run.id, call)
+                    result = self._redact_result(await self.tools.execute(run.id, call))
                     self._append_tool_result(run, result)
                     await self._emit_tool_result(run, call, result)
                     continue
@@ -1401,9 +1446,8 @@ class AgentManager:
                 try:
                     finish = FinishRequest.model_validate(call.arguments)
                 except ValidationError as exc:
-                    details = json.dumps(
-                        exc.errors(include_url=False, include_input=False),
-                        ensure_ascii=False,
+                    details = boundary_safe_json_dumps(
+                        exc.errors(include_url=False, include_input=False)
                     )
                     await reject_batch(
                         [call],
@@ -1476,12 +1520,12 @@ class AgentManager:
                 persisted_action_result: ToolResult | None = None
                 approval_request_id: str | None = None
                 await self.broker.emit(
-                    run.id, EventType.TOOL_REQUESTED, call.model_dump(mode="json")
+                    run.id, EventType.TOOL_REQUESTED, self._public_tool_call_payload(call)
                 )
                 if call.name == "update_plan":
                     await self._transition(run, RunState.EXECUTING)
                     await self.broker.emit(
-                        run.id, EventType.TOOL_STARTED, call.model_dump(mode="json")
+                        run.id, EventType.TOOL_STARTED, self._public_tool_call_payload(call)
                     )
                     result = self._apply_plan_update(run, call)
                 else:
@@ -1520,7 +1564,7 @@ class AgentManager:
                                 await self.broker.emit(
                                     run.id,
                                     EventType.TOOL_STARTED,
-                                    call.model_dump(mode="json"),
+                                    self._public_tool_call_payload(call),
                                 )
                             result = await self.tools.execute(
                                 run.id, call, sandbox_bypass=sandbox_bypass
@@ -1547,7 +1591,7 @@ class AgentManager:
                         approval_request_id=approval_request_id,
                     )
                 if not result.ok:
-                    fingerprint = json.dumps(
+                    fingerprint = boundary_safe_json_dumps(
                         {"name": call.name, "arguments": call.arguments}, sort_keys=True
                     )
                     repeated_failures[fingerprint] = repeated_failures.get(fingerprint, 0) + 1
@@ -1574,7 +1618,9 @@ class AgentManager:
         evidence = self._planning_evidence(run.messages)
         task_context = (
             f"Current request:\n{self._current_request(run)}\n\n"
-            f"Plan:\n{plan.markdown}\n\nStructured contract:\n{plan.model_dump_json()}"
+            "Plan:\n"
+            f"{plan.markdown}\n\nStructured contract:\n"
+            f"{boundary_safe_json_dumps(plan.model_dump(mode='json'))}"
         )
         previous = self._previous_turns_context(run)
         if previous:
@@ -1620,7 +1666,7 @@ class AgentManager:
                 continue
             name, arguments = call
             sections.append(
-                f"### {name}({json.dumps(arguments, ensure_ascii=False, sort_keys=True)})\n"
+                f"### {name}({boundary_safe_json_dumps(arguments, sort_keys=True)})\n"
                 f"{result.output}"
             )
 
@@ -1652,7 +1698,7 @@ class AgentManager:
         }
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(evidence, ensure_ascii=False)},
+            {"role": "user", "content": boundary_safe_json_dumps(evidence)},
         ]
         read_tools = [
             schema
@@ -1695,12 +1741,14 @@ class AgentManager:
                             "role": "tool",
                             "tool_call_id": submit_calls[0].id,
                             "name": "submit_verification",
-                            "content": ToolResult(
-                                tool_call_id=submit_calls[0].id,
-                                name="submit_verification",
-                                ok=False,
-                                error=f"Invalid verification report: {exc}",
-                            ).model_dump_json(),
+                            "content": boundary_safe_json_dumps(
+                                ToolResult(
+                                    tool_call_id=submit_calls[0].id,
+                                    name="submit_verification",
+                                    ok=False,
+                                    error=f"Invalid verification report: {exc}",
+                                ).model_dump(mode="json")
+                            ),
                         }
                     )
                     messages.append(
@@ -1719,13 +1767,15 @@ class AgentManager:
                         error="Verifier is read-only.",
                     )
                 else:
-                    result = await self.tools.execute(run.id, call)
+                    result = self._redact_result(await self.tools.execute(run.id, call))
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": result.tool_call_id,
                         "name": result.name,
-                        "content": result.model_dump_json(),
+                        "content": boundary_safe_json_dumps(
+                            result.model_dump(mode="json")
+                        ),
                     }
                 )
             if submit_calls and (read_calls or len(submit_calls) > 1):
@@ -1735,14 +1785,16 @@ class AgentManager:
                             "role": "tool",
                             "tool_call_id": call.id,
                             "name": call.name,
-                            "content": ToolResult(
-                                tool_call_id=call.id,
-                                name=call.name,
-                                ok=False,
-                                error=(
-                                    "Submit exactly one verdict in a separate turn after reads."
-                                ),
-                            ).model_dump_json(),
+                            "content": boundary_safe_json_dumps(
+                                ToolResult(
+                                    tool_call_id=call.id,
+                                    name=call.name,
+                                    ok=False,
+                                    error=(
+                                        "Submit exactly one verdict in a separate turn after reads."
+                                    ),
+                                ).model_dump(mode="json")
+                            ),
                         }
                     )
                 messages.append(
@@ -1931,9 +1983,10 @@ class AgentManager:
                         "Model provider returned an invalid response object",
                         category="provider_contract",
                     )
+                safe_response = self._canonicalize_provider_response(response)
                 if output_stream is not None:
-                    response.output_stream_id = await output_stream.resolve(response)
-                return response
+                    safe_response.output_stream_id = await output_stream.resolve(response)
+                return safe_response
             except asyncio.CancelledError:
                 if output_stream is not None:
                     await asyncio.shield(
@@ -2032,6 +2085,134 @@ class AgentManager:
                 },
             )
         return await self._request_model(run, prepared, tools)
+
+    def _canonicalize_provider_response(self, response: ModelResponse) -> ModelResponse:
+        """Make provider-controlled output safe before any semantic use or persistence."""
+
+        if (
+            not isinstance(response.content, str)
+            or not isinstance(response.preserve_empty_content, bool)
+            or (
+                response.reasoning_content is not None
+                and not isinstance(response.reasoning_content, str)
+            )
+            or (response.finish_reason is not None and not isinstance(response.finish_reason, str))
+            or response.output_stream_id is not None
+        ):
+            raise ProviderError(
+                "Model provider returned an invalid response object",
+                category="provider_contract",
+            )
+        if response.reasoning_content is not None and contains_redactable_secret(
+            response.reasoning_content,
+            api_key=self.settings.api_key,
+        ):
+            raise ProviderError(
+                "Provider-private replay state could not be stored safely",
+                category="provider_contract",
+            )
+        if response.finish_reason is not None and contains_redactable_secret(
+            response.finish_reason,
+            api_key=self.settings.api_key,
+        ):
+            raise ProviderError(
+                "Provider response metadata contained credential-like data",
+                category="provider_contract",
+            )
+
+        safe_calls: list[ToolCall] = []
+        for call in response.tool_calls:
+            if not isinstance(call, ToolCall):
+                raise ProviderError(
+                    "Model provider returned an invalid tool call",
+                    category="provider_contract",
+                )
+            safe_calls.append(self._canonicalize_provider_tool_call(call))
+        safe_response = ModelResponse(
+            content=self._redact(response.content),
+            tool_calls=safe_calls,
+            finish_reason=response.finish_reason,
+            reasoning_content=response.reasoning_content,
+            preserve_empty_content=response.preserve_empty_content,
+        )
+        if contains_redactable_serialized_json_secret(
+            safe_response.as_assistant_message(),
+            api_key=self.settings.api_key,
+        ):
+            raise ProviderError(
+                "Provider response could not be serialized without credential-like data",
+                category="provider_contract",
+            )
+        return safe_response
+
+    def _canonicalize_provider_tool_call(self, call: ToolCall) -> ToolCall:
+        if contains_redactable_secret(
+            call.id, api_key=self.settings.api_key
+        ) or contains_redactable_secret(call.name, api_key=self.settings.api_key):
+            raise ProviderError(
+                "Provider tool call contained credential-like data and was rejected before "
+                "storage or execution",
+                category="provider_contract",
+            )
+        if call.name in {"respond_to_user", "finish"}:
+            try:
+                arguments = cast(
+                    dict[str, Any],
+                    redact_json_value(call.arguments, api_key=self.settings.api_key),
+                )
+            except ValueError as exc:
+                raise ProviderError(
+                    "Provider tool call could not be redacted safely",
+                    category="provider_contract",
+                ) from exc
+        else:
+            if contains_redactable_json_secret(
+                call.arguments,
+                api_key=self.settings.api_key,
+            ):
+                raise ProviderError(
+                    "Provider tool call contained credential-like data and was rejected before "
+                    "storage or execution",
+                    category="provider_contract",
+                )
+            arguments = call.model_copy(deep=True).arguments
+        safe_call = ToolCall(id=call.id, name=call.name, arguments=arguments)
+        if contains_redactable_serialized_json_secret(
+            safe_call.model_dump(mode="json"),
+            api_key=self.settings.api_key,
+        ):
+            raise ProviderError(
+                "Provider tool call could not be serialized without credential-like data",
+                category="provider_contract",
+            )
+        return safe_call
+
+    def _public_tool_call_payload(self, call: ToolCall) -> dict[str, Any]:
+        return self._canonicalize_provider_tool_call(call).model_dump(mode="json")
+
+    def _require_safe_action_approval(self, approval: ApprovalRequest) -> None:
+        if contains_redactable_json_secret(
+            approval.model_dump(mode="json"),
+            api_key=self.settings.api_key,
+        ) or contains_redactable_serialized_json_secret(
+            approval.model_dump(mode="json"),
+            api_key=self.settings.api_key,
+        ):
+            raise ProviderError(
+                "Persisted action approval contains credential-like data and cannot be resumed",
+                category="provider_contract",
+            )
+        self._canonicalize_provider_tool_call(approval.tool_call)
+
+    def _reject_credential_input(self, value: Any, *, label: str, action: str) -> None:
+        if contains_redactable_json_secret(
+            value, api_key=self.settings.api_key
+        ) or contains_redactable_serialized_json_secret(
+            value, api_key=self.settings.api_key
+        ):
+            raise ValueError(
+                f"{label} contains credential-like data; remove it before {action}"
+            )
 
     async def _await_clarification(
         self,
@@ -2219,6 +2400,7 @@ class AgentManager:
             policy_decision=permission.policy_decision.value,
             sandbox_bypass_on_approve=permission.sandbox_bypass_on_allow,
         )
+        self._require_safe_action_approval(approval)
         run.pending_approval = approval
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         control = self._control(run.id)
@@ -2255,6 +2437,7 @@ class AgentManager:
         permission: PermissionResolution,
         approved: bool,
     ) -> ToolResult | None:
+        self._require_safe_action_approval(approval)
         previous = run.state
         run.pending_approval = None
         self._validate_transition(run, RunState.EXECUTING)
@@ -2304,13 +2487,13 @@ class AgentManager:
                 "sandbox_bypass": (permission.sandbox_bypass_on_allow if approved else False),
             },
             action_call_payload=(
-                approval.tool_call.model_dump(mode="json")
+                self._public_tool_call_payload(approval.tool_call)
                 if approved and permission.decision is not PermissionDecision.DENY
                 else None
             ),
             completed_tool_payload=(
                 {
-                    "call": approval.tool_call.model_dump(mode="json"),
+                    "call": self._public_tool_call_payload(approval.tool_call),
                     "result": completed_result.model_dump(mode="json"),
                     "approval_request_id": approval.id,
                 }
@@ -2325,6 +2508,7 @@ class AgentManager:
         approval = run.pending_approval
         if approval is None or existing.request_id != approval.id:
             raise RuntimeError("Persisted action decision does not match its approval")
+        self._require_safe_action_approval(approval)
         self._require_decision_subject(existing, approval.model_dump(mode="json"))
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         control = self._control(run.id)
@@ -2383,6 +2567,18 @@ class AgentManager:
         approval = run.pending_approval
         if approval is None:
             return
+        try:
+            self._require_safe_action_approval(approval)
+        except ProviderError:
+            run.pending_approval = None
+            run.messages = []
+            self.storage.save_run(run)
+            await self.broker.emit(
+                run.id,
+                EventType.DECISION_ABANDONED,
+                {"kind": DecisionKind.ACTION.value, "cause": cause},
+            )
+            return
         run.pending_approval = None
         self.storage.save_run(run)
         await self.broker.emit(
@@ -2406,18 +2602,27 @@ class AgentManager:
                 run.clarification = None
                 self.storage.save_run(run)
             return
+        unsafe_action = False
         if receipt.kind is DecisionKind.ACTION and run.pending_approval is not None:
             approval = run.pending_approval
+            try:
+                self._require_safe_action_approval(approval)
+            except ProviderError:
+                unsafe_action = True
+                run.messages = []
+                event_type = EventType.DECISION_ABANDONED
+                event_payload = {"cause": cause, "unsafe_subject_discarded": True}
+            else:
+                event_type = EventType.APPROVAL_RESOLVED
+                event_payload = {
+                    "approval_id": approval.id,
+                    "approved": False,
+                    "outcome": "abandoned",
+                    "cause": cause,
+                    "mode": approval.approval_mode.value,
+                    "sandbox_bypass": False,
+                }
             run.pending_approval = None
-            event_type = EventType.APPROVAL_RESOLVED
-            event_payload = {
-                "approval_id": approval.id,
-                "approved": False,
-                "outcome": "abandoned",
-                "cause": cause,
-                "mode": approval.approval_mode.value,
-                "sandbox_bypass": False,
-            }
         else:
             if receipt.kind is DecisionKind.CLARIFICATION:
                 run.clarification = None
@@ -2429,6 +2634,7 @@ class AgentManager:
                 receipt.request_id,
                 event_type=event_type,
                 event_payload=event_payload,
+                include_request_id=not unsafe_action,
             )
         except DecisionConflictError:
             return
@@ -2543,9 +2749,8 @@ class AgentManager:
         answers: list[ClarificationAnswer],
         tool_call_id: str | None = None,
     ) -> None:
-        content = json.dumps(
-            {"answers": [answer.model_dump(mode="json") for answer in answers]},
-            ensure_ascii=False,
+        content = boundary_safe_json_dumps(
+            {"answers": [answer.model_dump(mode="json") for answer in answers]}
         )
         if tool_call_id:
             run.messages.append(
@@ -2560,7 +2765,7 @@ class AgentManager:
             run.messages.append({"role": "user", "content": f"Clarification answers: {content}"})
 
     def _append_tool_result(self, run: RunRecord, result: ToolResult) -> None:
-        model_result = result.model_copy(deep=True)
+        model_result = self._redact_result(result.model_copy(deep=True))
         model_result.output = _limit_for_model(
             model_result.output, self.settings.model_output_limit
         )
@@ -2573,7 +2778,9 @@ class AgentManager:
                 "role": "tool",
                 "tool_call_id": model_result.tool_call_id,
                 "name": model_result.name,
-                "content": model_result.model_dump_json(),
+                "content": boundary_safe_json_dumps(
+                    model_result.model_dump(mode="json")
+                ),
             }
         )
 
@@ -2609,7 +2816,7 @@ class AgentManager:
                         "Provider tool calls could not be stored safely",
                         category="provider_contract",
                     ) from exc
-                function["arguments"] = json.dumps(safe_arguments, ensure_ascii=False)
+                function["arguments"] = boundary_safe_json_dumps(safe_arguments)
         try:
             stored = cast(
                 dict[str, Any],
@@ -2630,10 +2837,21 @@ class AgentManager:
                     category="provider_contract",
                 )
             stored["reasoning_content"] = private_reasoning
+        if contains_redactable_serialized_json_secret(
+            stored,
+            api_key=self.settings.api_key,
+        ):
+            raise ProviderError(
+                "Provider response could not be stored without credential-like data",
+                category="provider_contract",
+            )
         return stored
 
     def _event_for_model(self, event: RunEvent) -> dict[str, Any]:
-        payload = event.model_dump(mode="json")
+        payload = cast(
+            dict[str, Any],
+            self.storage.redact_public_value(event.model_dump(mode="json")),
+        )
         result = payload.get("payload", {}).get("result")
         if isinstance(result, dict):
             for field in ("output", "error"):
@@ -2675,7 +2893,11 @@ class AgentManager:
         run.messages.append({"role": "user", "content": correction})
         self.storage.save_run(run)
         for call, result in results:
-            await self.broker.emit(run.id, EventType.TOOL_REQUESTED, call.model_dump(mode="json"))
+            await self.broker.emit(
+                run.id,
+                EventType.TOOL_REQUESTED,
+                self._public_tool_call_payload(call),
+            )
             await self._emit_tool_result(run, call, result)
 
     async def _reject_invalid_planning_call(
@@ -2686,8 +2908,8 @@ class AgentManager:
         label: str,
         error: ValidationError,
     ) -> None:
-        details = json.dumps(
-            error.errors(include_url=False, include_input=False), ensure_ascii=False
+        details = boundary_safe_json_dumps(
+            error.errors(include_url=False, include_input=False)
         )
         result = ToolResult(
             tool_call_id=call.id,
@@ -2717,8 +2939,8 @@ class AgentManager:
         approval_request_id: str | None = None,
     ) -> None:
         payload: dict[str, Any] = {
-            "call": call.model_dump(mode="json"),
-            "result": result.model_dump(mode="json"),
+            "call": self._public_tool_call_payload(call),
+            "result": self._redact_result(result.model_copy(deep=True)).model_dump(mode="json"),
         }
         if approval_request_id is not None:
             payload["approval_request_id"] = approval_request_id
@@ -2805,9 +3027,34 @@ class AgentManager:
         )
 
     def _redact_result(self, result: ToolResult) -> ToolResult:
+        if contains_redactable_secret(
+            result.tool_call_id, api_key=self.settings.api_key
+        ) or contains_redactable_secret(result.name, api_key=self.settings.api_key):
+            raise ProviderError(
+                "Tool result identity contained credential-like data",
+                category="tool_contract",
+            )
         result.output = self._redact(result.output)
         if result.error:
             result.error = self._redact(result.error)
+        try:
+            result.metadata = cast(
+                dict[str, Any],
+                redact_json_value(result.metadata, api_key=self.settings.api_key),
+            )
+        except ValueError as exc:
+            raise ProviderError(
+                "Tool result metadata could not be redacted safely",
+                category="tool_contract",
+            ) from exc
+        if contains_redactable_serialized_json_secret(
+            result.model_dump(mode="json"),
+            api_key=self.settings.api_key,
+        ):
+            raise ProviderError(
+                "Tool result could not be serialized without credential-like data",
+                category="tool_contract",
+            )
         return result
 
     def _redact(self, text: str) -> str:
@@ -3188,7 +3435,7 @@ class AgentManager:
                     "role": "tool",
                     "tool_call_id": call["id"],
                     "name": call["function"]["name"],
-                    "content": json.dumps(
+                    "content": boundary_safe_json_dumps(
                         {
                             "ok": False,
                             "error": "TraceForge stopped before this tool call completed.",

@@ -389,6 +389,68 @@ async def test_create_patch_command_and_rollback(
 
 
 @pytest.mark.asyncio
+async def test_native_mutations_never_snapshot_or_write_credentials(
+    settings: Settings, workspace: Workspace, storage: Storage
+) -> None:
+    configured = "owner-only-key-123456"
+    protected_settings = replace(settings, api_key=configured)
+    storage.create_run(
+        RunRecord(id="run-1", task="Edit safely", workspace=str(workspace.root))
+    )
+    registry = ToolRegistry(workspace, protected_settings)
+    existing = workspace.root / "existing.txt"
+    existing.write_text(f"first\n{configured}\n")
+    safe_existing = workspace.root / "safe-existing.txt"
+    safe_existing.write_text("safe\n")
+
+    patch = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="patch",
+            name="apply_patch",
+            arguments={
+                "patch": (
+                    "--- a/existing.txt\n+++ b/existing.txt\n"
+                    "@@ -1 +1 @@\n-first\n+changed\n"
+                )
+            },
+        ),
+    )
+    create = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="create",
+            name="create_file",
+            arguments={"path": "new.txt", "content": configured},
+        ),
+    )
+    insert = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="insert",
+            name="apply_patch",
+            arguments={
+                "patch": (
+                    "--- a/safe-existing.txt\n+++ b/safe-existing.txt\n"
+                    "@@ -1 +1,2 @@\n safe\n"
+                    f"+{configured}\n"
+                )
+            },
+        ),
+    )
+
+    assert not patch.ok and "credential-like data" in (patch.error or "")
+    assert not create.ok and "credential-like data" in (create.error or "")
+    assert not insert.ok and "credential-like data" in (insert.error or "")
+    assert existing.read_text() == f"first\n{configured}\n"
+    assert safe_existing.read_text() == "safe\n"
+    assert not (workspace.root / "new.txt").exists()
+    assert storage.list_snapshots("run-1") == []
+    for database_file in settings.data_dir.glob("test.db*"):
+        assert configured.encode() not in database_file.read_bytes()
+
+
+@pytest.mark.asyncio
 async def test_mutation_metadata_reports_only_files_that_actually_changed(
     settings: Settings,
     workspace: Workspace,
