@@ -51,11 +51,12 @@ import {
 import ReactMarkdown from "react-markdown";
 import {
   isActiveState,
-  modelRequestDetail,
   parseDiff,
   presentState,
+  projectConversationEvents,
   reasoningErrorLabel,
   shouldSubmitPrompt,
+  supportedReasoningEffort,
 } from "./lib";
 import type {
   ApprovalMode,
@@ -866,9 +867,15 @@ function TaskComposer({
   const [submitting, setSubmitting] = useState(false);
   const supportedReasoning = provider?.supported_reasoning_efforts
     ?? DEFAULT_REASONING_EFFORTS;
+  const effectiveReasoningEffort = supportedReasoningEffort(
+    supportedReasoning,
+    reasoningEffort,
+  );
   useEffect(() => {
-    if (!supportedReasoning.includes(reasoningEffort)) setReasoningEffort("auto");
-  }, [reasoningEffort, supportedReasoning]);
+    if (effectiveReasoningEffort !== reasoningEffort) {
+      setReasoningEffort(effectiveReasoningEffort);
+    }
+  }, [effectiveReasoningEffort, reasoningEffort]);
   const targetLabel = project ? project.name : demoMode ? "固定演示" : "直接任务";
   return (
     <div className="composer-wrap">
@@ -898,7 +905,7 @@ function TaskComposer({
             task.trim(),
             planMode ? "plan" : "agent",
             demoMode ? "automatic" : approvalMode,
-            demoMode ? "auto" : reasoningEffort,
+            demoMode ? "auto" : effectiveReasoningEffort,
             target,
           )
             .catch(() => undefined)
@@ -958,8 +965,8 @@ function TaskComposer({
             <span className="toggle" />
             <span><strong>计划模式</strong><small>先生成完整方案，确认后再实施</small></span>
           </label>
-          <ReasoningEffortSelect
-            value={reasoningEffort}
+          <ReasoningEffortPicker
+            value={effectiveReasoningEffort}
             onChange={setReasoningEffort}
             provider={provider}
             disabled={demoMode}
@@ -1041,7 +1048,7 @@ function ApprovalModePicker({
   );
 }
 
-function ReasoningEffortSelect({
+function ReasoningEffortPicker({
   value,
   onChange,
   provider,
@@ -1053,24 +1060,53 @@ function ReasoningEffortSelect({
   disabled?: boolean;
 }) {
   const efforts = provider?.supported_reasoning_efforts ?? DEFAULT_REASONING_EFFORTS;
+  const effectiveValue = supportedReasoningEffort(efforts, value);
+  const description = efforts.length === 1
+    ? reasoningCapabilityDescription(provider)
+    : `${reasoningEffortDescription(effectiveValue)} ${reasoningCapabilityDescription(provider)}`;
   return (
-    <label className="reasoning-effort-select">
+    <div className="reasoning-effort-picker">
       <span><Gauge size={13} /> 思考强度</span>
-      <select
-        aria-label="本轮思考强度"
-        value={efforts.includes(value) ? value : "auto"}
-        disabled={disabled}
-        onChange={(event) => onChange(event.target.value as ReasoningEffort)}
-        title={reasoningCapabilityDescription(provider)}
-      >
-        {efforts.map((effort) => (
-          <option value={effort} key={effort}>
-            {reasoningEffortOptionLabel(effort, provider)}
-          </option>
-        ))}
-      </select>
-      <small>{reasoningCapabilityDescription(provider)}</small>
-    </label>
+      {!provider ? (
+        <div
+          className="reasoning-effort-fixed"
+          role="status"
+          aria-label="本轮思考强度：正在读取模型能力"
+          title={description}
+        >
+          正在读取
+          <span>能力加载中</span>
+        </div>
+      ) : efforts.length === 1 ? (
+        <div
+          className="reasoning-effort-fixed"
+          role="group"
+          aria-label={`本轮思考强度：${reasoningEffortTriggerLabel(effectiveValue, provider)}，唯一可用`}
+          title={description}
+        >
+          {reasoningEffortTriggerLabel(effectiveValue, provider)}
+          <span>唯一可用</span>
+        </div>
+      ) : (
+        <label className="reasoning-effort-select-shell">
+          <select
+            aria-label="本轮思考强度"
+            value={effectiveValue}
+            disabled={disabled}
+            onChange={(event) => onChange(event.target.value as ReasoningEffort)}
+            title={description}
+          >
+            {efforts.map((effort) => (
+              <option value={effort} key={effort}>
+                {reasoningEffortTriggerLabel(effort, provider)}
+              </option>
+            ))}
+          </select>
+          <ChevronDown aria-hidden="true" size={13} />
+        </label>
+      )}
+      <small>{description}</small>
+    </div>
   );
 }
 
@@ -1548,16 +1584,13 @@ function RollbackDialog({ onClose, onConfirm }: { onClose: () => void; onConfirm
 
 function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
   const end = useRef<HTMLDivElement>(null);
-  const conversation = events.filter((event) =>
-    ["turn.started", "turn.completed", "message"].includes(event.type)
-  );
+  const conversation = projectConversationEvents(events);
   const trace = events.filter((event) =>
     [
       "tool.completed",
       "plan.gated",
       "verification.completed",
       "repair.started",
-      "model.requested",
       "model.retry",
       "run.resumed",
       "error",
@@ -1676,15 +1709,6 @@ function ActivityItem({ event }: { event: RunEvent }) {
       <article className="activity evidence-activity repair-activity">
         <div className="activity-icon"><Wrench size={15} /></div>
         <div><span className="activity-label">有界修复</span><strong>第 {String(event.payload.cycle ?? "?")} / {String(event.payload.limit ?? "?")} 轮</strong><p>{String(event.payload.summary ?? "完成后复核要求进行修复。")}</p></div>
-      </article>
-    );
-  }
-  if (event.type === "model.requested") {
-    const effort = String(event.payload.requested_effort ?? "auto") as ReasoningEffort;
-    return (
-      <article className="activity evidence-activity model-request-activity">
-        <div className="activity-icon"><Gauge size={15} /></div>
-        <div><span className="activity-label">模型请求</span><strong>{String(event.payload.model ?? "模型")} · {reasoningEffortLabel(effort)}</strong><p>{modelRequestDetail(event.payload, effort)}</p></div>
       </article>
     );
   }
@@ -1837,16 +1861,23 @@ function FollowUpComposer({
     defaultApprovalMode === "full_access" ? "automatic" : defaultApprovalMode,
   );
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(
-    provider?.supported_reasoning_efforts.includes(defaultReasoningEffort)
-      ? defaultReasoningEffort
-      : "auto",
+    supportedReasoningEffort(
+      provider?.supported_reasoning_efforts ?? DEFAULT_REASONING_EFFORTS,
+      defaultReasoningEffort,
+    ),
   );
   const [submitting, setSubmitting] = useState(false);
   const supportedReasoning = provider?.supported_reasoning_efforts
     ?? DEFAULT_REASONING_EFFORTS;
+  const effectiveReasoningEffort = supportedReasoningEffort(
+    supportedReasoning,
+    reasoningEffort,
+  );
   useEffect(() => {
-    if (!supportedReasoning.includes(reasoningEffort)) setReasoningEffort("auto");
-  }, [reasoningEffort, supportedReasoning]);
+    if (effectiveReasoningEffort !== reasoningEffort) {
+      setReasoningEffort(effectiveReasoningEffort);
+    }
+  }, [effectiveReasoningEffort, reasoningEffort]);
   return (
     <form
       className="follow-up-composer"
@@ -1860,7 +1891,7 @@ function FollowUpComposer({
           request,
           planMode ? "plan" : "agent",
           approvalMode,
-          reasoningEffort,
+          effectiveReasoningEffort,
         )
           .then(() => setPrompt(""))
           .catch(() => undefined)
@@ -1906,8 +1937,8 @@ function FollowUpComposer({
             <option value="full_access">完全访问（工作区）</option>
           </select>
         </label>
-        <ReasoningEffortSelect
-          value={reasoningEffort}
+        <ReasoningEffortPicker
+          value={effectiveReasoningEffort}
           onChange={setReasoningEffort}
           provider={provider}
         />
@@ -1987,7 +2018,7 @@ function Inspector({
 }
 
 function Timeline({ events }: { events: RunEvent[] }) {
-  return <div className="timeline">{events.length === 0 && <p className="muted">正在等待证据…</p>}{events.map((event) => <div className="timeline-row" key={event.seq}><span className={`timeline-marker ${event.type.includes("error") ? "bad" : event.type.includes("completed") ? "good" : ""}`} /><div><strong>{event.type}</strong><small>{clockTime(event.created_at)} · #{event.seq}</small><p>{eventSummary(event)}</p></div></div>)}</div>;
+  return <div className="timeline">{events.length === 0 && <p className="muted">正在等待证据…</p>}{events.map((event) => <div className="timeline-row" key={event.seq}><span className={`timeline-marker ${event.type.includes("error") ? "bad" : event.type.includes("completed") ? "good" : ""}`} /><div><strong>{eventTypeLabel(event.type)}</strong><small>{clockTime(event.created_at)} · #{event.seq}</small><p>{eventSummary(event)}</p></div></div>)}</div>;
 }
 
 function DiffView({ diff }: { diff: string }) {
@@ -2132,30 +2163,20 @@ function reasoningEffortLabel(effort: string): string {
   });
 }
 
-function reasoningEffortOptionLabel(
+function reasoningEffortTriggerLabel(
   effort: ReasoningEffort,
   provider: ProviderConfig | null,
 ): string {
-  if (effort === "auto") {
-    const knownDefault = provider?.default_reasoning_effort;
-    return knownDefault
-      ? `模型默认（当前已知：${reasoningEffortLabel(knownDefault)}）`
-      : "模型默认（不发送强度字段）";
-  }
-  return {
-    none: "关闭",
-    minimal: "最小（最低延迟）",
-    low: "低（更快）",
-    medium: "中（平衡）",
-    high: "高（更深入）",
-    xhigh: "极高（更慢、用量更高）",
-    max: "最大（最慢、用量最高）",
-  }[effort];
+  if (effort !== "auto") return reasoningEffortLabel(effort);
+  const knownDefault = provider?.default_reasoning_effort;
+  return knownDefault
+    ? `模型默认 · ${reasoningEffortLabel(knownDefault)}`
+    : "模型默认";
 }
 
 function reasoningEffortDescription(effort: ReasoningEffort): string {
-  if (effort === "auto") return "完全省略强度字段，由当前模型采用自己的默认值。";
-  if (effort === "none") return "明确关闭当前模型的思考模式（仅在模型声明支持时可选）。";
+  if (effort === "auto") return "由当前模型决定，不表示最低强度。";
+  if (effort === "none") return "关闭当前模型的思考模式。";
   if (["xhigh", "max"].includes(effort)) {
     return "适合最难任务，通常增加延迟与 token/额度用量，并不保证结果一定更好。";
   }
@@ -2167,12 +2188,9 @@ function reasoningEffortDescription(effort: ReasoningEffort): string {
 function reasoningCapabilityDescription(provider: ProviderConfig | null): string {
   if (!provider) return "正在读取当前模型的精确能力。";
   if (provider.supported_reasoning_efforts.length === 1) {
-    return "当前精确路由没有可信档位目录，只使用模型默认且不盲发参数。";
+    return "当前模型仅提供这个档位。";
   }
-  const source = provider.reasoning_effort_source === "deepseek_catalog"
-    ? "DeepSeek 官方模型目录"
-    : "OpenAI 官方模型目录";
-  return `${source}：只显示该模型明确支持的档位；更高不等于必然更好。`;
+  return "只显示当前模型明确支持的档位；更高不一定更好。";
 }
 
 function permissionOutcomeLabel(
@@ -2388,7 +2406,7 @@ function eventSummary(event: RunEvent): string {
     return `修复轮次 ${String(event.payload.cycle ?? "?")} 已开始`;
   }
   if (event.type === "model.requested") {
-    return `模型请求 · ${reasoningEffortLabel(String(event.payload.requested_effort ?? "auto"))}`;
+    return "内部模型调用已记录";
   }
   if (event.type === "model.retry") {
     return `模型重试：第 ${String(event.payload.next_attempt ?? "?")} / ${String(event.payload.max_attempts ?? "?")} 次`;
@@ -2399,6 +2417,10 @@ function eventSummary(event: RunEvent): string {
       : String(event.payload.message ?? "错误").slice(0, 100);
   }
   return "证据已记录";
+}
+
+function eventTypeLabel(type: string): string {
+  return type === "model.requested" ? "模型调用" : type;
 }
 
 function relativeTime(value: string): string {

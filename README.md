@@ -34,7 +34,8 @@ Its differentiator is a defensible engineering loop with useful human control.
   another task's title.
 - **Conversation without losing the Trace.** Follow-up prompts continue the same task and preserve
   prior turn summaries, workspace, and evidence. The main feed reads like a coding conversation;
-  each final answer names the files actually changed by native edit tools in that turn, while the
+  each terminal answer has one canonical conversation event and names the files actually changed
+  by native edit tools in that turn, while the
   cumulative task diff, exact plan, tools, checks, and review stay one click away.
 - **Conversation-first completion.** A compact completion footer reports passed checks and keeps
   Proof Pack one click away without letting a large evidence dashboard bury the delivered answer.
@@ -57,7 +58,9 @@ Its differentiator is a defensible engineering loop with useful human control.
   tool schemas, keeps tool requests paired with their results, and never assigns a large window
   from a fuzzy model-name match.
 - **Per-turn, model-aware reasoning effort.** The composer shows only the effort levels supported
-  by the exact official endpoint/model route. Model default omits the wire field, unknown compatible
+  by the exact official endpoint/model route in a compact native discrete picker; a sole capability
+  becomes an explicit fixed chip, and model default is not presented as a lowest point on a slider.
+  Model default omits the wire field, unknown compatible
   routes remain default-only, and one frozen choice is used by planner, builder, and verifier
   without exposing provider-private reasoning.
 
@@ -125,7 +128,8 @@ also exposes a separate action-permission picker: **手动审批** confirms ever
 workspace-scoped edits while retaining the path guard. It removes unknown-command prompts only
 when an OS sandbox is enforced; on a policy-only host, those commands fall back to human
 confirmation. Full access is per-turn and never becomes the next turn's silent default.
-The adjacent **思考强度** picker is independent from those controls. A supported explicit level is
+The adjacent **思考强度** picker is independent from those controls. It preserves the exact sparse
+order declared for the selected route rather than inventing intermediate slider values. A supported explicit level is
 frozen for the whole turn and carried through planning, building, and completion review; follow-up
 turns may choose again. OpenAI routes receive the exact Chat Completions value. DeepSeek routes map
 **关闭** to disabled thinking and supported non-default levels to enabled thinking. TraceForge does
@@ -218,8 +222,8 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 231 backend tests at 88.03% coverage (with a hard 85% gate), ten frontend
-unit tests, and nine serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 235 backend tests at 88.02% coverage (with a hard 85% gate), 13 frontend
+unit tests, and 12 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 

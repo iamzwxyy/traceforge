@@ -27,9 +27,9 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByRole("radio", { name: /手动审批/ })).toBeDisabled();
   await expect(page.getByRole("radio", { name: /自动审批/ })).toBeChecked();
   await expect(page.getByRole("radio", { name: /完全访问（工作区）/ })).toBeDisabled();
-  await expect(page.getByLabel("本轮思考强度")).toBeDisabled();
-  await expect(page.getByLabel("本轮思考强度")).toHaveValue("auto");
-  await expect(page.getByText(/当前精确路由没有可信档位目录/).first()).toBeVisible();
+  await expect(page.getByRole("group", { name: /本轮思考强度：模型默认，唯一可用/ }))
+    .toContainText("模型默认");
+  await expect(page.getByText(/当前模型仅提供这个档位/).first()).toBeVisible();
   await expect(page.getByText("与计划模式独立", { exact: true })).toBeVisible();
   await expect(page.getByText("本地就绪", { exact: true })).toBeVisible();
   await expect(page.locator(".sandbox-status")).toContainText(/seatbelt|bubblewrap|仅策略限制/i);

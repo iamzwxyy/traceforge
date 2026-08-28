@@ -1,4 +1,4 @@
-import type { Run, RunEvent, RunState } from "./types";
+import type { ReasoningEffort, Run, RunEvent, RunState } from "./types";
 
 export interface StatePresentation {
   label: string;
@@ -65,13 +65,47 @@ export function shouldSubmitPrompt(event: {
   return event.key === "Enter" && !event.shiftKey && !event.isComposing;
 }
 
-export function modelRequestDetail(
-  payload: Record<string, unknown>,
-  requestedEffort: string,
-): string {
-  if (payload.thinking === "disabled") return "已明确关闭思考模式";
-  if (payload.omitted === true) return "未发送强度字段，沿用模型默认";
-  return `协议档位 ${String(payload.wire_effort ?? requestedEffort)}`;
+export function supportedReasoningEffort(
+  efforts: ReasoningEffort[],
+  requested: ReasoningEffort,
+): ReasoningEffort {
+  if (efforts.includes(requested)) return requested;
+  if (efforts.includes("auto")) return "auto";
+  return efforts[0] ?? "auto";
+}
+
+export function projectConversationEvents(events: RunEvent[]): RunEvent[] {
+  const conversation = events.filter((event) =>
+    ["turn.started", "turn.completed", "message"].includes(event.type)
+  );
+  const hidden = new Set<number>();
+  let turnStart = -1;
+
+  for (const [index, event] of conversation.entries()) {
+    if (event.type === "turn.started") {
+      turnStart = index;
+      continue;
+    }
+    if (event.type !== "turn.completed") continue;
+    if (["answered", "succeeded"].includes(String(event.payload.outcome ?? ""))) {
+      const summary = String(event.payload.summary ?? "");
+      for (let candidate = index - 1; candidate > turnStart; candidate -= 1) {
+        const previous = conversation[candidate];
+        if (previous.type !== "message") continue;
+        if (
+          ["planning", "building", "verifying"].includes(
+            String(previous.payload.phase ?? ""),
+          )
+          && String(previous.payload.content ?? "") === summary
+        ) {
+          hidden.add(previous.seq);
+        }
+      }
+    }
+    turnStart = -1;
+  }
+
+  return conversation.filter((event) => !hidden.has(event.seq));
 }
 
 export function reasoningErrorLabel(message: string): string | null {
@@ -105,7 +139,6 @@ const activityEventTypes = new Set([
   "plan.gated",
   "verification.completed",
   "repair.started",
-  "model.requested",
   "model.retry",
   "run.resumed",
   "error",

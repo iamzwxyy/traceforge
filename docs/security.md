@@ -178,6 +178,8 @@ The safe `model.requested` event records the requested level, whether the wire f
 and whether DeepSeek thinking was enabled or disabled. It records no reasoning text. A selected
 level is frozen across planner, builder, repairs, and verifier; if an interrupted run is pointed at
 an incompatible route, resume is rejected before a model call instead of silently downgrading it.
+The event remains available in the hashed audit ledger, but the default conversation and work-record
+projection do not expose its provider/wire fields; the Timeline uses a generic model-call label.
 
 ## Persistence and rollback
 

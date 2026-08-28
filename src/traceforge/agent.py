@@ -617,10 +617,6 @@ class AgentManager:
             ]
             run.messages.append(self._assistant_message_for_storage(response))
             self.storage.save_run(run)
-            if response.content and not any(
-                call.name == "respond_to_user" for call in terminal_calls
-            ):
-                await self._emit_message(run, response.content, phase="planning")
             if not response.tool_calls:
                 non_tool_responses += 1
                 if non_tool_responses >= 2:
@@ -650,6 +646,11 @@ class AgentManager:
                 run.messages.append({"role": "user", "content": error})
                 self.storage.save_run(run)
                 continue
+            if response.content and all(
+                call.name in {"list_files", "read_file", "search_text"}
+                for call in response.tool_calls
+            ):
+                await self._emit_message(run, response.content, phase="planning")
             for call in response.tool_calls:
                 if call.name in {"list_files", "read_file", "search_text"}:
                     result = await self.tools.execute(run.id, call)
@@ -787,8 +788,6 @@ class AgentManager:
         while run.step_count < self.settings.max_steps:
             response = await self._complete_model(run, builder_tools)
             run.messages.append(self._assistant_message_for_storage(response))
-            if response.content:
-                await self._emit_message(run, response.content, phase="building")
             if not response.tool_calls:
                 no_tool_responses += 1
                 if no_tool_responses >= 2:
@@ -802,6 +801,9 @@ class AgentManager:
                 self.storage.save_run(run)
                 continue
             no_tool_responses = 0
+            publish_progress = bool(response.content) and not any(
+                call.name == "finish" for call in response.tool_calls
+            )
             for call in response.tool_calls:
                 if call.name == "finish":
                     missing = self._missing_command_checks(run.plan)
@@ -826,6 +828,7 @@ class AgentManager:
                     return
                 run.step_count += 1
                 if run.step_count > self.settings.max_steps:
+                    publish_progress = False
                     break
                 await self.broker.emit(
                     run.id, EventType.TOOL_REQUESTED, call.model_dump(mode="json")
@@ -892,6 +895,7 @@ class AgentManager:
                                 sandbox_bypass=sandbox_bypass,
                             )
                 result = self._redact_result(result)
+                publish_progress = publish_progress and result.ok
                 self._append_tool_result(run, result)
                 await self._update_checks_and_diff(run, call, result)
                 await self._emit_tool_result(run, call, result)
@@ -914,6 +918,8 @@ class AgentManager:
                     elif repeated_failures[fingerprint] >= 3:
                         raise RuntimeError("The same tool call failed three times")
                 self.storage.save_run(run)
+            if publish_progress and response.content:
+                await self._emit_message(run, response.content, phase="building")
         raise RuntimeError(f"Builder exceeded the {self.settings.max_steps}-step limit")
 
     def _builder_messages(
@@ -1019,14 +1025,22 @@ class AgentManager:
             prepared, _ = self.context.prepare(messages, verifier_tools)
             response = await self._request_model(run, prepared, verifier_tools)
             messages.append(response.as_assistant_message())
-            if response.content:
-                await self._emit_message(run, response.content, phase="verifying")
             submit_calls = [
                 call for call in response.tool_calls if call.name == "submit_verification"
             ]
             read_calls = [
                 call for call in response.tool_calls if call.name != "submit_verification"
             ]
+            if (
+                response.content
+                and not submit_calls
+                and read_calls
+                and all(
+                    call.name in {"list_files", "read_file", "search_text"}
+                    for call in read_calls
+                )
+            ):
+                await self._emit_message(run, response.content, phase="verifying")
             if len(submit_calls) == 1 and not read_calls:
                 try:
                     return VerificationReport.model_validate(submit_calls[0].arguments)

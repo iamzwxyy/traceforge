@@ -109,6 +109,13 @@ questions per round, two to four options per question, and at most two rounds. `
 executable work only when enough context exists. Terminal actions cannot be mixed with reads or
 with each other in one model response.
 
+Model prose is public only after the runtime accepts a non-terminal inspection/tool round. Prose-only
+contract violations, mixed terminal responses, and prose attached to `respond_to_user`, `finish`, or
+`submit_verification` remain internal protocol history; the canonical user result is emitted once in
+`turn.completed`. The UI keeps the append-only event ledger intact and applies a narrow compatibility
+projection for older same-turn planning/building/verifying messages whose content exactly equals an
+answered or succeeded summary.
+
 A validated `TaskPlan` contains steps, an explicit relative file scope, acceptance checks,
 optional argv commands, and risks.
 
@@ -248,7 +255,9 @@ legacy terminal rows before serving them. Credential-like
 private text fails the turn without persistence rather than being redacted into protocol-invalid
 replay. `model.requested` exposes only safe metadata: turn, phase, attempt, model, requested level,
 wire level or omission, thinking on/off/default, and capability source. The Proof Pack projects the
-requested per-turn level but not wire omission or thinking state.
+requested per-turn level but not wire omission or thinking state. The main activity feed excludes
+these transport events from its default Trace projection, while the complete Timeline retains every
+sequence entry under a generic user-facing model-call label.
 
 ## Context management
 

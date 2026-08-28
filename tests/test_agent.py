@@ -105,6 +105,62 @@ async def test_conversational_request_is_answered_without_false_workflow(
 
 
 @pytest.mark.asyncio
+async def test_planner_prose_correction_publishes_only_the_canonical_answer(
+    settings: Settings, storage: Storage
+) -> None:
+    answer = "SELECT department, COUNT(*) FROM employees GROUP BY department;"
+    provider = ScriptedProvider([
+        ModelResponse(content=answer),
+        _direct_response(answer),
+    ])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Write the SQL query")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED
+    events = storage.get_events(run.id)
+    assert [event for event in events if event.type is EventType.MESSAGE] == []
+    completed_turns = [
+        event for event in events if event.type is EventType.TURN_COMPLETED
+    ]
+    assert len(completed_turns) == 1
+    assert completed_turns[0].payload["summary"] == answer
+
+
+@pytest.mark.asyncio
+async def test_planner_read_progress_remains_visible_before_the_answer(
+    settings: Settings, storage: Storage
+) -> None:
+    (settings.workspace / "architecture.txt").write_text("local core\n")
+    provider = ScriptedProvider([
+        ModelResponse(
+            content="I will inspect the requested file.",
+            tool_calls=[
+                ToolCall(
+                    id="read",
+                    name="read_file",
+                    arguments={"path": "architecture.txt"},
+                )
+            ],
+        ),
+        _direct_response("The core stays local."),
+    ])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Inspect architecture.txt")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED
+    messages = [
+        event.payload["content"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.MESSAGE
+    ]
+    assert messages == ["I will inspect the requested file."]
+
+
+@pytest.mark.asyncio
 async def test_read_only_inspection_can_end_in_a_direct_answer(
     settings: Settings, storage: Storage
 ) -> None:
@@ -954,6 +1010,129 @@ def _verification(verdict: str, summary: str) -> ModelResponse:
             )
         ]
     )
+
+
+@pytest.mark.asyncio
+async def test_terminal_builder_and_verifier_drafts_are_not_published(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                content="Reviewed",
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Reviewed", "evidence": ["plan"]},
+                    )
+                ],
+            ),
+            ModelResponse(
+                content="Verified",
+                tool_calls=[
+                    ToolCall(
+                        id="verify",
+                        name="submit_verification",
+                        arguments={
+                            "verdict": "pass",
+                            "summary": "Verified",
+                            "findings": [],
+                        },
+                    )
+                ],
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Review the workspace")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    events = storage.get_events(run.id)
+    assert [event for event in events if event.type is EventType.MESSAGE] == []
+    completed_turns = [
+        event for event in events if event.type is EventType.TURN_COMPLETED
+    ]
+    assert len(completed_turns) == 1
+    assert completed_turns[0].payload["summary"] == "Reviewed"
+
+
+@pytest.mark.asyncio
+async def test_builder_publishes_only_progress_backed_by_accepted_tools(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                content="Rejected mixed draft",
+                tool_calls=[
+                    ToolCall(
+                        id="accepted-before-unknown",
+                        name="update_plan",
+                        arguments={
+                            "updates": [{"id": "review", "status": "in_progress"}]
+                        },
+                    ),
+                    ToolCall(
+                        id="unknown",
+                        name="respond_to_user",
+                        arguments={"content": "Reviewed"},
+                    )
+                ],
+            ),
+            ModelResponse(
+                content="Rejected malformed draft",
+                tool_calls=[
+                    ToolCall(id="malformed", name="update_plan", arguments={})
+                ],
+            ),
+            ModelResponse(
+                content="Accepted progress",
+                tool_calls=[
+                    ToolCall(
+                        id="update",
+                        name="update_plan",
+                        arguments={
+                            "updates": [{"id": "review", "status": "in_progress"}]
+                        },
+                    )
+                ],
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Reviewed", "evidence": ["plan"]},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Review the workspace", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    messages = [
+        event.payload["content"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.MESSAGE
+    ]
+    assert messages == ["Accepted progress"]
 
 
 @pytest.mark.asyncio
@@ -2279,7 +2458,10 @@ async def test_planner_prose_only_fails_and_redacts_secret(
         for event in storage.get_events(run.id)
         if event.type is EventType.MESSAGE
     ]
-    assert settings.api_key not in "".join(messages)
+    assert messages == []
+    persisted = json.dumps(storage.get_run(run.id).model_dump(mode="json"))
+    assert settings.api_key not in persisted
+    assert "[REDACTED]" in persisted
 
 
 @pytest.mark.asyncio

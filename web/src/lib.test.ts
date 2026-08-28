@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   buildActivityChapters,
   mergeEvents,
-  modelRequestDetail,
   parseDiff,
   preferNewerRun,
   presentState,
+  projectConversationEvents,
   reasoningErrorLabel,
   shouldSubmitPrompt,
+  supportedReasoningEffort,
 } from "./lib";
 import type { Run, RunEvent } from "./types";
 
@@ -53,13 +54,61 @@ describe("mission control helpers", () => {
     expect(shouldSubmitPrompt({ key: "a", shiftKey: false, isComposing: false })).toBe(false);
   });
 
-  it("describes disabled thinking before the omitted effort field", () => {
-    expect(modelRequestDetail({ thinking: "disabled", omitted: true }, "none"))
-      .toBe("已明确关闭思考模式");
-    expect(modelRequestDetail({ thinking: "provider_default", omitted: true }, "auto"))
-      .toBe("未发送强度字段，沿用模型默认");
-    expect(modelRequestDetail({ wire_effort: "high", omitted: false }, "high"))
-      .toBe("协议档位 high");
+  it("falls back only to a capability the exact model actually supports", () => {
+    expect(supportedReasoningEffort(["none"], "high")).toBe("none");
+    expect(supportedReasoningEffort(["low", "high"], "max")).toBe("low");
+    expect(supportedReasoningEffort(["high", "auto"], "max")).toBe("auto");
+    expect(supportedReasoningEffort([], "high")).toBe("auto");
+  });
+
+  it("hides only an exact legacy planning duplicate of an answered turn", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      { ...event(2), payload: { phase: "planning", content: "Inspecting first." } },
+      { ...event(3), payload: { phase: "planning", content: "Final answer" } },
+      { ...event(4), payload: { phase: "planning", content: "Distinct later progress" } },
+      {
+        ...event(5),
+        type: "turn.completed",
+        payload: { index: 1, outcome: "answered", summary: "Final answer" },
+      },
+    ]);
+
+    expect(projected.map((item) => item.seq)).toEqual([1, 2, 4, 5]);
+  });
+
+  it("does not deduplicate across turns or discard distinct progress", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      { ...event(2), payload: { phase: "planning", content: "Progress" } },
+      {
+        ...event(3),
+        type: "turn.completed",
+        payload: { index: 1, outcome: "answered", summary: "Same answer" },
+      },
+      { ...event(4), type: "turn.started", payload: { index: 2 } },
+      {
+        ...event(5),
+        type: "turn.completed",
+        payload: { index: 2, outcome: "answered", summary: "Same answer" },
+      },
+    ]);
+
+    expect(projected.map((item) => item.seq)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("hides an exact legacy builder draft before a successful terminal summary", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      { ...event(2), payload: { phase: "building", content: "Implemented and tested" } },
+      {
+        ...event(3),
+        type: "turn.completed",
+        payload: { index: 1, outcome: "succeeded", summary: "Implemented and tested" },
+      },
+    ]);
+
+    expect(projected.map((item) => item.seq)).toEqual([1, 3]);
   });
 
   it("turns reasoning capability failures into actionable Chinese guidance", () => {
