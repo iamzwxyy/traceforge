@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from traceforge.models import (
     ClarificationAnswer,
     ClarificationQuestion,
+    ClarificationRequest,
     QuestionOption,
     TaskPlan,
 )
@@ -31,6 +32,39 @@ def test_clarification_answer_accepts_custom_text() -> None:
 def test_clarification_answer_rejects_empty_value() -> None:
     with pytest.raises(ValidationError, match="required"):
         ClarificationAnswer(question_id="name")
+
+
+def test_clarification_request_requires_unique_question_ids() -> None:
+    with pytest.raises(ValidationError, match="question ids must be unique"):
+        ClarificationRequest(
+            questions=[
+                ClarificationQuestion(
+                    id="scope",
+                    prompt="First scope?",
+                    options=[
+                        QuestionOption(id="one", label="One"),
+                        QuestionOption(id="two", label="Two"),
+                    ],
+                ),
+                ClarificationQuestion(
+                    id="scope",
+                    prompt="Second scope?",
+                    options=[
+                        QuestionOption(id="small", label="Small"),
+                        QuestionOption(id="large", label="Large"),
+                    ],
+                ),
+            ]
+        )
+
+
+def test_clarification_answer_rejects_option_and_custom_text_together() -> None:
+    with pytest.raises(ValidationError, match="Exactly one"):
+        ClarificationAnswer(
+            question_id="scope",
+            option_id="small",
+            custom_text="large",
+        )
 
 
 def test_plan_materializes_a_localized_markdown_contract_from_structured_fields() -> None:

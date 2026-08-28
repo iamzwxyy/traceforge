@@ -74,7 +74,31 @@ credential exposure remain denied in all profiles.
 Each tool completion records the base decision, effective decision, profile, authorization source,
 outcome, reason, and actual sandbox-bypass fact. A pending approval also snapshots those fields so
 the approval card can say whether clicking once will retain or bypass the OS sandbox. Cancellation
-or restart resolves a stale approval as `abandoned`, clears its ID, and never replays the action.
+marks an unconsumed approval `abandoned`. Restart instead preserves its exact request-bound receipt:
+explicit resume reopens a pending card or consumes an already accepted response; it never lets that
+ID authorize a reconstructed or later action.
+
+## Durable decision boundary
+
+Every clarification, plan review, and action approval is bound to a random request ID and a hash of
+the exact subject shown to the user. The backend commits the canonical response to a SQLite inbox
+before acknowledging it. An exact retry is safe even after consumption; a different payload under
+the same ID, the wrong decision kind, an abandoned request, or an old ID is rejected. The browser
+also uses synchronous single-flight guards and keeps a submitted card locked until the run changes,
+but those controls are usability defenses—the database compare-and-set remains authoritative.
+Clarification schemas reject duplicate question IDs, duplicate answers, and responses that mix or
+omit option/custom values. Restart repair pairs an accepted reply with the exact latest unanswered
+source call rather than trusting a provider call ID to be globally unique.
+
+Approved actions use an at-most-once crash boundary. The transaction that consumes approval also
+clears the pending card, enters execution, and persists `tool.started`; only then may the external
+tool run. A crash before that transaction leaves an accepted receipt that explicit resume can
+consume. A crash after it but before `tool.completed` is inherently unable to prove whether the
+side effect occurred, so TraceForge marks the receipt `uncertain`, never auto-replays it, and asks
+the resumed builder to inspect current state. This favors duplicate-side-effect prevention over
+blind at-least-once execution. A rejection is different: its deterministic failed tool result and
+completion evidence commit with receipt consumption, preserving the user's exact decision across a
+crash.
 
 ## Command policy
 
@@ -201,7 +225,22 @@ WAL checkpoint whose busy result is checked, but TraceForge does not encrypt the
 from SSDs, backups, or filesystem snapshots.
 
 Rollback is hash-conditional. A file changed by the user after the agent wrote it is reported as a
-conflict and preserved. This prevents recovery from becoming a second destructive action.
+conflict and preserved. This prevents recovery from becoming a second destructive action. Before
+touching files, rollback permanently abandons the run's pending or accepted human decision and
+clears its public subject; a stale response cannot race rollback or revive the gate even if a later
+file operation fails. Resume and rollback are serialized by the same per-run lifecycle lock.
+
+Filesystem changes cannot share a transaction with SQLite, so rollback makes each path
+result-idempotent: an original file already restored, or a generated file already absent, is
+recognized as the same successful outcome on retry. After the file batch, the `rolled_back` row and
+complete result event commit together. Once that transaction exists, an exact API retry returns the
+persisted result without running the file algorithm again, so a lost response cannot reinterpret
+restored files as new conflicts.
+
+A rolled-back run is never reopened for writing. Continuation creates one linked successor UUID
+whose snapshot keys are independent and whose baseline is the current disk. Exact continuation
+retries return that successor; a conflicting second branch is rejected. Thus a later rollback
+cannot use the parent's older snapshots to overwrite work the user did after the first rollback.
 
 The successful RunRecord, closed turn, terminal events, and immutable per-turn Proof Pack are one
 SQLite transaction. A construction or identity conflict rolls back the whole success transition,
@@ -247,6 +286,14 @@ a stale UI owner before dispatch. These checks prevent ordinary response or rend
 displaying one workspace's evidence—or targeting its controls—under another task, while the backend
 remains the authority for access to each run-scoped route.
 
+Decision and rollback forms also own a synchronous in-flight token, disable every mutable control,
+and keep local failure details beside the relevant card/dialog. A rollback dialog cannot close via
+Escape while its request is pending; success projects the backend's restored/removed/conflict
+lists and receives focus. A successful mutation response is authoritative even if the subsequent
+refresh fails, so that synchronization error cannot unlock the control and resend the POST. A
+rolled-back continuation selects the new successor response rather than refreshing the old parent
+ID; a lineage conflict refreshes the parent and task list so the existing successor becomes visible.
+
 ## Residual risks
 
 - A user-approved bypass has the user's OS permissions and can ignore the workspace boundary.
@@ -271,6 +318,9 @@ remains the authority for access to each run-scoped route.
   planned file scope do not establish semantic safety.
 - Proof Pack hashes are not signatures or remote attestations.
 - Provider behavior and availability are external dependencies; retries do not guarantee service.
+- An `uncertain` approved action may in fact have done nothing if the process died after the durable
+  start marker but before entering the tool. Automatic replay would be more dangerous; inspect the
+  workspace and external system before deciding whether to issue a new action.
 
 The safe default for an unfamiliar repository is a disposable OS account, container, or virtual
 machine in addition to TraceForge's built-in controls.

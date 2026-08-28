@@ -12,7 +12,10 @@ from pydantic import ValidationError
 from traceforge.config import Settings
 from traceforge.models import (
     ApprovalMode,
+    ApprovalRequest,
     ConversationTurn,
+    DecisionKind,
+    DecisionStatus,
     EventType,
     ProjectRecord,
     ProofPack,
@@ -21,6 +24,8 @@ from traceforge.models import (
     RunEvent,
     RunRecord,
     RunState,
+    ToolCall,
+    ToolResult,
 )
 from traceforge.proof import build_proof_pack, build_success_proof_pack
 from traceforge.storage import SecureCheckpointError, SnapshotRecord, Storage
@@ -59,6 +64,358 @@ def test_run_and_events_round_trip(storage: Storage, settings: Settings) -> None
     assert loaded.messages[0]["content"] == "Fix it"
     assert event.seq == 1
     assert storage.get_events("run-1")[0].payload == {"state": "planning"}
+
+
+def test_run_lineage_requires_a_rolled_back_parent_and_is_atomic(
+    storage: Storage, settings: Settings
+) -> None:
+    parent = RunRecord(
+        id="parent",
+        task="First change",
+        workspace=str(settings.workspace),
+        state=RunState.ROLLED_BACK,
+    )
+    storage.create_run(parent)
+    child = RunRecord(
+        id="child",
+        task="Continue safely",
+        workspace=str(settings.workspace),
+    )
+
+    storage.create_run(child, parent_run_id=parent.id)
+
+    assert storage.get_parent_run_id(child.id) == parent.id
+    assert storage.get_parent_run_id(parent.id) is None
+    assert storage.get_successor_run_id(parent.id) == child.id
+    assert storage.get_successor_run_id(child.id) is None
+
+    invalid_parent = RunRecord(
+        id="active-parent",
+        task="Still active",
+        workspace=str(settings.workspace),
+        state=RunState.EXECUTING,
+    )
+    storage.create_run(invalid_parent)
+    rejected_child = RunRecord(
+        id="rejected-child",
+        task="Must not persist",
+        workspace=str(settings.workspace),
+    )
+    with pytest.raises(ValueError, match="rolled-back"):
+        storage.create_run(rejected_child, parent_run_id=invalid_parent.id)
+    with pytest.raises(KeyError):
+        storage.get_run(rejected_child.id)
+
+
+def test_open_decision_rolls_back_waiting_state_row_and_events_together(
+    storage: Storage,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = RunRecord(
+        id="atomic-decision",
+        task="Choose safely",
+        workspace=str(settings.workspace),
+        state=RunState.PLANNING,
+    )
+    storage.create_run(run)
+    run.state = RunState.AWAITING_PLAN_APPROVAL
+    inserted = 0
+    original_insert = storage._insert_event_locked
+
+    def fail_second_event(event: RunEvent) -> None:
+        nonlocal inserted
+        inserted += 1
+        original_insert(event)
+        if inserted == 2:
+            raise RuntimeError("event write failed")
+
+    monkeypatch.setattr(storage, "_insert_event_locked", fail_second_event)
+    with pytest.raises(RuntimeError, match="event write failed"):
+        storage.open_decision(
+            run,
+            previous_state=RunState.PLANNING,
+            request_id="decision-1",
+            kind=DecisionKind.PLAN,
+            turn_index=1,
+            subject={"summary": "Review"},
+            requested_event_type=EventType.PLAN_UPDATED,
+            requested_payload={"summary": "Review"},
+        )
+
+    assert storage.get_run(run.id).state is RunState.PLANNING
+    assert storage.get_active_decision(run.id) is None
+    assert storage.get_events(run.id) == []
+
+
+def test_approved_action_consumption_and_start_marker_are_atomic(
+    storage: Storage,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCall(
+        id="command",
+        name="run_command",
+        arguments={"argv": ["git", "status"]},
+    )
+    approval = ApprovalRequest(
+        id="approval-1",
+        tool_call=call,
+        summary="Inspect repository status",
+        reason="Manual approval is required",
+        risk="elevated",
+        approval_mode=ApprovalMode.MANUAL,
+        policy_decision="ask",
+    )
+    run = RunRecord(
+        id="atomic-action",
+        task="Inspect status",
+        workspace=str(settings.workspace),
+        state=RunState.EXECUTING,
+        pending_approval=approval,
+    )
+    storage.create_run(run)
+    run.state = RunState.AWAITING_ACTION_APPROVAL
+    storage.open_decision(
+        run,
+        previous_state=RunState.EXECUTING,
+        request_id=approval.id,
+        kind=DecisionKind.ACTION,
+        turn_index=1,
+        subject=approval.model_dump(mode="json"),
+        requested_event_type=EventType.APPROVAL_REQUESTED,
+        requested_payload=approval.model_dump(mode="json"),
+    )
+    storage.accept_decision(
+        run.id,
+        approval.id,
+        DecisionKind.ACTION,
+        {"approved": True},
+    )
+    events_before = storage.get_events(run.id)
+    persisted = storage.get_run(run.id)
+    persisted.pending_approval = None
+    persisted.state = RunState.EXECUTING
+    original_insert = storage._insert_event_locked
+
+    def fail_start_marker(event: RunEvent) -> None:
+        original_insert(event)
+        if event.type is EventType.TOOL_STARTED:
+            raise RuntimeError("start marker write failed")
+
+    monkeypatch.setattr(storage, "_insert_event_locked", fail_start_marker)
+    with pytest.raises(RuntimeError, match="start marker write failed"):
+        storage.consume_decision(
+            persisted,
+            approval.id,
+            DecisionKind.ACTION,
+            previous_state=RunState.AWAITING_ACTION_APPROVAL,
+            resolved_event_type=EventType.APPROVAL_RESOLVED,
+            resolved_payload={"approved": True},
+            action_call_payload=call.model_dump(mode="json"),
+        )
+
+    unchanged = storage.get_run(run.id)
+    assert unchanged.state is RunState.AWAITING_ACTION_APPROVAL
+    assert unchanged.pending_approval == approval
+    receipt = storage.get_decision(run.id, approval.id)
+    assert receipt.status is DecisionStatus.ACCEPTED
+    assert receipt.execution_started_at is None
+    assert storage.get_events(run.id) == events_before
+
+
+def test_rejected_action_result_and_decision_consumption_are_atomic(
+    storage: Storage,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCall(
+        id="rejected-command",
+        name="run_command",
+        arguments={"argv": ["git", "status"]},
+    )
+    approval = ApprovalRequest(
+        id="approval-rejected",
+        tool_call=call,
+        summary="Inspect repository status",
+        reason="Manual approval is required",
+        risk="elevated",
+        approval_mode=ApprovalMode.MANUAL,
+        policy_decision="ask",
+    )
+    run = RunRecord(
+        id="atomic-rejection",
+        task="Reject status inspection",
+        workspace=str(settings.workspace),
+        state=RunState.EXECUTING,
+        pending_approval=approval,
+    )
+    storage.create_run(run)
+    run.state = RunState.AWAITING_ACTION_APPROVAL
+    storage.open_decision(
+        run,
+        previous_state=RunState.EXECUTING,
+        request_id=approval.id,
+        kind=DecisionKind.ACTION,
+        turn_index=1,
+        subject=approval.model_dump(mode="json"),
+        requested_event_type=EventType.APPROVAL_REQUESTED,
+        requested_payload=approval.model_dump(mode="json"),
+    )
+    storage.accept_decision(
+        run.id,
+        approval.id,
+        DecisionKind.ACTION,
+        {"approved": False},
+    )
+    events_before = storage.get_events(run.id)
+    rejected = ToolResult(
+        tool_call_id=call.id,
+        name=call.name,
+        ok=False,
+        error="User rejected this action.",
+    )
+    persisted = storage.get_run(run.id)
+    persisted.pending_approval = None
+    persisted.state = RunState.EXECUTING
+    persisted.messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": call.id,
+            "name": call.name,
+            "content": rejected.model_dump_json(),
+        }
+    )
+    original_insert = storage._insert_event_locked
+
+    def fail_completed_marker(event: RunEvent) -> None:
+        original_insert(event)
+        if event.type is EventType.TOOL_COMPLETED:
+            raise RuntimeError("completion marker write failed")
+
+    monkeypatch.setattr(storage, "_insert_event_locked", fail_completed_marker)
+    with pytest.raises(RuntimeError, match="completion marker write failed"):
+        storage.consume_decision(
+            persisted,
+            approval.id,
+            DecisionKind.ACTION,
+            previous_state=RunState.AWAITING_ACTION_APPROVAL,
+            resolved_event_type=EventType.APPROVAL_RESOLVED,
+            resolved_payload={"approved": False},
+            completed_tool_payload={
+                "call": call.model_dump(mode="json"),
+                "result": rejected.model_dump(mode="json"),
+                "approval_request_id": approval.id,
+            },
+        )
+
+    unchanged = storage.get_run(run.id)
+    assert unchanged.state is RunState.AWAITING_ACTION_APPROVAL
+    assert unchanged.pending_approval == approval
+    assert unchanged.messages == []
+    assert storage.get_decision(run.id, approval.id).status is DecisionStatus.ACCEPTED
+    assert storage.get_events(run.id) == events_before
+
+
+def test_abandon_decision_clears_subject_and_emits_evidence_atomically(
+    storage: Storage,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCall(id="pending", name="run_command", arguments={"argv": ["pwd"]})
+    approval = ApprovalRequest(
+        id="approval-abandon",
+        tool_call=call,
+        summary="Inspect workspace",
+        reason="Manual approval is required",
+        risk="elevated",
+        approval_mode=ApprovalMode.MANUAL,
+        policy_decision="ask",
+    )
+    run = RunRecord(
+        id="atomic-abandon",
+        task="Abandon safely",
+        workspace=str(settings.workspace),
+        state=RunState.EXECUTING,
+        pending_approval=approval,
+    )
+    storage.create_run(run)
+    run.state = RunState.AWAITING_ACTION_APPROVAL
+    storage.open_decision(
+        run,
+        previous_state=RunState.EXECUTING,
+        request_id=approval.id,
+        kind=DecisionKind.ACTION,
+        turn_index=1,
+        subject=approval.model_dump(mode="json"),
+        requested_event_type=EventType.APPROVAL_REQUESTED,
+        requested_payload=approval.model_dump(mode="json"),
+    )
+    storage.accept_decision(
+        run.id,
+        approval.id,
+        DecisionKind.ACTION,
+        {"approved": True},
+    )
+    events_before = storage.get_events(run.id)
+    persisted = storage.get_run(run.id)
+    persisted.pending_approval = None
+    original_insert = storage._insert_event_locked
+
+    def fail_abandon_event(event: RunEvent) -> None:
+        original_insert(event)
+        if event.type is EventType.APPROVAL_RESOLVED:
+            raise RuntimeError("abandon evidence write failed")
+
+    monkeypatch.setattr(storage, "_insert_event_locked", fail_abandon_event)
+    with pytest.raises(RuntimeError, match="abandon evidence write failed"):
+        storage.abandon_decision(
+            persisted,
+            approval.id,
+            event_type=EventType.APPROVAL_RESOLVED,
+            event_payload={"outcome": "abandoned"},
+        )
+
+    unchanged = storage.get_run(run.id)
+    assert unchanged.pending_approval == approval
+    assert storage.get_decision(run.id, approval.id).status is DecisionStatus.ACCEPTED
+    assert storage.get_events(run.id) == events_before
+
+
+def test_rollback_state_and_replayable_result_are_atomic(
+    storage: Storage,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = RunRecord(
+        id="atomic-rollback",
+        task="Rollback atomically",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+    )
+    storage.create_run(run)
+    run.state = RunState.ROLLED_BACK
+    original_insert = storage._insert_event_locked
+
+    def fail_result_event(event: RunEvent) -> None:
+        original_insert(event)
+        if event.type is EventType.ROLLBACK_COMPLETED:
+            raise RuntimeError("rollback result write failed")
+
+    monkeypatch.setattr(storage, "_insert_event_locked", fail_result_event)
+    with pytest.raises(RuntimeError, match="rollback result write failed"):
+        storage.commit_rollback(
+            run,
+            previous_state=RunState.INTERRUPTED,
+            rollback_payload={
+                "restored": ["restored.txt"],
+                "removed": [],
+                "conflicts": [],
+            },
+        )
+
+    assert storage.get_run(run.id).state is RunState.INTERRUPTED
+    assert storage.get_events(run.id) == []
 
 
 def test_snapshot_is_write_once(storage: Storage, tmp_path: Path) -> None:

@@ -20,6 +20,9 @@ from traceforge.models import (
     ClarificationAnswer,
     ClarificationRequest,
     ConversationTurn,
+    DecisionKind,
+    DecisionRequest,
+    DecisionStatus,
     DirectResponse,
     EventType,
     FinishRequest,
@@ -45,7 +48,12 @@ from traceforge.proof import (
     freeze_success_proof_pack,
 )
 from traceforge.provider import ModelProvider, ModelResponse, ProviderError
-from traceforge.storage import SecureCheckpointError, Storage
+from traceforge.storage import (
+    DecisionConflictError,
+    SecureCheckpointError,
+    Storage,
+    decision_payload_sha256,
+)
 from traceforge.tools import PermissionDecision, PermissionResolution, ToolRegistry
 from traceforge.workspace import RollbackResult, Workspace
 
@@ -83,6 +91,8 @@ class _Control:
     clarification_future: asyncio.Future[list[ClarificationAnswer]] | None = None
     plan_future: asyncio.Future[PlanDecision] | None = None
     approval_future: asyncio.Future[bool] | None = None
+    decision_request_id: str | None = None
+    decision_kind: DecisionKind | None = None
 
 
 _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
@@ -136,8 +146,10 @@ _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
         RunState.PLANNING,
         RunState.AWAITING_CLARIFICATION,
         RunState.AWAITING_PLAN_APPROVAL,
+        RunState.AWAITING_ACTION_APPROVAL,
         RunState.EXECUTING,
         RunState.CANCELLED,
+        RunState.FAILED,
         RunState.ROLLED_BACK,
     },
     RunState.ANSWERED: {RunState.CREATED, RunState.ROLLED_BACK},
@@ -179,6 +191,7 @@ class AgentManager:
         mode: InteractionMode = InteractionMode.AGENT,
         approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
+        parent_run_id: str | None = None,
     ) -> RunRecord:
         clean_task = task.strip()
         if not clean_task:
@@ -206,23 +219,26 @@ class AgentManager:
                 )
             ],
         )
-        self.storage.create_run(run)
+        self.storage.create_run(run, parent_run_id=parent_run_id)
         self._controls[run.id] = _Control()
         await self.broker.emit(
             run.id,
             EventType.STATE_CHANGED,
             {"state": run.state.value, "previous": None},
         )
+        turn_started_payload: dict[str, Any] = {
+            "index": 1,
+            "request": clean_task,
+            "mode": mode.value,
+            "approval_mode": approval_mode.value,
+            "reasoning_effort": reasoning_effort.value,
+        }
+        if parent_run_id is not None:
+            turn_started_payload["continued_from_run_id"] = parent_run_id
         await self.broker.emit(
             run.id,
             EventType.TURN_STARTED,
-            {
-                "index": 1,
-                "request": clean_task,
-                "mode": mode.value,
-                "approval_mode": approval_mode.value,
-                "reasoning_effort": reasoning_effort.value,
-            },
+            turn_started_payload,
         )
         self._spawn(run.id, resume=False)
         return run
@@ -243,6 +259,60 @@ class AgentManager:
                 mode=mode,
                 approval_mode=approval_mode,
                 reasoning_effort=reasoning_effort,
+            )
+
+    async def continue_after_rollback(
+        self,
+        run_id: str,
+        prompt: str,
+        *,
+        mode: InteractionMode = InteractionMode.AGENT,
+        approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
+    ) -> RunRecord:
+        """Start a successor run with a fresh snapshot boundary after rollback."""
+
+        async with self._lifecycle_lock(run_id):
+            clean_prompt = prompt.strip()
+            if not clean_prompt:
+                raise ValueError("Follow-up prompt must not be empty")
+            parent = self.storage.get_run(run_id)
+            if parent.state is not RunState.ROLLED_BACK:
+                raise InvalidRunAction(
+                    "A rollback successor is available only after rollback completes"
+                )
+            await self._wait_for_terminal_task(run_id)
+            parent = self.storage.get_run(run_id)
+            if parent.state is not RunState.ROLLED_BACK:
+                raise InvalidRunAction(
+                    "A rollback successor is available only after rollback completes"
+                )
+            if parent.workspace != str(self.settings.workspace):
+                raise InvalidRunAction("The rolled-back task belongs to another workspace")
+            successor_id = self.storage.get_successor_run_id(parent.id)
+            if successor_id is not None:
+                successor = self.storage.get_run(successor_id)
+                first_turn = successor.turns[0] if successor.turns else None
+                if (
+                    successor.task == clean_prompt
+                    and first_turn is not None
+                    and first_turn.request == clean_prompt
+                    and first_turn.mode is mode
+                    and first_turn.approval_mode is approval_mode
+                    and first_turn.reasoning_effort is reasoning_effort
+                ):
+                    return successor
+                raise InvalidRunAction(
+                    f"This rolled-back task already continued as {successor.id}"
+                )
+            return await self.start_run(
+                clean_prompt,
+                verifier_enabled=parent.verifier_enabled,
+                project_id=parent.project_id,
+                mode=mode,
+                approval_mode=approval_mode,
+                reasoning_effort=reasoning_effort,
+                parent_run_id=parent.id,
             )
 
     async def _follow_up_locked(
@@ -314,46 +384,81 @@ class AgentManager:
         return self.storage.get_run(run.id)
 
     async def answer_clarification(
-        self, run_id: str, answers: list[ClarificationAnswer]
+        self,
+        run_id: str,
+        answers: list[ClarificationAnswer],
+        *,
+        request_id: str | None = None,
     ) -> None:
-        run = self.storage.get_run(run_id)
-        if run.state is not RunState.AWAITING_CLARIFICATION or run.clarification is None:
-            raise InvalidRunAction("The run is not waiting for clarification")
-        expected = {question.id: question for question in run.clarification.questions}
-        supplied = {answer.question_id: answer for answer in answers}
-        if supplied.keys() != expected.keys():
-            raise InvalidRunAction("Every clarification question must be answered exactly once")
-        for question_id, answer in supplied.items():
-            if answer.option_id and answer.option_id not in {
-                option.id for option in expected[question_id].options
-            }:
-                raise InvalidRunAction(f"Unknown option for {question_id}: {answer.option_id}")
-        future = self._control(run_id).clarification_future
-        if future is None or future.done():
-            raise InvalidRunAction("Clarification response window is not active")
-        future.set_result(answers)
+        request_id = request_id or self._active_decision_id(
+            run_id, DecisionKind.CLARIFICATION
+        )
+        payload = {"answers": [answer.model_dump(mode="json") for answer in answers]}
+        receipt = self._decision_or_reject(run_id, request_id)
+        if receipt.status is DecisionStatus.PENDING:
+            run = self.storage.get_run(run_id)
+            if run.clarification is None:
+                raise InvalidRunAction("The clarification request is no longer active")
+            expected = {question.id: question for question in run.clarification.questions}
+            supplied = {answer.question_id: answer for answer in answers}
+            if len(supplied) != len(answers) or supplied.keys() != expected.keys():
+                raise InvalidRunAction("Every clarification question must be answered exactly once")
+            for question_id, answer in supplied.items():
+                if answer.option_id and answer.option_id not in {
+                    option.id for option in expected[question_id].options
+                }:
+                    raise InvalidRunAction(
+                        f"Unknown option for {question_id}: {answer.option_id}"
+                    )
+            self._require_decision_subject(receipt, run.clarification.model_dump(mode="json"))
+        accepted = self._accept_decision_or_reject(
+            run_id, request_id, DecisionKind.CLARIFICATION, payload
+        )
+        self._signal_decision(accepted)
 
-    async def decide_plan(self, run_id: str, decision: PlanDecision) -> None:
-        run = self.storage.get_run(run_id)
-        if run.state is not RunState.AWAITING_PLAN_APPROVAL:
-            raise InvalidRunAction("The run is not waiting for plan approval")
-        future = self._control(run_id).plan_future
-        if future is None or future.done():
-            raise InvalidRunAction("Plan decision window is not active")
-        future.set_result(decision)
+    async def decide_plan(
+        self,
+        run_id: str,
+        decision: PlanDecision,
+        *,
+        request_id: str | None = None,
+    ) -> None:
+        request_id = request_id or self._active_decision_id(run_id, DecisionKind.PLAN)
+        receipt = self._decision_or_reject(run_id, request_id)
+        if receipt.status is DecisionStatus.PENDING:
+            run = self.storage.get_run(run_id)
+            if run.plan is None:
+                raise InvalidRunAction("The plan request is no longer active")
+            self._require_decision_subject(receipt, run.plan.model_dump(mode="json"))
+        accepted = self._accept_decision_or_reject(
+            run_id,
+            request_id,
+            DecisionKind.PLAN,
+            decision.model_dump(mode="json"),
+        )
+        self._signal_decision(accepted)
 
     async def decide_action(
         self, run_id: str, approval_id: str, *, approved: bool
     ) -> None:
-        run = self.storage.get_run(run_id)
-        if run.state is not RunState.AWAITING_ACTION_APPROVAL:
-            raise InvalidRunAction("The run is not waiting for an action approval")
-        if run.pending_approval is None or run.pending_approval.id != approval_id:
-            raise InvalidRunAction("Approval is no longer pending")
-        future = self._control(run_id).approval_future
-        if future is None or future.done():
-            raise InvalidRunAction("Action decision window is not active")
-        future.set_result(approved)
+        try:
+            receipt = self._decision_or_reject(run_id, approval_id)
+        except InvalidRunAction as exc:
+            raise InvalidRunAction("The action approval is no longer pending") from exc
+        if receipt.status is DecisionStatus.PENDING:
+            run = self.storage.get_run(run_id)
+            if run.pending_approval is None or run.pending_approval.id != approval_id:
+                raise InvalidRunAction("Approval is no longer pending")
+            self._require_decision_subject(
+                receipt, run.pending_approval.model_dump(mode="json")
+            )
+        accepted = self._accept_decision_or_reject(
+            run_id,
+            approval_id,
+            DecisionKind.ACTION,
+            {"approved": approved},
+        )
+        self._signal_decision(accepted)
 
     async def cancel(self, run_id: str) -> RunRecord:
         run = self.storage.get_run(run_id)
@@ -368,12 +473,16 @@ class AgentManager:
             except asyncio.CancelledError:
                 pass
         elif run.state is RunState.INTERRUPTED:
-            await self._abandon_pending_approval(run, cause="user_cancelled")
+            await self._abandon_active_decision(run, cause="user_cancelled")
             if await self._transition(run, RunState.CANCELLED):
                 await self._close_turn(run, "cancelled", "The user stopped this turn.")
         return self.storage.get_run(run_id)
 
     async def resume(self, run_id: str) -> RunRecord:
+        async with self._lifecycle_lock(run_id):
+            return self._resume_locked(run_id)
+
+    def _resume_locked(self, run_id: str) -> RunRecord:
         run = self.storage.get_run(run_id)
         if run.state is not RunState.INTERRUPTED:
             raise InvalidRunAction("Only interrupted runs can be resumed")
@@ -407,6 +516,15 @@ class AgentManager:
 
     async def _rollback_locked(self, run_id: str) -> RollbackResult:
         run = self.storage.get_run(run_id)
+        if run.state is RunState.ROLLED_BACK:
+            persisted = self._persisted_rollback_result(run_id)
+            if persisted is None:
+                raise InvalidRunAction(
+                    "Rollback already completed, but its persisted result is unavailable"
+                )
+            return persisted
+        if run_id in self._tasks and not self._tasks[run_id].done():
+            raise RunConflictError("Run is already active")
         if run.state is RunState.ANSWERED and not self.storage.list_snapshots(run_id):
             raise InvalidRunAction("Answer-only turns have no file changes to roll back")
         if not run.state.terminal and run.state is not RunState.INTERRUPTED:
@@ -416,10 +534,49 @@ class AgentManager:
             run = self.storage.get_run(run_id)
         if run.state is RunState.SUCCEEDED:
             self._freeze_success_or_reject(run)
+        await self._abandon_active_decision(run, cause="run_rolled_back")
+        previous = run.state
+        self._validate_transition(run, RunState.ROLLED_BACK)
+        if not await self._prepare_terminal_cleanup(run, RunState.ROLLED_BACK):
+            raise InvalidRunAction(
+                "Rollback is waiting for secure history cleanup; close external SQLite "
+                "readers and retry"
+            )
         result = self.workspace.rollback(run_id)
-        await self._transition(run, RunState.ROLLED_BACK)
-        await self.broker.emit(run_id, EventType.ROLLBACK_COMPLETED, _rollback_payload(result))
+        run.state = RunState.ROLLED_BACK
+        events = self.storage.commit_rollback(
+            run,
+            previous_state=previous,
+            rollback_payload=_rollback_payload(result),
+        )
+        await self._publish_persisted(events)
         return result
+
+    def _persisted_rollback_result(self, run_id: str) -> RollbackResult | None:
+        event = next(
+            (
+                candidate
+                for candidate in reversed(self.storage.get_events(run_id))
+                if candidate.type is EventType.ROLLBACK_COMPLETED
+            ),
+            None,
+        )
+        if event is None:
+            return None
+
+        def paths(key: str) -> list[str]:
+            values = event.payload.get(key)
+            return (
+                [value for value in values if isinstance(value, str)]
+                if isinstance(values, list)
+                else []
+            )
+
+        return RollbackResult(
+            restored=paths("restored"),
+            removed=paths("removed"),
+            conflicts=paths("conflicts"),
+        )
 
     async def get_proof_pack(
         self, run_id: str, turn_index: int | None = None
@@ -537,14 +694,14 @@ class AgentManager:
         except asyncio.CancelledError:
             current = self.storage.get_run(run_id)
             if not current.state.terminal:
-                await self._abandon_pending_approval(
-                    current,
-                    cause="process_shutdown" if self._shutting_down else "user_cancelled",
-                )
                 if self._shutting_down:
                     current.interrupted_from = current.state
                     await self._transition(current, RunState.INTERRUPTED)
                 else:
+                    self._mark_uncertain_started_approvals(run_id)
+                    await self._abandon_active_decision(
+                        current, cause="user_cancelled"
+                    )
                     if await self._transition(current, RunState.CANCELLED):
                         await self._close_turn(
                             current, "cancelled", "The user stopped this turn."
@@ -582,39 +739,92 @@ class AgentManager:
 
     async def _prepare_resume(self, run: RunRecord) -> None:
         previous = run.interrupted_from
-        await self._abandon_pending_approval(run, cause="process_restart")
+        active_decision = self.storage.get_active_decision(run.id)
+        if run.pending_approval is not None and (
+            active_decision is None or active_decision.kind is not DecisionKind.ACTION
+        ):
+            await self._abandon_pending_approval(run, cause="process_restart")
         run.interrupted_from = None
         run.error = None
-        repaired_calls = self._repair_incomplete_tool_protocol(run)
+        preserved_decision = active_decision is not None and (
+            (
+                active_decision.kind is DecisionKind.CLARIFICATION
+                and run.clarification is not None
+            )
+            or (active_decision.kind is DecisionKind.PLAN and run.plan is not None)
+            or (
+                active_decision.kind is DecisionKind.ACTION
+                and run.pending_approval is not None
+            )
+        )
+        if active_decision is not None and not preserved_decision:
+            await self._abandon_active_decision(run, cause="resume_subject_mismatch")
+            active_decision = None
+        uncertain_approvals = self._mark_uncertain_started_approvals(run.id)
+        repaired_calls = (
+            0 if preserved_decision else self._repair_incomplete_tool_protocol(run)
+        )
         if run.clarification is not None and not run.plan_approved:
-            strategy = "await_clarification"
+            strategy = (
+                "consume_accepted_clarification"
+                if active_decision
+                and active_decision.kind is DecisionKind.CLARIFICATION
+                and active_decision.status is DecisionStatus.ACCEPTED
+                else "await_clarification"
+            )
         elif run.plan is not None and not run.plan_approved:
             strategy = (
                 "persisted_fast_path"
                 if run.plan_gate
                 and run.plan_gate.decision in {"auto_approved", "agent_continues"}
-                else "await_plan_approval"
+                else (
+                    "consume_accepted_plan"
+                    if active_decision
+                    and active_decision.kind is DecisionKind.PLAN
+                    and active_decision.status is DecisionStatus.ACCEPTED
+                    else "await_plan_approval"
+                )
+            )
+        elif run.pending_approval is not None and active_decision is not None:
+            strategy = (
+                "consume_accepted_action"
+                if active_decision.status is DecisionStatus.ACCEPTED
+                else "await_action_approval"
             )
         elif run.plan_approved:
             strategy = "inspect_before_execution"
         else:
             strategy = "restart_planning"
         self.storage.save_run(run)
+        resumed_payload: dict[str, Any] = {
+            "interrupted_from": previous.value if previous else None,
+            "strategy": strategy,
+            "incomplete_tool_calls_repaired": repaired_calls,
+        }
+        if uncertain_approvals:
+            resumed_payload["uncertain_action_approvals"] = uncertain_approvals
         await self.broker.emit(
             run.id,
             EventType.RUN_RESUMED,
-            {
-                "interrupted_from": previous.value if previous else None,
-                "strategy": strategy,
-                "incomplete_tool_calls_repaired": repaired_calls,
-            },
+            resumed_payload,
         )
         if run.clarification is not None and not run.plan_approved:
-            await self._transition(run, RunState.AWAITING_CLARIFICATION)
-            answers = await self._await_clarification(run)
-            self._append_clarification_answers(run, answers)
-            run.clarification = None
-            await self._transition(run, RunState.PLANNING)
+            source_tool_call_id = self._pending_tool_call_id(run, "ask_questions")
+            existing = (
+                active_decision
+                if active_decision
+                and active_decision.kind is DecisionKind.CLARIFICATION
+                else None
+            )
+            request_id, answers = await self._await_clarification(
+                run, existing=existing
+            )
+            await self._apply_clarification_decision(
+                run,
+                request_id,
+                answers,
+                tool_call_id=source_tool_call_id,
+            )
         elif run.plan is not None and not run.plan_approved:
             if run.plan_gate and run.plan_gate.decision in {
                 "auto_approved",
@@ -624,12 +834,23 @@ class AgentManager:
                 run.messages = self._builder_messages(run, run.plan)
                 await self._transition(run, RunState.EXECUTING)
             else:
-                await self._transition(run, RunState.AWAITING_PLAN_APPROVAL)
-                approved = await self._await_plan_decision(run)
-                if approved:
-                    run.plan_approved = True
-                    run.messages = self._builder_messages(run, run.plan)
-                    await self._transition(run, RunState.EXECUTING)
+                source_tool_call_id = self._pending_tool_call_id(run, "submit_plan")
+                existing = (
+                    active_decision
+                    if active_decision and active_decision.kind is DecisionKind.PLAN
+                    else None
+                )
+                request_id, decision = await self._await_plan_decision(
+                    run, existing=existing
+                )
+                await self._apply_plan_decision(
+                    run,
+                    request_id,
+                    decision,
+                    tool_call_id=source_tool_call_id,
+                )
+        elif run.pending_approval is not None and active_decision is not None:
+            await self._resume_action_decision(run, active_decision)
         elif run.plan_approved:
             run.pending_approval = None
             run.messages.append(
@@ -778,11 +999,10 @@ class AgentManager:
                         continue
                     run.clarification = clarification
                     self.storage.save_run(run)
-                    await self._transition(run, RunState.AWAITING_CLARIFICATION)
-                    answers = await self._await_clarification(run)
-                    self._append_clarification_answers(run, answers, call.id)
-                    run.clarification = None
-                    await self._transition(run, RunState.PLANNING)
+                    request_id, answers = await self._await_clarification(run)
+                    await self._apply_clarification_decision(
+                        run, request_id, answers, tool_call_id=call.id
+                    )
                     continue
                 if call.name == "submit_plan":
                     try:
@@ -833,12 +1053,11 @@ class AgentManager:
                         run.messages = self._builder_messages(run, plan)
                         await self._transition(run, RunState.EXECUTING)
                         return
-                    await self._transition(run, RunState.AWAITING_PLAN_APPROVAL)
-                    approved = await self._await_plan_decision(run, tool_call_id=call.id)
+                    request_id, decision = await self._await_plan_decision(run)
+                    approved = await self._apply_plan_decision(
+                        run, request_id, decision, tool_call_id=call.id
+                    )
                     if approved:
-                        run.plan_approved = True
-                        run.messages = self._builder_messages(run, plan)
-                        await self._transition(run, RunState.EXECUTING)
                         return
             self.storage.save_run(run)
         raise RuntimeError("Planning exceeded the maximum number of model turns")
@@ -985,6 +1204,8 @@ class AgentManager:
             batch_succeeded = True
             for call in response.tool_calls:
                 run.step_count += 1
+                persisted_action_result: ToolResult | None = None
+                approval_request_id: str | None = None
                 await self.broker.emit(
                     run.id, EventType.TOOL_REQUESTED, call.model_dump(mode="json")
                 )
@@ -1015,29 +1236,25 @@ class AgentManager:
                     else:
                         approved = True
                         if permission.decision is PermissionDecision.ASK:
-                            approved = await self._await_action_approval(
-                                run, call, permission
-                            )
+                            (
+                                approved,
+                                approval_request_id,
+                                persisted_action_result,
+                            ) = await self._await_action_approval(run, call, permission)
                         if not approved:
-                            result = ToolResult(
-                                tool_call_id=call.id,
-                                name=call.name,
-                                ok=False,
-                                error="User rejected this action.",
-                                metadata={
-                                    "permission": permission.as_metadata(
-                                        outcome="user_rejected",
-                                        sandbox_bypass=False,
-                                    )
-                                },
-                            )
+                            if persisted_action_result is None:
+                                raise RuntimeError(
+                                    "Rejected action is missing its durable tool result"
+                                )
+                            result = persisted_action_result
                         else:
                             await self._transition(run, RunState.EXECUTING)
-                            await self.broker.emit(
-                                run.id,
-                                EventType.TOOL_STARTED,
-                                call.model_dump(mode="json"),
-                            )
+                            if approval_request_id is None:
+                                await self.broker.emit(
+                                    run.id,
+                                    EventType.TOOL_STARTED,
+                                    call.model_dump(mode="json"),
+                                )
                             result = await self.tools.execute(
                                 run.id, call, sandbox_bypass=sandbox_bypass
                             )
@@ -1052,9 +1269,16 @@ class AgentManager:
                 result = self._redact_result(result)
                 publish_progress = publish_progress and result.ok
                 batch_succeeded = batch_succeeded and result.ok
-                self._append_tool_result(run, result)
+                if persisted_action_result is None:
+                    self._append_tool_result(run, result)
                 await self._update_checks_and_diff(run, call, result)
-                await self._emit_tool_result(run, call, result)
+                if persisted_action_result is None:
+                    await self._emit_tool_result(
+                        run,
+                        call,
+                        result,
+                        approval_request_id=approval_request_id,
+                    )
                 if not result.ok:
                     fingerprint = json.dumps(
                         {"name": call.name, "arguments": call.arguments}, sort_keys=True
@@ -1320,6 +1544,7 @@ class AgentManager:
         )
 
     async def _fail(self, run: RunRecord, error: str) -> None:
+        await self._abandon_active_decision(run, cause="run_failed")
         run.error = error
         self.storage.save_run(run)
         await self.broker.emit(run.id, EventType.ERROR, {"message": error})
@@ -1455,35 +1680,130 @@ class AgentManager:
             )
         return await self._request_model(run, prepared, tools)
 
-    async def _await_clarification(self, run: RunRecord) -> list[ClarificationAnswer]:
+    async def _await_clarification(
+        self,
+        run: RunRecord,
+        *,
+        existing: DecisionRequest | None = None,
+    ) -> tuple[str, list[ClarificationAnswer]]:
+        assert run.clarification is not None
         future: asyncio.Future[list[ClarificationAnswer]] = (
             asyncio.get_running_loop().create_future()
         )
-        self._control(run.id).clarification_future = future
-        assert run.clarification is not None
-        await self.broker.emit(
-            run.id,
-            EventType.CLARIFICATION_REQUESTED,
-            run.clarification.model_dump(mode="json"),
+        request_id = existing.request_id if existing else uuid4().hex
+        control = self._control(run.id)
+        control.clarification_future = future
+        control.decision_request_id = request_id
+        control.decision_kind = DecisionKind.CLARIFICATION
+        requested_payload = run.clarification.model_dump(mode="json")
+        if existing is None:
+            previous = run.state
+            self._validate_transition(run, RunState.AWAITING_CLARIFICATION)
+            run.state = RunState.AWAITING_CLARIFICATION
+            _receipt, events = self.storage.open_decision(
+                run,
+                previous_state=previous,
+                request_id=request_id,
+                kind=DecisionKind.CLARIFICATION,
+                turn_index=self._active_turn(run).index,
+                subject=requested_payload,
+                requested_event_type=EventType.CLARIFICATION_REQUESTED,
+                requested_payload=requested_payload,
+            )
+            await self._publish_persisted(events)
+        elif existing.status is DecisionStatus.PENDING:
+            previous = run.state
+            self._validate_transition(run, RunState.AWAITING_CLARIFICATION)
+            run.state = RunState.AWAITING_CLARIFICATION
+            _receipt, events = self.storage.reopen_decision(
+                run,
+                request_id,
+                previous_state=previous,
+                requested_event_type=EventType.CLARIFICATION_REQUESTED,
+                requested_payload=requested_payload,
+            )
+            await self._publish_persisted(events)
+        self._signal_decision(self.storage.get_decision(run.id, request_id))
+        return request_id, await future
+
+    async def _apply_clarification_decision(
+        self,
+        run: RunRecord,
+        request_id: str,
+        answers: list[ClarificationAnswer],
+        *,
+        tool_call_id: str | None = None,
+    ) -> None:
+        previous = run.state
+        self._append_clarification_answers(run, answers, tool_call_id)
+        run.clarification = None
+        self._validate_transition(run, RunState.PLANNING)
+        run.state = RunState.PLANNING
+        _receipt, events = self.storage.consume_decision(
+            run,
+            request_id,
+            DecisionKind.CLARIFICATION,
+            previous_state=previous,
+            resolved_event_type=EventType.CLARIFICATION_ANSWERED,
+            resolved_payload={
+                "answers": [answer.model_dump(mode="json") for answer in answers]
+            },
         )
-        answers = await future
-        await self.broker.emit(
-            run.id,
-            EventType.CLARIFICATION_ANSWERED,
-            {"answers": [answer.model_dump(mode="json") for answer in answers]},
-        )
-        return answers
+        await self._publish_persisted(events)
 
     async def _await_plan_decision(
-        self, run: RunRecord, *, tool_call_id: str | None = None
-    ) -> bool:
+        self,
+        run: RunRecord,
+        *,
+        existing: DecisionRequest | None = None,
+    ) -> tuple[str, PlanDecision]:
         future: asyncio.Future[PlanDecision] = asyncio.get_running_loop().create_future()
-        self._control(run.id).plan_future = future
         assert run.plan is not None
-        await self.broker.emit(
-            run.id, EventType.PLAN_UPDATED, run.plan.model_dump(mode="json")
-        )
-        decision = await future
+        request_id = existing.request_id if existing else uuid4().hex
+        control = self._control(run.id)
+        control.plan_future = future
+        control.decision_request_id = request_id
+        control.decision_kind = DecisionKind.PLAN
+        requested_payload = run.plan.model_dump(mode="json")
+        if existing is None:
+            previous = run.state
+            self._validate_transition(run, RunState.AWAITING_PLAN_APPROVAL)
+            run.state = RunState.AWAITING_PLAN_APPROVAL
+            _receipt, events = self.storage.open_decision(
+                run,
+                previous_state=previous,
+                request_id=request_id,
+                kind=DecisionKind.PLAN,
+                turn_index=self._active_turn(run).index,
+                subject=requested_payload,
+                requested_event_type=EventType.PLAN_UPDATED,
+                requested_payload=requested_payload,
+            )
+            await self._publish_persisted(events)
+        elif existing.status is DecisionStatus.PENDING:
+            previous = run.state
+            self._validate_transition(run, RunState.AWAITING_PLAN_APPROVAL)
+            run.state = RunState.AWAITING_PLAN_APPROVAL
+            _receipt, events = self.storage.reopen_decision(
+                run,
+                request_id,
+                previous_state=previous,
+                requested_event_type=EventType.PLAN_UPDATED,
+                requested_payload=requested_payload,
+            )
+            await self._publish_persisted(events)
+        self._signal_decision(self.storage.get_decision(run.id, request_id))
+        return request_id, await future
+
+    async def _apply_plan_decision(
+        self,
+        run: RunRecord,
+        request_id: str,
+        decision: PlanDecision,
+        *,
+        tool_call_id: str | None = None,
+    ) -> bool:
+        previous = run.state
         if decision.decision == "approve":
             if tool_call_id:
                 self._append_tool_result(
@@ -1495,6 +1815,20 @@ class AgentManager:
                         output="The user approved this plan.",
                     ),
                 )
+            assert run.plan is not None
+            run.plan_approved = True
+            run.messages = self._builder_messages(run, run.plan)
+            self._validate_transition(run, RunState.EXECUTING)
+            run.state = RunState.EXECUTING
+            _receipt, events = self.storage.consume_decision(
+                run,
+                request_id,
+                DecisionKind.PLAN,
+                previous_state=previous,
+                resolved_event_type=EventType.PLAN_RESOLVED,
+                resolved_payload=decision.model_dump(mode="json"),
+            )
+            await self._publish_persisted(events)
             return True
         if tool_call_id:
             self._append_tool_result(
@@ -1508,12 +1842,22 @@ class AgentManager:
             )
         run.plan = None
         run.plan_gate = None
-        await self._transition(run, RunState.PLANNING)
+        self._validate_transition(run, RunState.PLANNING)
+        run.state = RunState.PLANNING
+        _receipt, events = self.storage.consume_decision(
+            run,
+            request_id,
+            DecisionKind.PLAN,
+            previous_state=previous,
+            resolved_event_type=EventType.PLAN_RESOLVED,
+            resolved_payload=decision.model_dump(mode="json"),
+        )
+        await self._publish_persisted(events)
         return False
 
     async def _await_action_approval(
         self, run: RunRecord, call: ToolCall, permission: PermissionResolution
-    ) -> bool:
+    ) -> tuple[bool, str, ToolResult | None]:
         approval = ApprovalRequest(
             id=uuid4().hex,
             tool_call=call,
@@ -1525,26 +1869,85 @@ class AgentManager:
             sandbox_bypass_on_approve=permission.sandbox_bypass_on_allow,
         )
         run.pending_approval = approval
-        self.storage.save_run(run)
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        self._control(run.id).approval_future = future
-        await self._transition(run, RunState.AWAITING_ACTION_APPROVAL)
-        await self.broker.emit(
-            run.id,
-            EventType.APPROVAL_REQUESTED,
-            {
+        control = self._control(run.id)
+        control.approval_future = future
+        control.decision_request_id = approval.id
+        control.decision_kind = DecisionKind.ACTION
+        previous = run.state
+        self._validate_transition(run, RunState.AWAITING_ACTION_APPROVAL)
+        run.state = RunState.AWAITING_ACTION_APPROVAL
+        _receipt, events = self.storage.open_decision(
+            run,
+            previous_state=previous,
+            request_id=approval.id,
+            kind=DecisionKind.ACTION,
+            turn_index=self._active_turn(run).index,
+            subject=approval.model_dump(mode="json"),
+            requested_event_type=EventType.APPROVAL_REQUESTED,
+            requested_payload={
                 **approval.model_dump(mode="json"),
                 "mode": permission.mode.value,
                 "policy_decision": permission.policy_decision.value,
             },
         )
+        await self._publish_persisted(events)
+        self._signal_decision(self.storage.get_decision(run.id, approval.id))
         approved = await future
+        persisted_result = await self._consume_action_decision(
+            run, approval, permission, approved
+        )
+        return approved, approval.id, persisted_result
+
+    async def _consume_action_decision(
+        self,
+        run: RunRecord,
+        approval: ApprovalRequest,
+        permission: PermissionResolution,
+        approved: bool,
+    ) -> ToolResult | None:
+        previous = run.state
         run.pending_approval = None
-        self.storage.save_run(run)
-        await self.broker.emit(
-            run.id,
-            EventType.APPROVAL_RESOLVED,
-            {
+        self._validate_transition(run, RunState.EXECUTING)
+        run.state = RunState.EXECUTING
+        completed_result: ToolResult | None = None
+        if not approved:
+            completed_result = ToolResult(
+                tool_call_id=approval.tool_call.id,
+                name=approval.tool_call.name,
+                ok=False,
+                error="User rejected this action.",
+                metadata={
+                    "permission": permission.as_metadata(
+                        outcome="user_rejected", sandbox_bypass=False
+                    )
+                },
+            )
+        elif permission.decision is PermissionDecision.DENY:
+            completed_result = ToolResult(
+                tool_call_id=approval.tool_call.id,
+                name=approval.tool_call.name,
+                ok=False,
+                error=(
+                    "The accepted action was not resumed because the current invariant "
+                    f"permission policy denies it: {permission.reason}"
+                ),
+                metadata={
+                    "permission": permission.as_metadata(
+                        outcome="denied_after_resume", sandbox_bypass=False
+                    )
+                },
+            )
+        if completed_result is not None:
+            completed_result = self._redact_result(completed_result)
+            self._append_tool_result(run, completed_result)
+        _receipt, events = self.storage.consume_decision(
+            run,
+            approval.id,
+            DecisionKind.ACTION,
+            previous_state=previous,
+            resolved_event_type=EventType.APPROVAL_RESOLVED,
+            resolved_payload={
                 "approval_id": approval.id,
                 "approved": approved,
                 "outcome": "approved" if approved else "rejected",
@@ -1553,9 +1956,85 @@ class AgentManager:
                     permission.sandbox_bypass_on_allow if approved else False
                 ),
             },
+            action_call_payload=(
+                approval.tool_call.model_dump(mode="json")
+                if approved and permission.decision is not PermissionDecision.DENY
+                else None
+            ),
+            completed_tool_payload=(
+                {
+                    "call": approval.tool_call.model_dump(mode="json"),
+                    "result": completed_result.model_dump(mode="json"),
+                    "approval_request_id": approval.id,
+                }
+                if completed_result is not None
+                else None
+            ),
         )
-        await self._transition(run, RunState.EXECUTING)
-        return approved
+        await self._publish_persisted(events)
+        return completed_result
+
+    async def _resume_action_decision(
+        self, run: RunRecord, existing: DecisionRequest
+    ) -> None:
+        approval = run.pending_approval
+        if approval is None or existing.request_id != approval.id:
+            raise RuntimeError("Persisted action decision does not match its approval")
+        self._require_decision_subject(existing, approval.model_dump(mode="json"))
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        control = self._control(run.id)
+        control.approval_future = future
+        control.decision_request_id = approval.id
+        control.decision_kind = DecisionKind.ACTION
+        requested_payload = {
+            **approval.model_dump(mode="json"),
+            "mode": approval.approval_mode.value,
+            "policy_decision": approval.policy_decision,
+        }
+        if existing.status is DecisionStatus.PENDING:
+            previous = run.state
+            self._validate_transition(run, RunState.AWAITING_ACTION_APPROVAL)
+            run.state = RunState.AWAITING_ACTION_APPROVAL
+            _receipt, events = self.storage.reopen_decision(
+                run,
+                approval.id,
+                previous_state=previous,
+                requested_event_type=EventType.APPROVAL_REQUESTED,
+                requested_payload=requested_payload,
+            )
+            await self._publish_persisted(events)
+        self._signal_decision(self.storage.get_decision(run.id, approval.id))
+        approved = await future
+        permission = self.tools.resolve_permission(
+            approval.tool_call, run.plan, approval.approval_mode
+        )
+        persisted_result = await self._consume_action_decision(
+            run, approval, permission, approved
+        )
+        if persisted_result is None:
+            sandbox_bypass = approval.sandbox_bypass_on_approve
+            result = await self.tools.execute(
+                run.id,
+                approval.tool_call,
+                sandbox_bypass=sandbox_bypass,
+            )
+            result.metadata["permission"] = permission.as_metadata(
+                outcome="user_approved_after_resume",
+                sandbox_bypass=sandbox_bypass,
+            )
+            result = self._redact_result(result)
+            self._append_tool_result(run, result)
+        else:
+            result = persisted_result
+        await self._update_checks_and_diff(run, approval.tool_call, result)
+        if persisted_result is None:
+            await self._emit_tool_result(
+                run,
+                approval.tool_call,
+                result,
+                approval_request_id=approval.id,
+            )
+        self.storage.save_run(run)
 
     async def _abandon_pending_approval(self, run: RunRecord, *, cause: str) -> None:
         approval = run.pending_approval
@@ -1576,10 +2055,45 @@ class AgentManager:
             },
         )
 
+    async def _abandon_active_decision(self, run: RunRecord, *, cause: str) -> None:
+        receipt = self.storage.get_active_decision(run.id)
+        if receipt is None:
+            await self._abandon_pending_approval(run, cause=cause)
+            if run.clarification is not None:
+                run.clarification = None
+                self.storage.save_run(run)
+            return
+        if receipt.kind is DecisionKind.ACTION and run.pending_approval is not None:
+            approval = run.pending_approval
+            run.pending_approval = None
+            event_type = EventType.APPROVAL_RESOLVED
+            event_payload = {
+                "approval_id": approval.id,
+                "approved": False,
+                "outcome": "abandoned",
+                "cause": cause,
+                "mode": approval.approval_mode.value,
+                "sandbox_bypass": False,
+            }
+        else:
+            if receipt.kind is DecisionKind.CLARIFICATION:
+                run.clarification = None
+            event_type = EventType.DECISION_ABANDONED
+            event_payload = {"cause": cause}
+        try:
+            _receipt, event = self.storage.abandon_decision(
+                run,
+                receipt.request_id,
+                event_type=event_type,
+                event_payload=event_payload,
+            )
+        except DecisionConflictError:
+            return
+        await self._publish_persisted([event])
+
     async def _transition(self, run: RunRecord, new_state: RunState) -> bool:
         same_state = run.state is new_state
-        if not same_state and new_state not in _ALLOWED_TRANSITIONS[run.state]:
-            raise RuntimeError(f"Invalid run transition: {run.state.value} -> {new_state.value}")
+        self._validate_transition(run, new_state)
         if new_state.terminal and not await self._prepare_terminal_cleanup(run, new_state):
             return False
         if same_state:
@@ -1670,7 +2184,6 @@ class AgentManager:
             )
         else:
             run.messages.append({"role": "user", "content": f"Clarification answers: {content}"})
-        self.storage.save_run(run)
 
     def _append_tool_result(self, run: RunRecord, result: ToolResult) -> None:
         model_result = result.model_copy(deep=True)
@@ -1785,12 +2298,23 @@ class AgentManager:
         await self._emit_tool_result(run, call, result)
 
     async def _emit_tool_result(
-        self, run: RunRecord, call: ToolCall, result: ToolResult
+        self,
+        run: RunRecord,
+        call: ToolCall,
+        result: ToolResult,
+        *,
+        approval_request_id: str | None = None,
     ) -> None:
+        payload: dict[str, Any] = {
+            "call": call.model_dump(mode="json"),
+            "result": result.model_dump(mode="json"),
+        }
+        if approval_request_id is not None:
+            payload["approval_request_id"] = approval_request_id
         await self.broker.emit(
             run.id,
             EventType.TOOL_COMPLETED,
-            {"call": call.model_dump(mode="json"), "result": result.model_dump(mode="json")},
+            payload,
         )
 
     async def _emit_message(self, run: RunRecord, content: str, *, phase: str) -> None:
@@ -1890,6 +2414,122 @@ class AgentManager:
             raise InvalidRunAction(f"Run is not active: {run_id}") from exc
 
     @staticmethod
+    def _validate_transition(run: RunRecord, new_state: RunState) -> None:
+        if new_state is not run.state and new_state not in _ALLOWED_TRANSITIONS[run.state]:
+            raise RuntimeError(
+                f"Invalid run transition: {run.state.value} -> {new_state.value}"
+            )
+
+    async def _publish_persisted(self, events: list[RunEvent]) -> None:
+        for event in events:
+            await self.broker.publish(event)
+
+    def _decision_or_reject(
+        self, run_id: str, request_id: str
+    ) -> DecisionRequest:
+        try:
+            return self.storage.get_decision(run_id, request_id)
+        except KeyError as exc:
+            raise InvalidRunAction("Decision request is unknown or expired") from exc
+
+    def _active_decision_id(self, run_id: str, kind: DecisionKind) -> str:
+        receipt = self.storage.get_active_decision(run_id)
+        if receipt is None or receipt.kind is not kind:
+            label = (
+                "clarification"
+                if kind is DecisionKind.CLARIFICATION
+                else "plan approval"
+            )
+            raise InvalidRunAction(f"The run is not waiting for {label}")
+        return receipt.request_id
+
+    def _accept_decision_or_reject(
+        self,
+        run_id: str,
+        request_id: str,
+        kind: DecisionKind,
+        payload: dict[str, Any],
+    ) -> DecisionRequest:
+        try:
+            return self.storage.accept_decision(run_id, request_id, kind, payload)
+        except DecisionConflictError as exc:
+            raise InvalidRunAction(str(exc)) from exc
+
+    @staticmethod
+    def _require_decision_subject(
+        receipt: DecisionRequest, subject: dict[str, Any]
+    ) -> None:
+        if receipt.subject_sha256 != decision_payload_sha256(subject):
+            raise InvalidRunAction(
+                "Decision request no longer matches the clarification, plan, or action shown"
+            )
+
+    def _signal_decision(self, receipt: DecisionRequest) -> None:
+        if receipt.status is not DecisionStatus.ACCEPTED or receipt.payload is None:
+            return
+        control = self._controls.get(receipt.run_id)
+        if (
+            control is None
+            or control.decision_request_id != receipt.request_id
+            or control.decision_kind is not receipt.kind
+        ):
+            return
+        if receipt.kind is DecisionKind.CLARIFICATION:
+            clarification_future = control.clarification_future
+            raw_answers = receipt.payload.get("answers")
+            if (
+                clarification_future is not None
+                and not clarification_future.done()
+                and isinstance(raw_answers, list)
+            ):
+                clarification_future.set_result(
+                    [ClarificationAnswer.model_validate(answer) for answer in raw_answers]
+                )
+        elif receipt.kind is DecisionKind.PLAN:
+            plan_future = control.plan_future
+            if plan_future is not None and not plan_future.done():
+                plan_future.set_result(PlanDecision.model_validate(receipt.payload))
+        else:
+            approval_future = control.approval_future
+            approved = receipt.payload.get("approved")
+            if (
+                approval_future is not None
+                and not approval_future.done()
+                and isinstance(approved, bool)
+            ):
+                approval_future.set_result(approved)
+
+    def _mark_uncertain_started_approvals(self, run_id: str) -> int:
+        events = self.storage.get_events(run_id)
+        uncertain_request_ids: set[str] = set()
+        for started in events:
+            if (
+                started.type is not EventType.TOOL_STARTED
+                or not started.payload.get("approval_request_id")
+            ):
+                continue
+            request_id = str(started.payload["approval_request_id"])
+            call_id = str(started.payload.get("id", ""))
+            completed = any(
+                event.type is EventType.TOOL_COMPLETED
+                and event.seq > started.seq
+                and (
+                    event.payload.get("approval_request_id") == request_id
+                    or (
+                        event.payload.get("approval_request_id") is None
+                        and isinstance(event.payload.get("call"), dict)
+                        and str(event.payload["call"].get("id", "")) == call_id
+                    )
+                )
+                for event in events
+            )
+            if not completed:
+                uncertain_request_ids.add(request_id)
+        for request_id in uncertain_request_ids:
+            self.storage.mark_action_uncertain(run_id, request_id)
+        return len(uncertain_request_ids)
+
+    @staticmethod
     def _active_turn(run: RunRecord) -> ConversationTurn:
         if run.turns:
             return run.turns[-1]
@@ -1906,15 +2546,48 @@ class AgentManager:
     def _current_request(self, run: RunRecord) -> str:
         return self._active_turn(run).request
 
-    @staticmethod
-    def _previous_turns_context(run: RunRecord) -> str:
-        completed = [turn for turn in run.turns[:-1] if turn.outcome != "in_progress"]
-        if not completed:
+    def _previous_turns_context(self, run: RunRecord) -> str:
+        own_entries: list[tuple[str, ConversationTurn]] = [
+            ("this run", turn)
+            for turn in run.turns[:-1]
+            if turn.outcome != "in_progress"
+        ]
+        ancestors: list[RunRecord] = []
+        parent_id = self.storage.get_parent_run_id(run.id)
+        for _ in range(3):
+            if parent_id is None:
+                break
+            parent = self.storage.get_run(parent_id)
+            ancestors.append(parent)
+            parent_id = self.storage.get_parent_run_id(parent.id)
+
+        entries: list[tuple[str, ConversationTurn]] = []
+        for ancestor in reversed(ancestors):
+            entries.extend(
+                (f"rolled-back predecessor {ancestor.id[:8]}", turn)
+                for turn in ancestor.turns
+                if turn.outcome != "in_progress"
+            )
+        entries.extend(own_entries)
+        if not entries:
             return ""
-        lines = ["Earlier turns in this same task:"]
-        for turn in completed[-6:]:
+
+        lines: list[str] = []
+        if ancestors:
+            lines.extend(
+                [
+                    "Earlier task history (including rolled-back predecessor runs):",
+                    "The current workspace is authoritative. Predecessor summaries preserve "
+                    "intent and historical evidence only; do not assume their file changes "
+                    "still exist.",
+                ]
+            )
+        else:
+            lines.append("Earlier turns in this same task:")
+        for source, turn in entries[-6:]:
+            source_suffix = "" if source == "this run" else f" [{source}]"
             lines.append(
-                f"- Turn {turn.index}: {turn.request}\n"
+                f"- Turn {turn.index}{source_suffix}: {turn.request}\n"
                 f"  Outcome: {turn.outcome}. Summary: {turn.summary or '(no summary)'}"
             )
         return "\n".join(lines)
@@ -1972,13 +2645,44 @@ class AgentManager:
         return scrubbed
 
     def _clarification_round(self, run_id: str) -> int:
-        count = 0
+        request_ids: set[str] = set()
         for event in reversed(self.storage.get_events(run_id)):
             if event.type is EventType.TURN_STARTED:
                 break
             if event.type is EventType.CLARIFICATION_REQUESTED:
-                count += 1
-        return count
+                request_id = event.payload.get("request_id")
+                request_ids.add(
+                    str(request_id) if request_id else f"legacy-event:{event.seq}"
+                )
+        return len(request_ids)
+
+    @staticmethod
+    def _pending_tool_call_id(run: RunRecord, expected_name: str) -> str | None:
+        for index in range(len(run.messages) - 1, -1, -1):
+            message = run.messages[index]
+            if message.get("role") != "assistant":
+                continue
+            raw_calls = message.get("tool_calls")
+            if not isinstance(raw_calls, list):
+                continue
+            completed_ids = {
+                str(later.get("tool_call_id"))
+                for later in run.messages[index + 1 :]
+                if later.get("role") == "tool" and later.get("tool_call_id")
+            }
+            for raw_call in reversed(raw_calls):
+                if not isinstance(raw_call, dict):
+                    continue
+                call_id = str(raw_call.get("id", ""))
+                function = raw_call.get("function")
+                if (
+                    call_id
+                    and call_id not in completed_ids
+                    and isinstance(function, dict)
+                    and function.get("name") == expected_name
+                ):
+                    return call_id
+        return None
 
     @staticmethod
     def _missing_command_checks(plan: TaskPlan | None) -> list[str]:

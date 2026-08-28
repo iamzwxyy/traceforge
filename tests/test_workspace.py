@@ -53,6 +53,44 @@ def test_rollback_restores_and_removes_files(workspace: Workspace, storage: Stor
     assert result.restored == ["existing.txt"]
     assert result.removed == ["nested/new.txt"]
 
+    exact_retry = workspace.rollback("run-1")
+    assert exact_retry == result
+
+
+def test_rollback_retry_recognizes_files_restored_before_a_mid_batch_failure(
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_run(storage, workspace)
+    first = workspace.root / "a.txt"
+    second = workspace.root / "b.txt"
+    for target in (first, second):
+        target.write_text(f"before {target.stem}\n")
+        workspace.snapshot("run-1", target)
+        target.write_text(f"agent {target.stem}\n")
+        workspace.record_agent_version("run-1", target)
+    original_write_bytes = Path.write_bytes
+    failed = False
+
+    def fail_second_once(path: Path, content: bytes) -> int:
+        nonlocal failed
+        if path == second and not failed:
+            failed = True
+            raise OSError("simulated mid-batch failure")
+        return original_write_bytes(path, content)
+
+    monkeypatch.setattr(Path, "write_bytes", fail_second_once)
+    with pytest.raises(OSError, match="mid-batch"):
+        workspace.rollback("run-1")
+
+    retried = workspace.rollback("run-1")
+
+    assert first.read_text() == "before a\n"
+    assert second.read_text() == "before b\n"
+    assert retried.restored == ["a.txt", "b.txt"]
+    assert retried.conflicts == []
+
 
 def test_rollback_skips_user_modified_file(workspace: Workspace, storage: Storage) -> None:
     _create_run(storage, workspace)

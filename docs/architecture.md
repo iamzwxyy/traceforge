@@ -76,7 +76,10 @@ stateDiagram-v2
     executing --> cancelled
     created --> interrupted: process exit
     planning --> interrupted: process exit
+    awaiting_clarification --> interrupted: process exit
+    awaiting_plan_approval --> interrupted: process exit
     executing --> interrupted: process exit
+    awaiting_action_approval --> interrupted: process exit
     interrupted --> planning: resume before plan
     interrupted --> awaiting_plan_approval: resume at plan
     interrupted --> executing: resume persisted Agent-mode plan
@@ -89,13 +92,14 @@ stateDiagram-v2
 
 Transitions are allowlisted. Invalid public actions return a conflict rather than silently
 changing state. `InteractionMode` does not add states for action permissions: Manual/Automatic/
-workspace Full access all reuse the same optional `awaiting_action_approval` gate. A process shutdown records the previous phase and never automatically replays an
-incomplete tool call. On resume, any unmatched assistant tool call receives a synthetic failure
-result before the model is called again, preserving the provider protocol. A persisted pending
-approval is first resolved as `abandoned` and cleared, so an old approval ID cannot authorize a
-new or reconstructed action. Resume also validates the interrupted turn's frozen reasoning effort
-against the newly configured route. An incompatible route leaves the run interrupted rather than
-silently downgrading the request.
+workspace Full access all reuse the same optional `awaiting_action_approval` gate. A process shutdown
+records the previous phase and never automatically replays an incomplete tool call. On explicit
+resume, a durable pending decision reopens and an accepted decision is consumed from its stored
+receipt. An unmatched assistant tool call receives a synthetic failure before the model is called
+again, preserving the provider protocol. Resume also validates the interrupted turn's frozen
+reasoning effort against the newly configured route. An incompatible route leaves the run
+interrupted rather than silently downgrading the request. `rolled_back` has no same-run transition:
+continuation creates a separate linked run with a fresh snapshot namespace.
 
 ## Answer, clarify, plan, build, verify
 
@@ -132,6 +136,29 @@ contract. A restart preserves the recorded decision. Any later file mutation out
 `impacted_files` remains a base-policy `ask`; Manual and Automatic pause, while workspace Full
 access handles that soft decision automatically without disabling the Workspace guard. Skipping a
 plan-review click never changes these action semantics.
+
+### Durable human decisions
+
+Clarification, plan review, and action approval use a SQLite `decision_requests` inbox. Opening a
+gate atomically persists the waiting `RunRecord`, a unique request ID plus SHA-256 of the exact
+question/plan/action, and the requested event. REST accepts only a response bound to that ID. It
+canonicalizes and stores the payload before returning `202 Accepted`; an exact retry is idempotent,
+while a changed payload, abandoned request, wrong kind, or old ID is rejected. The worker may then
+consume the accepted receipt and the next state/events in one transaction, so a crash cannot leave
+an HTTP-accepted answer only in an in-memory future. Clarification question IDs must be unique and
+each submitted answer must contain exactly one option or one custom value. After restart, the
+application reconstructs the latest unanswered assistant tool batch and pairs the stored
+clarification or plan receipt with that exact source call, even if a provider reused a call ID in
+an earlier batch.
+
+For an approved external action, consuming the decision, clearing the pending card, entering
+`executing`, and appending the approval resolution plus `tool.started` marker are one transaction.
+The external tool starts only after that commit. If the process dies before consumption, explicit
+resume can consume it once. If it dies after the marker but before a matching `tool.completed`, the
+receipt becomes `uncertain` and the call is never replayed; the builder receives an inspect-first
+recovery context. A rejected action's deterministic tool result and completion evidence are also
+committed with decision consumption, so a crash cannot replace the user's rejection with generic
+protocol repair. User cancellation abandons any still-pending or accepted receipt.
 
 ### Building
 
@@ -284,15 +311,27 @@ turn requests and summaries while keeping the same run id, project, workspace sn
 ledger, and rollback boundary. Model protocol messages reset per turn so stale tool-call state is
 not mixed into a new request.
 
+Rollback intentionally ends that snapshot lineage. A follow-up from `rolled_back` creates one
+successor run UUID recorded in `run_lineage`; exact retries return the same successor and a
+different branch request conflicts. The successor keeps the project/workspace association but
+snapshots files under its own run ID. Its planner receives bounded predecessor turn summaries with
+an explicit warning that they are historical intent/evidence and that current disk contents are
+authoritative. This prevents a later successor rollback from restoring the original pre-parent
+bytes over edits the user made after the first rollback.
+
 ## Persistence and recovery
 
-SQLite uses WAL mode and six tables:
+SQLite uses WAL mode. Its core tables include:
 
 - `runs`: public state, optional project association, current interaction, action-permission, and
   reasoning-effort mirrors, conversation turns,
   internal messages, plan and scope assessment, approval state, and interrupted origin;
 - `events`: per-run monotonically increasing sequence and JSON payload;
-- `snapshots`: original bytes, mode, original hash, and last agent-written hash per path.
+- `snapshots`: original bytes, mode, original hash, and last agent-written hash per path;
+- `decision_requests`: request subject/payload hashes, pending/accepted/consumed/abandoned/uncertain
+  status, and the approved-action execution-start boundary;
+- `run_lineage`: the one-to-one rolled-back parent → successor relationship;
+- `proof_packs` and conservative backfill markers: immutable successful-turn evidence;
 - `projects`: reusable display names and canonical local root directories;
 - `provider_config`: one model/base-URL/credential-file reference plus the last successful native
   tool-call verification time, never the secret value. In the atomic test-and-save path, a draft
@@ -316,10 +355,10 @@ where every unfinished run is marked interrupted before any workspace manager is
 SQLite transaction
 appends a `state.changed` event with the previous phase and `cause=process_restart`, so the recovery
 audit cannot disagree with the run row. Resume appends a `run.resumed` event with its
-application-selected strategy and the number of incomplete tool calls closed without replay. A
-pending action approval first emits an `approval.resolved` event with `outcome=abandoned`; its
-persisted ID is cleared before resume can issue another action. A
-verifier rejection similarly appends `repair.started` before builder work continues. See
+application-selected strategy, preserved decision behavior, uncertain approvals, and the number of
+incomplete tool calls closed without replay. Pending and accepted decisions remain request-bound
+across restart; only explicit user cancellation abandons them. A verifier rejection similarly
+appends `repair.started` before builder work continues. See
 [Fault-injection evidence](fault-injection.md) for the deterministic failure matrix.
 
 ## Rollback algorithm
@@ -327,18 +366,34 @@ verifier rejection similarly appends `repair.started` before builder work contin
 For every touched path, TraceForge records the original state only once and updates the last-agent
 hash after each mutation. Rollback compares the current file hash with that last-agent hash:
 
+- already equal to the recorded original state: record the same restoration/removal result again;
 - equal and originally present: restore bytes and POSIX mode;
 - equal and originally absent: remove the generated file and empty generated directories;
 - different: report a conflict and preserve the user's later edit.
 
 This is deliberately safer than `git reset`: it works in non-Git folders and never overwrites a
-post-agent user change.
+post-agent user change. Recognizing an already-restored target makes a full retry—or a retry after a
+mid-batch filesystem failure—result-idempotent. The filesystem is not part of the SQLite
+transaction: rollback first abandons any active human decision, then processes files, then commits
+the `rolled_back` state and complete `rollback.completed` result atomically. Resume and rollback
+share the per-run lifecycle lock, so a newly registered worker and a rollback cannot cross.
+
+After rollback, the parent snapshot set is never reused. Its single successor takes a fresh first
+snapshot from the then-current file bytes, and the parent/child IDs are exposed in run views so the
+UI can navigate the immutable audit record without offering a second branch.
 
 ## HTTP and event surface
 
 The same-origin service defaults to `127.0.0.1`. REST manages direct-task directories, projects,
 provider references, exact reasoning-capability metadata, atomic draft connection probes, and run controls; it returns current state/diff/events,
-adds follow-up turns, downloads Markdown plans, and resolves plan or action decisions. The
+adds follow-up turns, downloads Markdown plans, and resolves request-bound clarification, plan, or
+action decisions. `202` means the canonical response is durably queued, not merely placed in an
+in-memory future. A rolled-back follow-up returns a new linked run; exact retries return the same
+successor. The browser treats a successful mutation response as the commit boundary: it stores the
+returned run/result immediately and performs synchronization refresh separately, so a failed GET
+cannot unlock a card or resend a successful POST. Decision and rollback errors stay beside their
+own controls, rollback success moves focus to its result, and successor conflicts refresh the
+parent/list to reveal the already-created child. The
 provider probe persists its draft only after native tool calling succeeds. Ordinary configuration
 saves clear verification, and runtime methods serialize provider changes with starting, following
 up, or resuming work; all three task entry points reject an unverified saved connection.

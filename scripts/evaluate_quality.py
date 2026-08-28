@@ -90,8 +90,9 @@ SCENARIOS = (
         id="recovery-rollback",
         title="Recovery without duplicated side effects",
         claim=(
-            "Transient model outages pause with retry evidence, interrupted tools are never "
-            "replayed, and rollback preserves later user edits."
+            "Transient model outages pause with retry evidence, request-bound decisions resume "
+            "without crossing prompts, started actions are never replayed, and rollback keeps a "
+            "fresh successor boundary while preserving later user edits."
         ),
         tests=(
             (
@@ -99,6 +100,18 @@ SCENARIOS = (
                 "test_transient_model_outage_pauses_and_resumes_without_losing_run"
             ),
             "tests/test_agent.py::test_resume_repairs_only_the_missing_result_in_a_partial_tool_batch",
+            (
+                "tests/test_agent.py::"
+                "test_accepted_clarification_crash_window_pairs_answer_exactly_once"
+            ),
+            (
+                "tests/test_agent.py::"
+                "test_started_approved_action_is_uncertain_and_never_replayed_after_crash"
+            ),
+            (
+                "tests/test_agent.py::"
+                "test_rollback_successor_uses_fresh_snapshot_boundary_and_lineage"
+            ),
             (
                 "tests/test_workspace.py::"
                 "test_rollback_restores_safe_files_while_preserving_one_conflict"

@@ -96,9 +96,25 @@ so the labels can be audited rather than trusted.
 
 ### What happens on a crash in the middle of a command?
 
-Startup changes active runs to `interrupted` and records the previous phase. Resume never blindly
-replays a command. If the stored assistant message lacks a matching tool result, TraceForge inserts
-a synthetic interruption result and asks the builder to inspect current state.
+Startup changes active runs to `interrupted` and records the previous phase. Human replies are
+request-bound SQLite receipts, so a pending card can reopen and an accepted reply can be consumed
+after explicit resume without matching a later prompt. For an approved action, receipt consumption,
+the execution state, and `tool.started` are one transaction committed before external execution.
+If that marker has no matching completion after restart, TraceForge marks the action uncertain,
+never replays it, inserts any required protocol closure, and asks the builder to inspect current
+state. Clarification and plan replies are paired with the exact latest unanswered source call,
+even if a provider reused an older call ID; rejecting an action atomically preserves the exact
+failed tool result instead of relying on later generic repair.
+
+### What happens if rollback crashes or races Resume?
+
+Both operations use the same per-run lifecycle lock, so either Resume registers its worker first
+and rollback conflicts, or rollback wins and Resume sees the terminal state. Rollback abandons any
+live human decision before touching files. Each file recognizes both its agent-written state and
+its already-restored target state, which makes a retry converge after a mid-batch failure while
+still preserving a later user edit as a conflict. Only after the files converge does one SQLite
+transaction publish `rolled_back` plus the complete result; it does not pretend the filesystem and
+database are one transaction.
 
 ### How does reasoning effort work, and do you expose chain of thought?
 

@@ -94,6 +94,8 @@ class EventType(StrEnum):
     CLARIFICATION_ANSWERED = "clarification.answered"
     PLAN_UPDATED = "plan.updated"
     PLAN_GATED = "plan.gated"
+    PLAN_RESOLVED = "plan.resolved"
+    DECISION_ABANDONED = "decision.abandoned"
     TOOL_REQUESTED = "tool.requested"
     TOOL_STARTED = "tool.started"
     TOOL_OUTPUT = "tool.output"
@@ -111,6 +113,20 @@ class EventType(StrEnum):
     TURN_STARTED = "turn.started"
     TURN_COMPLETED = "turn.completed"
     ROLLBACK_COMPLETED = "rollback.completed"
+
+
+class DecisionKind(StrEnum):
+    CLARIFICATION = "clarification"
+    PLAN = "plan"
+    ACTION = "action"
+
+
+class DecisionStatus(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    CONSUMED = "consumed"
+    ABANDONED = "abandoned"
+    UNCERTAIN = "uncertain"
 
 
 class QuestionOption(BaseModel):
@@ -145,6 +161,13 @@ class ClarificationRequest(BaseModel):
     questions: list[ClarificationQuestion] = Field(min_length=1, max_length=3)
     round: int = Field(default=1, ge=1, le=2)
 
+    @model_validator(mode="after")
+    def validate_question_ids(self) -> ClarificationRequest:
+        ids = [question.id for question in self.questions]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Clarification question ids must be unique")
+        return self
+
 
 class DirectResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -165,8 +188,9 @@ class ClarificationAnswer(BaseModel):
 
     @model_validator(mode="after")
     def require_value(self) -> ClarificationAnswer:
-        if not self.option_id and not self.custom_text:
-            raise ValueError("An option or custom answer is required")
+        supplied = int(bool(self.option_id)) + int(bool(self.custom_text))
+        if supplied != 1:
+            raise ValueError("Exactly one option or custom answer is required")
         return self
 
 
@@ -291,6 +315,23 @@ class RunEvent(BaseModel):
     type: EventType
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class DecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    request_id: str
+    kind: DecisionKind
+    turn_index: int = Field(ge=1)
+    subject_sha256: str = Field(min_length=64, max_length=64)
+    status: DecisionStatus
+    payload: dict[str, Any] | None = None
+    payload_sha256: str | None = Field(default=None, min_length=64, max_length=64)
+    created_at: datetime = Field(default_factory=utc_now)
+    accepted_at: datetime | None = None
+    consumed_at: datetime | None = None
+    execution_started_at: datetime | None = None
 
 
 class ProjectRecord(BaseModel):

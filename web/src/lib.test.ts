@@ -41,13 +41,31 @@ describe("mission control helpers", () => {
       state: "succeeded",
       updated_at: "2026-08-27T12:00:00.200Z",
       proof_turn_indexes: [1],
-    } as Run;
+    } as unknown as Run;
     const withoutProof = {
       ...withProof,
       proof_turn_indexes: [],
     };
 
     expect(preferNewerRun(withProof, withoutProof).proof_turn_indexes).toEqual([1]);
+  });
+
+  it("keeps immutable rollback lineage when equal-timestamp metadata arrives late", () => {
+    const linked = {
+      id: "parent",
+      state: "rolled_back",
+      updated_at: "2026-08-27T12:00:00.200Z",
+      parent_run_id: null,
+      successor_run_id: "successor",
+      proof_turn_indexes: [],
+    } as unknown as Run;
+    const stale = {
+      ...linked,
+      successor_run_id: null,
+    };
+
+    expect(preferNewerRun(linked, stale).successor_run_id).toBe("successor");
+    expect(preferNewerRun(stale, linked).successor_run_id).toBe("successor");
   });
 
   it("uses frozen Proof availability instead of successful turn outcomes", () => {

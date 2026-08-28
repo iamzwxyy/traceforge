@@ -96,6 +96,14 @@ class Workspace:
         for snapshot in self.storage.list_snapshots(run_id):
             path = self.resolve_write(snapshot.path)
             current_hash = digest(path.read_bytes()) if path.exists() else None
+            if snapshot.existed and current_hash == snapshot.original_hash:
+                if snapshot.mode is not None:
+                    os.chmod(path, snapshot.mode)
+                result.restored.append(snapshot.path)
+                continue
+            if not snapshot.existed and not path.exists():
+                result.removed.append(snapshot.path)
+                continue
             if current_hash != snapshot.last_agent_hash:
                 result.conflicts.append(snapshot.path)
                 continue

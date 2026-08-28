@@ -14,6 +14,7 @@ import type {
   ReasoningEffort,
   Run,
   RunEvent,
+  RollbackResult,
   RunTarget,
 } from "./types";
 
@@ -103,15 +104,24 @@ export const api = {
       method: "POST",
       body: JSON.stringify(config),
     }),
-  answerQuestions: (runId: string, answers: ClarificationAnswer[]) =>
+  answerQuestions: (
+    runId: string,
+    requestId: string,
+    answers: ClarificationAnswer[],
+  ) =>
     request<{ accepted: boolean }>(`/api/runs/${runId}/answers`, {
       method: "POST",
-      body: JSON.stringify({ answers }),
+      body: JSON.stringify({ request_id: requestId, answers }),
     }),
-  decidePlan: (runId: string, decision: "approve" | "revise", feedback = "") =>
+  decidePlan: (
+    runId: string,
+    requestId: string,
+    decision: "approve" | "revise",
+    feedback = "",
+  ) =>
     request<{ accepted: boolean }>(`/api/runs/${runId}/plan-decision`, {
       method: "POST",
-      body: JSON.stringify({ decision, feedback }),
+      body: JSON.stringify({ request_id: requestId, decision, feedback }),
     }),
   decideAction: (runId: string, approvalId: string, approved: boolean) =>
     request<{ accepted: boolean }>(
@@ -121,7 +131,7 @@ export const api = {
   cancel: (runId: string) => request<Run>(`/api/runs/${runId}/cancel`, { method: "POST" }),
   resume: (runId: string) => request<Run>(`/api/runs/${runId}/resume`, { method: "POST" }),
   rollback: (runId: string) =>
-    request<{ restored: string[]; removed: string[]; conflicts: string[] }>(
+    request<RollbackResult>(
       `/api/runs/${runId}/rollback`,
       { method: "POST" },
     ),

@@ -40,6 +40,11 @@ Its differentiator is a defensible engineering loop with useful human control.
   each terminal answer has one canonical conversation event and names the files actually changed
   by native edit tools in that turn, while the
   cumulative task diff, exact plan, tools, checks, and review stay one click away.
+- **Durable human decisions.** Clarification, plan review, and action approval are bound to stable
+  request IDs and persisted before HTTP acknowledgement. Exact retries are idempotent; stale or
+  conflicting replies cannot answer a later prompt, and resumed replies pair with the exact source
+  tool call. Approved actions commit their execution-start marker with the consumed decision, so
+  restart recovery never guesses by replaying a side effect.
 - **Conversation-first completion.** A compact completion footer reports passed checks and keeps
   Proof Pack one click away without letting a large evidence dashboard bury the delivered answer.
   The left history panel and default-collapsed right details panel are resizable, keyboard
@@ -56,6 +61,8 @@ Its differentiator is a defensible engineering loop with useful human control.
 - **Recoverable execution.** Runs and events survive in SQLite. Bounded, visible model retries
   pause safely on a persistent transient outage; connection settings can be repaired before
   resuming. File snapshots support conflict-aware rollback without overwriting later user edits.
+  Continuing after rollback creates one linked successor with a fresh snapshot boundary, so a
+  later rollback restores the post-rollback workspace rather than the original pre-task files.
 - **Model-aware context limits.** Each run snapshots the capacity resolved from an explicit user
   override, an exact official-endpoint model entry, or a conservative fallback. Compaction counts
   tool schemas, keeps tool requests paired with their results, and never assigns a large window
@@ -156,6 +163,9 @@ project-scoped tasks. Direct runs stay at the top level. After a
 turn finishes, use the bottom composer to continue in the same task; each follow-up can choose its
 own Agent/Plan and action-permission modes. In either mode, conversational or read-only requests can answer directly;
 the UI labels that terminal state separately from evidence-backed completion.
+After rollback, the same composer creates and selects a linked successor task instead. The old run
+remains immutable audit history, and the successor snapshots the current workspace; exact request
+retries return that same successor rather than creating parallel branches.
 
 The right **任务详情** panel starts collapsed so the conversation stays primary. Use the header
 buttons to toggle either side panel, drag their separators (or use arrow/Home/End keys) to resize,
@@ -197,6 +207,8 @@ flowchart LR
     G -->|follow-up| B
     J -->|follow-up| B
     D -. snapshots .-> I[Conflict-aware rollback]
+    I --> K[Linked successor + fresh snapshots]
+    K --> B
 ```
 
 The model proposes actions; TraceForge owns the state machine, message history, tool dispatch,
@@ -240,8 +252,8 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 300 backend tests at 88.38% coverage (with a hard 85% gate), 18 frontend
-unit tests, and 19 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 326 backend tests at 88.35% coverage (with a hard 85% gate), 19 frontend
+unit tests, and 25 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 

@@ -13,8 +13,13 @@ from fastapi.testclient import TestClient
 from traceforge.api import _choose_macos_directory, _open_workspace_directory, create_app
 from traceforge.config import Settings
 from traceforge.models import (
+    ClarificationQuestion,
+    ClarificationRequest,
     ConversationTurn,
+    DecisionKind,
+    EventType,
     ProviderConfig,
+    QuestionOption,
     RunRecord,
     RunState,
     ToolCall,
@@ -89,6 +94,130 @@ def test_api_represents_direct_answer_without_completion_evidence(
         assert client.post(f"/api/runs/{answered['id']}/rollback").status_code == 409
 
 
+def test_api_rejects_duplicate_answers_for_one_clarification_question(
+    settings: Settings,
+) -> None:
+    question = ModelResponse(
+        tool_calls=[
+            ToolCall(
+                id="question",
+                name="ask_questions",
+                arguments={
+                    "questions": [
+                        {
+                            "id": "scope",
+                            "prompt": "Which scope?",
+                            "options": [
+                                {"id": "small", "label": "Small"},
+                                {"id": "large", "label": "Large"},
+                            ],
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    app = create_app(
+        settings,
+        provider=ScriptedProvider([question, _answer_response("Scope recorded")]),
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={"task": "Clarify scope", "create_direct_workspace": True},
+        )
+        run_id = created.json()["id"]
+        waiting = _wait_for_state(client, run_id, "awaiting_clarification")
+        request_id = waiting["decision_request_id"]
+
+        duplicate = client.post(
+            f"/api/runs/{run_id}/answers",
+            json={
+                "request_id": request_id,
+                "answers": [
+                    {"question_id": "scope", "option_id": "small"},
+                    {"question_id": "scope", "option_id": "large"},
+                ],
+            },
+        )
+
+        assert duplicate.status_code == 409
+        assert "exactly once" in duplicate.json()["detail"]
+        still_waiting = client.get(f"/api/runs/{run_id}").json()
+        assert still_waiting["state"] == "awaiting_clarification"
+        assert still_waiting["decision_request_id"] == request_id
+        accepted = client.post(
+            f"/api/runs/{run_id}/answers",
+            json={
+                "request_id": request_id,
+                "answers": [{"question_id": "scope", "option_id": "small"}],
+            },
+        )
+        assert accepted.status_code == 202
+        assert _wait_for_state(client, run_id, "answered")["decision_request_id"] is None
+
+
+def test_api_rollback_hides_and_expires_an_interrupted_decision(
+    settings: Settings,
+) -> None:
+    app = create_app(settings, provider=ScriptedProvider([]))
+    clarification = ClarificationRequest(
+        questions=[
+            ClarificationQuestion(
+                id="scope",
+                prompt="Which scope?",
+                options=[
+                    QuestionOption(id="small", label="Small"),
+                    QuestionOption(id="large", label="Large"),
+                ],
+            )
+        ]
+    )
+    run = RunRecord(
+        id="rollback-interrupted-decision",
+        task="Rollback the old question",
+        workspace=str(settings.workspace),
+        state=RunState.PLANNING,
+        clarification=clarification,
+    )
+    app.state.storage.create_run(run)
+    run.state = RunState.AWAITING_CLARIFICATION
+    request_id = "question-before-rollback"
+    app.state.storage.open_decision(
+        run,
+        previous_state=RunState.PLANNING,
+        request_id=request_id,
+        kind=DecisionKind.CLARIFICATION,
+        turn_index=1,
+        subject=clarification.model_dump(mode="json"),
+        requested_event_type=EventType.CLARIFICATION_REQUESTED,
+        requested_payload=clarification.model_dump(mode="json"),
+    )
+    interrupted = app.state.storage.get_run(run.id)
+    interrupted.state = RunState.INTERRUPTED
+    interrupted.interrupted_from = RunState.AWAITING_CLARIFICATION
+    app.state.storage.save_run(interrupted)
+
+    with TestClient(app) as client:
+        rolled_back = client.post(f"/api/runs/{run.id}/rollback")
+        assert rolled_back.status_code == 200
+        public = client.get(f"/api/runs/{run.id}").json()
+        assert public["state"] == "rolled_back"
+        assert public["clarification"] is None
+        assert public["decision_request_id"] is None
+        assert public["decision_kind"] is None
+        stale = client.post(
+            f"/api/runs/{run.id}/answers",
+            json={
+                "request_id": request_id,
+                "answers": [{"question_id": "scope", "option_id": "small"}],
+            },
+        )
+        assert stale.status_code == 409
+        assert "abandoned" in stale.json()["detail"]
+
+
 def test_instance_health_and_ipv6_origins_cover_rest_and_websocket(
     settings: Settings,
 ) -> None:
@@ -161,9 +290,35 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
         assert waiting["context_tokens"] > 0
         assert waiting["context_tokens"] < waiting["context_limit"]
         assert waiting["context_limit"] == settings.context_limit
+        assert waiting["decision_kind"] == "plan"
+        assert waiting["decision_request_id"]
 
-        decision = client.post(f"/api/runs/{run_id}/plan-decision", json={"decision": "approve"})
+        missing_identity = client.post(
+            f"/api/runs/{run_id}/plan-decision", json={"decision": "approve"}
+        )
+        assert missing_identity.status_code == 422
+
+        plan_request = {
+            "request_id": waiting["decision_request_id"],
+            "decision": "approve",
+        }
+        decision = client.post(
+            f"/api/runs/{run_id}/plan-decision",
+            json=plan_request,
+        )
         assert decision.status_code == 202
+        assert client.post(
+            f"/api/runs/{run_id}/plan-decision", json=plan_request
+        ).status_code == 202
+        conflicting_retry = client.post(
+            f"/api/runs/{run_id}/plan-decision",
+            json={
+                "request_id": waiting["decision_request_id"],
+                "decision": "revise",
+                "feedback": "Different response",
+            },
+        )
+        assert conflicting_retry.status_code == 409
         completed = _wait_for_state(client, run_id, "succeeded")
         assert completed["verification"]["verdict"] == "inconclusive"
 
@@ -249,6 +404,90 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
         assert second["turns"][1]["approval_mode"] == "manual"
         assert all(turn["reasoning_effort"] == "auto" for turn in second["turns"])
         assert all(turn["outcome"] == "succeeded" for turn in second["turns"])
+
+
+def test_api_follow_up_after_rollback_creates_a_linked_successor(
+    settings: Settings,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments={
+                            "summary": "Create one note",
+                            "steps": [{"id": "create", "title": "Create note.txt"}],
+                            "acceptance_checks": [
+                                {"id": "review", "label": "Review note.txt"}
+                            ],
+                            "impacted_files": ["note.txt"],
+                        },
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="create",
+                        name="create_file",
+                        arguments={"path": "note.txt", "content": "agent\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Created note.txt"},
+                    )
+                ]
+            ),
+            _answer_response("The rolled-back work is available as history."),
+        ]
+    )
+    app = create_app(settings, provider=provider)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={"task": "Create note.txt", "verifier_enabled": False},
+        )
+        first_id = created.json()["id"]
+        _wait_for_state(client, first_id, "succeeded")
+        rolled_back = client.post(f"/api/runs/{first_id}/rollback")
+        assert rolled_back.status_code == 200
+
+        continued = client.post(
+            f"/api/runs/{first_id}/turns",
+            json={"prompt": "Explain what was rolled back"},
+        )
+
+        assert continued.status_code == 200
+        successor = continued.json()
+        assert successor["id"] != first_id
+        assert successor["parent_run_id"] == first_id
+        assert successor["task"] == "Explain what was rolled back"
+        assert client.get(f"/api/runs/{first_id}").json()["state"] == "rolled_back"
+        completed = _wait_for_state(client, successor["id"], "answered")
+        assert completed["parent_run_id"] == first_id
+        parent = client.get(f"/api/runs/{first_id}").json()
+        assert parent["successor_run_id"] == successor["id"]
+
+        exact_retry = client.post(
+            f"/api/runs/{first_id}/turns",
+            json={"prompt": "Explain what was rolled back"},
+        )
+        assert exact_retry.status_code == 200
+        assert exact_retry.json()["id"] == successor["id"]
+        conflicting_retry = client.post(
+            f"/api/runs/{first_id}/turns",
+            json={"prompt": "Start a different continuation"},
+        )
+        assert conflicting_retry.status_code == 409
+        assert "already continued" in conflicting_retry.json()["detail"]
 
 
 def test_api_keeps_each_success_proof_immutable_across_later_turns(
@@ -1433,8 +1672,14 @@ def test_api_allows_provider_repair_then_resume_after_transient_outage(
 
         resumed = client.post(f"/api/runs/{run_id}/resume")
         assert resumed.status_code == 200
-        _wait_for_state(client, run_id, "awaiting_plan_approval")
-        approved = client.post(f"/api/runs/{run_id}/plan-decision", json={"decision": "approve"})
+        waiting = _wait_for_state(client, run_id, "awaiting_plan_approval")
+        approved = client.post(
+            f"/api/runs/{run_id}/plan-decision",
+            json={
+                "request_id": waiting["decision_request_id"],
+                "decision": "approve",
+            },
+        )
         assert approved.status_code == 202
         completed = _wait_for_state(client, run_id, "succeeded")
         assert completed["error"] is None

@@ -49,11 +49,20 @@ export function preferNewerRun(current: Run | null, incoming: Run): Run {
     ...(incoming.proof_turn_indexes ?? []),
   ])].sort((left, right) => left - right);
   const preferredIndexes = preferred.proof_turn_indexes ?? [];
+  const parentRunId = current.parent_run_id ?? incoming.parent_run_id;
+  const successorRunId = current.successor_run_id ?? incoming.successor_run_id;
   if (
     preferredIndexes.length === proofTurnIndexes.length
     && preferredIndexes.every((turnIndex, index) => turnIndex === proofTurnIndexes[index])
+    && preferred.parent_run_id === parentRunId
+    && preferred.successor_run_id === successorRunId
   ) return preferred;
-  return { ...preferred, proof_turn_indexes: proofTurnIndexes };
+  return {
+    ...preferred,
+    proof_turn_indexes: proofTurnIndexes,
+    parent_run_id: parentRunId,
+    successor_run_id: successorRunId,
+  };
 }
 
 export function availableProofTurnIndexes(

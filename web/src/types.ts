@@ -15,6 +15,7 @@ export type RunState =
 
 export type CheckStatus = "pending" | "running" | "passed" | "failed" | "waived";
 export type InteractionMode = "agent" | "plan";
+export type DecisionKind = "clarification" | "plan" | "action";
 export type ApprovalMode = "manual" | "automatic" | "full_access";
 export type ReasoningEffort =
   | "auto"
@@ -119,6 +120,10 @@ export interface Run {
   reasoning_effort: ReasoningEffort;
   turns: ConversationTurn[];
   proof_turn_indexes: number[];
+  decision_request_id: string | null;
+  decision_kind: DecisionKind | null;
+  parent_run_id: string | null;
+  successor_run_id: string | null;
   verifier_enabled: boolean;
   plan: TaskPlan | null;
   clarification: ClarificationRequest | null;
@@ -153,6 +158,12 @@ export interface RunEvent {
   type: string;
   payload: Record<string, unknown>;
   created_at: string;
+}
+
+export interface RollbackResult {
+  restored: string[];
+  removed: string[];
+  conflicts: string[];
 }
 
 export interface AppStatus {

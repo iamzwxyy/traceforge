@@ -14,6 +14,7 @@ import type {
   ProviderUpdate,
   Run,
   RunEvent,
+  RollbackResult,
   RunTarget,
 } from "./types";
 
@@ -25,8 +26,10 @@ const refreshEventTypes = new Set([
   "clarification.answered",
   "plan.updated",
   "plan.gated",
+  "plan.resolved",
   "approval.requested",
   "approval.resolved",
+  "decision.abandoned",
   "verification.completed",
   "repair.started",
   "run.resumed",
@@ -55,8 +58,12 @@ export function useTraceForge() {
   const [diff, setDiff] = useState("");
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [rollbackResults, setRollbackResults] = useState<Record<string, RollbackResult>>({});
   const lastSeq = useRef(0);
   const selectedRunIdRef = useRef<string | null>(null);
+  const selectionVersion = useRef(0);
+  const actionRequestVersions = useRef(new Map<string, number>());
+  const workspaceRequestVersions = useRef(new Map<string, number>());
   const diffRequestVersions = useRef(new Map<string, number>());
   const diffEventVersions = useRef(new Map<string, number>());
   const proofRequestVersion = useRef(0);
@@ -66,6 +73,7 @@ export function useTraceForge() {
 
   const selectRun = useCallback((runId: string | null) => {
     if (selectedRunIdRef.current === runId) return;
+    selectionVersion.current += 1;
     selectedRunIdRef.current = runId;
     if (runId) {
       diffRequestVersions.current.set(
@@ -220,25 +228,59 @@ export function useTraceForge() {
     };
   }, [refreshRun, refreshRunMetadata, selectedRunId]);
 
+  const synchronizeAfterMutation = useCallback((
+    runId: string,
+    ownsFeedback: () => boolean,
+  ) => {
+    const synchronizationError = "操作已成功接收，但状态同步失败；TraceForge 正在重试。";
+    const synchronize = () => Promise.all([refreshRun(runId), refreshRuns()]);
+    void synchronize().catch(() => {
+      if (ownsFeedback()) setError(synchronizationError);
+      window.setTimeout(() => {
+        void synchronize()
+          .then(() => {
+            if (ownsFeedback()) {
+              setError((current) => current === synchronizationError ? null : current);
+            }
+          })
+          .catch(() => undefined);
+      }, 800);
+    });
+  }, [refreshRun, refreshRuns]);
+
   const perform = useCallback(
-    async (runId: string, operation: () => Promise<unknown>) => {
+    async <Result,>(
+      runId: string,
+      operation: () => Promise<Result>,
+      options: { surfaceOperationError?: boolean } = {},
+    ): Promise<Result> => {
       if (selectedRunIdRef.current !== runId) {
         throw new Error("当前任务已切换，请在当前任务中重试此操作");
       }
-      if (selectedRunIdRef.current === runId) setError(null);
+      const surfaceOperationError = options.surfaceOperationError ?? true;
+      const requestVersion = (actionRequestVersions.current.get(runId) ?? 0) + 1;
+      actionRequestVersions.current.set(runId, requestVersion);
+      const requestSelectionVersion = selectionVersion.current;
+      const ownsFeedback = () => (
+        selectedRunIdRef.current === runId
+        && selectionVersion.current === requestSelectionVersion
+        && actionRequestVersions.current.get(runId) === requestVersion
+      );
+      if (surfaceOperationError && ownsFeedback()) setError(null);
+      let result: Result;
       try {
-        await operation();
-        if (selectedRunIdRef.current === runId) setProofPack(null);
-        await refreshRun(runId);
-        await refreshRuns();
+        result = await operation();
       } catch (reason) {
-        if (selectedRunIdRef.current === runId) {
+        if (surfaceOperationError && ownsFeedback()) {
           setError(reason instanceof Error ? reason.message : String(reason));
         }
         throw reason;
       }
+      if (ownsFeedback()) setProofPack(null);
+      synchronizeAfterMutation(runId, ownsFeedback);
+      return result;
     },
-    [refreshRun, refreshRuns],
+    [synchronizeAfterMutation],
   );
 
   const createRun = useCallback(
@@ -268,6 +310,62 @@ export function useTraceForge() {
     },
     [selectRun],
   );
+
+  const followUp = useCallback(async (
+    prompt: string,
+    mode: InteractionMode,
+    approvalMode: ApprovalMode,
+    reasoningEffort: ReasoningEffort,
+  ): Promise<Run | undefined> => {
+    if (!run) return undefined;
+    const runId = run.id;
+    if (run.state !== "rolled_back") {
+      const continued = await perform(runId, () => api.followUp(
+        runId,
+        prompt,
+        mode,
+        approvalMode,
+        reasoningEffort,
+      ));
+      storeRun(continued);
+      return continued;
+    }
+    if (selectedRunIdRef.current !== runId) {
+      throw new Error("当前任务已切换，请在当前任务中重试此操作");
+    }
+    const requestVersion = (actionRequestVersions.current.get(runId) ?? 0) + 1;
+    actionRequestVersions.current.set(runId, requestVersion);
+    const requestSelectionVersion = selectionVersion.current;
+    const ownsFeedback = () => (
+      selectedRunIdRef.current === runId
+      && selectionVersion.current === requestSelectionVersion
+      && actionRequestVersions.current.get(runId) === requestVersion
+    );
+    if (ownsFeedback()) setError(null);
+    let successor: Run;
+    try {
+      successor = await api.followUp(
+        runId,
+        prompt,
+        mode,
+        approvalMode,
+        reasoningEffort,
+      );
+    } catch (reason) {
+      await Promise.allSettled([
+        refreshRunMetadata(runId),
+        refreshRuns(),
+      ]);
+      if (ownsFeedback()) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
+      throw reason;
+    }
+    storeRun(successor);
+    if (ownsFeedback()) selectRun(successor.id);
+    void refreshRuns().catch(() => undefined);
+    return successor;
+  }, [perform, refreshRunMetadata, refreshRuns, run, selectRun, storeRun]);
 
   const createProject = useCallback(
     async (name: string, root: string, createDirectory: boolean) => {
@@ -299,13 +397,21 @@ export function useTraceForge() {
     if (selectedRunIdRef.current !== runId) {
       throw new Error("当前任务已切换，请在当前任务中重试此操作");
     }
-    setError(null);
+    const requestVersion = (workspaceRequestVersions.current.get(runId) ?? 0) + 1;
+    workspaceRequestVersions.current.set(runId, requestVersion);
+    const requestSelectionVersion = selectionVersion.current;
+    const ownsFeedback = () => (
+      selectedRunIdRef.current === runId
+      && selectionVersion.current === requestSelectionVersion
+      && workspaceRequestVersions.current.get(runId) === requestVersion
+    );
+    if (ownsFeedback()) setError(null);
     try {
       const result = await api.openWorkspace(runId);
       if (!result.supported) throw new Error("当前系统没有可用的文件管理器");
       return result;
     } catch (reason) {
-      if (selectedRunIdRef.current === runId) {
+      if (ownsFeedback()) {
         setError(reason instanceof Error ? reason.message : String(reason));
       }
       throw reason;
@@ -403,6 +509,7 @@ export function useTraceForge() {
     provider,
     proofPack,
     proofLoadState,
+    rollbackResult: run ? rollbackResults[run.id] ?? null : null,
     runs,
     run,
     events,
@@ -413,18 +520,7 @@ export function useTraceForge() {
     selectedRunId,
     selectRun,
     createRun,
-    followUp: (
-      prompt: string,
-      mode: InteractionMode,
-      approvalMode: ApprovalMode,
-      reasoningEffort: ReasoningEffort,
-    ) => run && perform(run.id, () => api.followUp(
-      run.id,
-      prompt,
-      mode,
-      approvalMode,
-      reasoningEffort,
-    )),
+    followUp,
     createProject,
     saveProvider,
     testProvider,
@@ -432,15 +528,68 @@ export function useTraceForge() {
     listDirectories: api.listDirectories,
     chooseDirectory,
     openWorkspace,
-    answerQuestions: (answers: ClarificationAnswer[]) =>
-      run && perform(run.id, () => api.answerQuestions(run.id, answers)),
-    decidePlan: (decision: "approve" | "revise", feedback = "") =>
-      run && perform(run.id, () => api.decidePlan(run.id, decision, feedback)),
-    decideAction: (approved: boolean) =>
-      run?.pending_approval &&
-      perform(run.id, () => api.decideAction(run.id, run.pending_approval!.id, approved)),
-    cancel: () => run && perform(run.id, () => api.cancel(run.id)),
-    resume: () => run && perform(run.id, () => api.resume(run.id)),
-    rollback: () => run && perform(run.id, () => api.rollback(run.id)),
+    answerQuestions: (answers: ClarificationAnswer[]): Promise<void> => {
+      if (!run?.decision_request_id) {
+        return Promise.reject(new Error("澄清请求已更新，请按当前问题重试"));
+      }
+      return perform(run.id, () => api.answerQuestions(
+        run.id,
+        run.decision_request_id!,
+        answers,
+      ), { surfaceOperationError: false }).then(() => undefined);
+    },
+    decidePlan: (decision: "approve" | "revise", feedback = ""): Promise<void> => {
+      if (!run?.decision_request_id) {
+        return Promise.reject(new Error("计划审批请求已更新，请重新审阅当前计划"));
+      }
+      return perform(run.id, () => api.decidePlan(
+        run.id,
+        run.decision_request_id!,
+        decision,
+        feedback,
+      ), { surfaceOperationError: false }).then(() => undefined);
+    },
+    decideAction: (approved: boolean): Promise<void> => {
+      if (!run?.pending_approval) {
+        return Promise.reject(new Error("动作审批请求已更新，请重新审阅当前动作"));
+      }
+      return perform(
+        run.id,
+        () => api.decideAction(run.id, run.pending_approval!.id, approved),
+        { surfaceOperationError: false },
+      ).then(() => undefined);
+    },
+    cancel: () => run && perform(run.id, () => api.cancel(run.id)).then((next) => {
+      storeRun(next);
+      return next;
+    }),
+    resume: () => run && perform(run.id, () => api.resume(run.id)).then((next) => {
+      storeRun(next);
+      return next;
+    }),
+    rollback: async (): Promise<RollbackResult> => {
+      if (!run) throw new Error("请选择要回滚的任务");
+      const runId = run.id;
+      const result = await perform(
+        runId,
+        () => api.rollback(runId),
+        { surfaceOperationError: false },
+      );
+      setRollbackResults((current) => ({ ...current, [runId]: result }));
+      setRuns((current) => current.map((candidate) => (
+        candidate.id === runId
+          ? {
+              ...candidate,
+              state: "rolled_back",
+              decision_request_id: null,
+              decision_kind: null,
+              clarification: null,
+              pending_approval: null,
+              updated_at: new Date().toISOString(),
+            }
+          : candidate
+      )));
+      return result;
+    },
   };
 }

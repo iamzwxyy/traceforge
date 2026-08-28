@@ -23,7 +23,7 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 | Complete evidence loop | real diff, fresh checks, independent pass, stable completion diff and Proof Pack digest | deterministic tenant-isolation demo plus Proof Pack projection test |
 | Mode-aware intent and human control | conversation ends as an answer without false evidence; Agent/Plan controls plan review while Manual/Automatic/workspace Full access independently control actions; hard denials never upgrade | direct-answer, cross-mode permission matrix, stale-approval, sandbox fallback, and plan-gate state-machine tests |
 | Truthful repair and termination | edits invalidate old checks; repair-budget exhaustion ends failed | stale-check repair and repair-limit tests |
-| Recovery and rollback | transient model failure pauses with bounded retry evidence and can resume after settings change; incomplete tool calls are never replayed; one conflict does not block safe rollback of other files | provider-outage recovery, restart protocol, and partial rollback tests |
+| Recovery and rollback | transient model failure pauses with bounded retry evidence; request-bound human decisions resume and pair with the exact source call; started actions are uncertain and never replayed; conflicts stay preserved; post-rollback continuation gets a fresh snapshot lineage | provider-outage, protocol-repair, durable-clarification, atomic action-start, partial rollback, and rollback-successor tests |
 | Command isolation | enforced backend blocks workspace escape and credential reads; an explicit escape is one-shot and labeled | real Seatbelt/Bubblewrap adversarial tests plus bypass evidence test |
 
 `passed` means every selected invariant executed and passed. `degraded` means Pytest skipped an

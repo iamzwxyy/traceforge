@@ -11,11 +11,17 @@ from traceforge.agent import AgentManager, InvalidRunAction, PlanDecision, RunCo
 from traceforge.config import Settings
 from traceforge.models import (
     ApprovalMode,
+    ApprovalRequest,
     ClarificationAnswer,
+    ClarificationQuestion,
+    ClarificationRequest,
     ConversationTurn,
+    DecisionKind,
+    DecisionStatus,
     EventType,
     InteractionMode,
     PlanGate,
+    QuestionOption,
     ReasoningEffort,
     RunRecord,
     RunState,
@@ -65,6 +71,34 @@ def _direct_response(content: str, *, call_id: str = "respond") -> ModelResponse
                 id=call_id,
                 name="respond_to_user",
                 arguments={"content": content},
+            )
+        ]
+    )
+
+
+def _question_response(
+    call_id: str,
+    *,
+    question_id: str = "choice",
+    prompt: str = "Choose one",
+) -> ModelResponse:
+    return ModelResponse(
+        tool_calls=[
+            ToolCall(
+                id=call_id,
+                name="ask_questions",
+                arguments={
+                    "questions": [
+                        {
+                            "id": question_id,
+                            "prompt": prompt,
+                            "options": [
+                                {"id": "a", "label": "A"},
+                                {"id": "b", "label": "B"},
+                            ],
+                        }
+                    ]
+                },
             )
         ]
     )
@@ -546,6 +580,352 @@ async def test_follow_up_continues_the_same_task_with_prior_turn_context(
     event_types = [event.type for event in storage.get_events(first.id)]
     assert event_types.count(EventType.TURN_STARTED) == 2
     assert event_types.count(EventType.TURN_COMPLETED) == 2
+
+
+@pytest.mark.asyncio
+async def test_rollback_successor_uses_fresh_snapshot_boundary_and_lineage(
+    settings: Settings, storage: Storage
+) -> None:
+    note = settings.workspace / "note.txt"
+    note.write_text("base\n")
+    plan = {
+        "summary": "Update the note",
+        "steps": [{"id": "update", "title": "Update note.txt"}],
+        "acceptance_checks": [{"id": "review", "label": "Review note.txt"}],
+        "impacted_files": ["note.txt"],
+    }
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall(id="plan-1", name="submit_plan", arguments=plan)]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="patch-1",
+                        name="apply_patch",
+                        arguments={
+                            "patch": (
+                                "--- a/note.txt\n+++ b/note.txt\n"
+                                "@@ -1 +1 @@\n-base\n+first agent edit\n"
+                            )
+                        },
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-1",
+                        name="finish",
+                        arguments={"summary": "Applied the first edit"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[ToolCall(id="plan-2", name="submit_plan", arguments=plan)]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="patch-2",
+                        name="apply_patch",
+                        arguments={
+                            "patch": (
+                                "--- a/note.txt\n+++ b/note.txt\n"
+                                "@@ -1 +1 @@\n-user edit after rollback\n+successor edit\n"
+                            )
+                        },
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-2",
+                        name="finish",
+                        arguments={"summary": "Applied the successor edit"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    first = await manager.start_run("Apply the first edit", verifier_enabled=False)
+    assert (await manager.wait(first.id)).state is RunState.SUCCEEDED
+    assert note.read_text() == "first agent edit\n"
+    first_rollback = await manager.rollback(first.id)
+    assert first_rollback.restored == ["note.txt"]
+    assert note.read_text() == "base\n"
+
+    note.write_text("user edit after rollback\n")
+    rollback_event_count = sum(
+        event.type is EventType.ROLLBACK_COMPLETED
+        for event in storage.get_events(first.id)
+    )
+    exact_rollback_retry = await manager.rollback(first.id)
+    assert exact_rollback_retry == first_rollback
+    assert note.read_text() == "user edit after rollback\n"
+    assert sum(
+        event.type is EventType.ROLLBACK_COMPLETED
+        for event in storage.get_events(first.id)
+    ) == rollback_event_count
+
+    successor = await manager.continue_after_rollback(
+        first.id, "Apply a different edit after rollback"
+    )
+    assert successor.id != first.id
+    assert successor.project_id == first.project_id
+    assert storage.get_parent_run_id(successor.id) == first.id
+    assert (await manager.wait(successor.id)).state is RunState.SUCCEEDED
+    assert note.read_text() == "successor edit\n"
+
+    planner_context = str(provider.requests[3][0][1]["content"])
+    assert "rolled-back predecessor" in planner_context
+    assert "current workspace is authoritative" in planner_context
+    assert "Applied the first edit" in planner_context
+    started = next(
+        event
+        for event in storage.get_events(successor.id)
+        if event.type is EventType.TURN_STARTED
+    )
+    assert started.payload["continued_from_run_id"] == first.id
+
+    exact_retry = await manager.continue_after_rollback(
+        first.id, "Apply a different edit after rollback"
+    )
+    assert exact_retry.id == successor.id
+    with pytest.raises(InvalidRunAction, match="already continued"):
+        await manager.continue_after_rollback(first.id, "Start a conflicting branch")
+
+    successor_rollback = await manager.rollback(successor.id)
+    assert successor_rollback.restored == ["note.txt"]
+    assert successor_rollback.conflicts == []
+    assert note.read_text() == "user edit after rollback\n"
+
+
+@pytest.mark.asyncio
+async def test_rollback_abandons_every_interrupted_human_decision_before_files(
+    settings: Settings, storage: Storage
+) -> None:
+    manager = AgentManager(settings, storage, ScriptedProvider([]))
+    clarification = ClarificationRequest(
+        questions=[
+            ClarificationQuestion(
+                id="scope",
+                prompt="Which scope?",
+                options=[
+                    QuestionOption(id="small", label="Small"),
+                    QuestionOption(id="large", label="Large"),
+                ],
+            )
+        ]
+    )
+    plan = TaskPlan.model_validate(_review_plan())
+    action = ApprovalRequest(
+        id="rollback-action-request",
+        tool_call=ToolCall(
+            id="rollback-command",
+            name="run_command",
+            arguments={"argv": ["python", "app.py"]},
+        ),
+        summary="Run app.py",
+        reason="Manual approval is required",
+        risk="elevated",
+        approval_mode=ApprovalMode.MANUAL,
+        policy_decision="ask",
+    )
+    cases = [
+        (
+            "rollback-clarification",
+            DecisionKind.CLARIFICATION,
+            RunState.PLANNING,
+            RunState.AWAITING_CLARIFICATION,
+            clarification.model_dump(mode="json"),
+            EventType.CLARIFICATION_REQUESTED,
+        ),
+        (
+            "rollback-plan",
+            DecisionKind.PLAN,
+            RunState.PLANNING,
+            RunState.AWAITING_PLAN_APPROVAL,
+            plan.model_dump(mode="json"),
+            EventType.PLAN_UPDATED,
+        ),
+        (
+            "rollback-action",
+            DecisionKind.ACTION,
+            RunState.EXECUTING,
+            RunState.AWAITING_ACTION_APPROVAL,
+            action.model_dump(mode="json"),
+            EventType.APPROVAL_REQUESTED,
+        ),
+    ]
+
+    for run_id, kind, previous, waiting_state, subject, event_type in cases:
+        run = RunRecord(
+            id=run_id,
+            task="Rollback an interrupted decision",
+            workspace=str(settings.workspace),
+            state=previous,
+            clarification=clarification if kind is DecisionKind.CLARIFICATION else None,
+            plan=plan if kind is DecisionKind.PLAN else None,
+            pending_approval=action if kind is DecisionKind.ACTION else None,
+        )
+        storage.create_run(run)
+        run.state = waiting_state
+        request_id = action.id if kind is DecisionKind.ACTION else f"{run_id}-request"
+        storage.open_decision(
+            run,
+            previous_state=previous,
+            request_id=request_id,
+            kind=kind,
+            turn_index=1,
+            subject=subject,
+            requested_event_type=event_type,
+            requested_payload=subject,
+        )
+        accepted_payload = (
+            {"answers": [{"question_id": "scope", "option_id": "small"}]}
+            if kind is DecisionKind.CLARIFICATION
+            else (
+                {"decision": "approve", "feedback": ""}
+                if kind is DecisionKind.PLAN
+                else {"approved": True}
+            )
+        )
+        storage.accept_decision(run_id, request_id, kind, accepted_payload)
+        interrupted = storage.get_run(run_id)
+        interrupted.interrupted_from = waiting_state
+        interrupted.state = RunState.INTERRUPTED
+        storage.save_run(interrupted)
+
+        await manager.rollback(run_id)
+
+        rolled_back = storage.get_run(run_id)
+        assert rolled_back.state is RunState.ROLLED_BACK
+        assert rolled_back.pending_approval is None
+        assert rolled_back.clarification is None
+        assert storage.get_active_decision(run_id) is None
+        assert storage.get_decision(run_id, request_id).status is DecisionStatus.ABANDONED
+        if kind is DecisionKind.CLARIFICATION:
+            stale_call = manager.answer_clarification(
+                run_id,
+                [ClarificationAnswer(question_id="scope", option_id="small")],
+                request_id=request_id,
+            )
+        elif kind is DecisionKind.PLAN:
+            stale_call = manager.decide_plan(
+                run_id,
+                PlanDecision(decision="approve"),
+                request_id=request_id,
+            )
+        else:
+            stale_call = manager.decide_action(run_id, request_id, approved=True)
+        with pytest.raises(InvalidRunAction, match="abandoned"):
+            await stale_call
+
+
+@pytest.mark.asyncio
+async def test_rollback_file_failure_cannot_revive_an_old_accepted_decision(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clarification = ClarificationRequest(
+        questions=[
+            ClarificationQuestion(
+                id="scope",
+                prompt="Which scope?",
+                options=[
+                    QuestionOption(id="small", label="Small"),
+                    QuestionOption(id="large", label="Large"),
+                ],
+            )
+        ]
+    )
+    run = RunRecord(
+        id="rollback-file-failure",
+        task="Rollback before consuming an answer",
+        workspace=str(settings.workspace),
+        state=RunState.PLANNING,
+        clarification=clarification,
+    )
+    storage.create_run(run)
+    run.state = RunState.AWAITING_CLARIFICATION
+    storage.open_decision(
+        run,
+        previous_state=RunState.PLANNING,
+        request_id="clarification-before-rollback",
+        kind=DecisionKind.CLARIFICATION,
+        turn_index=1,
+        subject=clarification.model_dump(mode="json"),
+        requested_event_type=EventType.CLARIFICATION_REQUESTED,
+        requested_payload=clarification.model_dump(mode="json"),
+    )
+    storage.accept_decision(
+        run.id,
+        "clarification-before-rollback",
+        DecisionKind.CLARIFICATION,
+        {"answers": [{"question_id": "scope", "option_id": "small"}]},
+    )
+    interrupted = storage.get_run(run.id)
+    interrupted.state = RunState.INTERRUPTED
+    interrupted.interrupted_from = RunState.AWAITING_CLARIFICATION
+    storage.save_run(interrupted)
+    manager = AgentManager(settings, storage, ScriptedProvider([]))
+
+    def fail_file_rollback(_run_id: str) -> None:
+        raise RuntimeError("snapshot storage unavailable")
+
+    monkeypatch.setattr(manager.workspace, "rollback", fail_file_rollback)
+    with pytest.raises(RuntimeError, match="snapshot storage unavailable"):
+        await manager.rollback(run.id)
+
+    unchanged = storage.get_run(run.id)
+    assert unchanged.state is RunState.INTERRUPTED
+    assert unchanged.clarification is None
+    assert storage.get_active_decision(run.id) is None
+    assert storage.get_decision(
+        run.id, "clarification-before-rollback"
+    ).status is DecisionStatus.ABANDONED
+    with pytest.raises(InvalidRunAction, match="abandoned"):
+        await manager.answer_clarification(
+            run.id,
+            [ClarificationAnswer(question_id="scope", option_id="small")],
+            request_id="clarification-before-rollback",
+        )
+
+
+@pytest.mark.asyncio
+async def test_rollback_cannot_race_a_newly_resumed_worker(
+    settings: Settings, storage: Storage
+) -> None:
+    blocker = asyncio.Event()
+
+    class BlockingProvider:
+        async def complete(self, messages, tools=None, **_kwargs) -> ModelResponse:
+            await blocker.wait()
+            raise AssertionError("unreachable")
+
+    run = RunRecord(
+        id="resume-rollback-race",
+        task="Resume or rollback, never both",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.PLANNING,
+        turns=[ConversationTurn(index=1, request="Resume or rollback, never both")],
+    )
+    storage.create_run(run)
+    manager = AgentManager(settings, storage, BlockingProvider())
+
+    await manager.resume(run.id)
+    with pytest.raises(RunConflictError, match="already active"):
+        await manager.rollback(run.id)
+
+    await manager.shutdown()
+    assert storage.get_run(run.id).state is RunState.INTERRUPTED
 
 
 @pytest.mark.asyncio
@@ -2427,6 +2807,159 @@ async def test_plan_revision_then_completion(settings: Settings, storage: Storag
 
 
 @pytest.mark.asyncio
+async def test_stale_plan_retry_is_idempotent_without_rebinding_to_revised_plan(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="plan-1",
+                        name="submit_plan",
+                        arguments=_review_plan("Draft"),
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="plan-2",
+                        name="submit_plan",
+                        arguments=_review_plan("Revised"),
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Reviewed the revised plan"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run(
+        "Review safely", verifier_enabled=False, mode=InteractionMode.PLAN
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    first = storage.get_active_decision(run.id)
+    assert first is not None
+    revision = PlanDecision(decision="revise", feedback="Make it narrower")
+
+    await manager.decide_plan(run.id, revision, request_id=first.request_id)
+    async with asyncio.timeout(3):
+        while True:
+            waiting = storage.get_run(run.id)
+            second = storage.get_active_decision(run.id)
+            if (
+                waiting.state is RunState.AWAITING_PLAN_APPROVAL
+                and waiting.plan is not None
+                and waiting.plan.summary == "Revised"
+                and second is not None
+                and second.request_id != first.request_id
+            ):
+                break
+            await asyncio.sleep(0.01)
+
+    await manager.decide_plan(run.id, revision, request_id=first.request_id)
+    still_waiting = storage.get_run(run.id)
+    assert still_waiting.state is RunState.AWAITING_PLAN_APPROVAL
+    assert still_waiting.plan is not None and still_waiting.plan.summary == "Revised"
+    assert storage.get_active_decision(run.id) == second
+    with pytest.raises(InvalidRunAction, match="different response"):
+        await manager.decide_plan(
+            run.id,
+            PlanDecision(decision="approve"),
+            request_id=first.request_id,
+        )
+
+    await manager.decide_plan(
+        run.id, PlanDecision(decision="approve"), request_id=second.request_id
+    )
+    completed = await manager.wait(run.id)
+    assert completed.state is RunState.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_stale_clarification_retry_does_not_answer_the_next_round(
+    settings: Settings, storage: Storage
+) -> None:
+    def question(call_id: str) -> ModelResponse:
+        return ModelResponse(
+            tool_calls=[
+                ToolCall(
+                    id=call_id,
+                    name="ask_questions",
+                    arguments={
+                        "questions": [
+                            {
+                                "id": "choice",
+                                "prompt": "Choose one",
+                                "options": [
+                                    {"id": "a", "label": "A"},
+                                    {"id": "b", "label": "B"},
+                                ],
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+    manager = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [question("question-1"), question("question-2"), _direct_response("Done")]
+        ),
+    )
+    run = await manager.start_run("Clarify twice")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    first = storage.get_active_decision(run.id)
+    assert first is not None
+    first_answers = [ClarificationAnswer(question_id="choice", option_id="a")]
+    await manager.answer_clarification(
+        run.id, first_answers, request_id=first.request_id
+    )
+    async with asyncio.timeout(3):
+        while True:
+            waiting = storage.get_run(run.id)
+            second = storage.get_active_decision(run.id)
+            if (
+                waiting.state is RunState.AWAITING_CLARIFICATION
+                and waiting.clarification is not None
+                and waiting.clarification.round == 2
+                and second is not None
+                and second.request_id != first.request_id
+            ):
+                break
+            await asyncio.sleep(0.01)
+
+    await manager.answer_clarification(
+        run.id, first_answers, request_id=first.request_id
+    )
+    assert storage.get_active_decision(run.id) == second
+    assert storage.get_run(run.id).clarification is not None
+    with pytest.raises(InvalidRunAction, match="different response"):
+        await manager.answer_clarification(
+            run.id,
+            [ClarificationAnswer(question_id="choice", option_id="b")],
+            request_id=first.request_id,
+        )
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="choice", option_id="b")],
+        request_id=second.request_id,
+    )
+    completed = await manager.wait(run.id)
+    assert completed.state is RunState.ANSWERED
+
+
+@pytest.mark.asyncio
 async def test_verifier_failure_triggers_one_repair_cycle(
     settings: Settings, storage: Storage
 ) -> None:
@@ -3051,7 +3584,7 @@ async def test_cancel_abandons_pending_approval_and_stale_id_cannot_resolve_it(
 
 
 @pytest.mark.asyncio
-async def test_restart_abandons_pending_approval_without_replaying_action(
+async def test_restart_reopens_pending_approval_without_replaying_action(
     settings: Settings, storage: Storage
 ) -> None:
     first = AgentManager(
@@ -3085,16 +3618,12 @@ async def test_restart_abandons_pending_approval_without_replaying_action(
 
     interrupted = storage.get_run(run.id)
     assert interrupted.state is RunState.INTERRUPTED
-    assert interrupted.pending_approval is None
+    assert interrupted.pending_approval is not None
+    assert interrupted.pending_approval.id == approval.id
     assert interrupted.interrupted_from is RunState.AWAITING_ACTION_APPROVAL
-    abandoned = next(
-        event
-        for event in storage.get_events(run.id)
-        if event.type is EventType.APPROVAL_RESOLVED
-        and event.payload.get("outcome") == "abandoned"
-    )
-    assert abandoned.payload["approval_id"] == approval.id
-    assert abandoned.payload["cause"] == "process_shutdown"
+    receipt = storage.get_active_decision(run.id)
+    assert receipt is not None
+    assert receipt.request_id == approval.id
 
     second = AgentManager(
         settings,
@@ -3116,14 +3645,624 @@ async def test_restart_abandons_pending_approval_without_replaying_action(
         ),
     )
     await second.resume(run.id)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    reopened = storage.get_run(run.id).pending_approval
+    assert reopened is not None and reopened.id == approval.id
+    await second.decide_action(run.id, approval.id, approved=False)
     completed = await second.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED
-    assert not any(
-        event.type is EventType.TOOL_COMPLETED
+    events = storage.get_events(run.id)
+    pending_results = [
+        event
+        for event in events
+        if event.type is EventType.TOOL_COMPLETED
         and event.payload["call"]["id"] == "pending-command"
-        for event in storage.get_events(run.id)
+    ]
+    assert len(pending_results) == 1
+    assert pending_results[0].payload["result"]["ok"] is False
+    assert not any(
+        event.type is EventType.TOOL_STARTED
+        and event.payload.get("id") == "pending-command"
+        for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_accepted_clarification_crash_window_pairs_answer_exactly_once(
+    settings: Settings, storage: Storage
+) -> None:
+    first = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider([_question_response("question-call")]),
+    )
+    run = await first.start_run("Clarify durably")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    receipt = storage.get_active_decision(run.id)
+    assert receipt is not None
+    answers = [ClarificationAnswer(question_id="choice", option_id="a")]
+    storage.accept_decision(
+        run.id,
+        receipt.request_id,
+        DecisionKind.CLARIFICATION,
+        {"answers": [answer.model_dump(mode="json") for answer in answers]},
+    )
+
+    detached = storage.get_run(run.id)
+    first._append_clarification_answers(detached, answers, "question-call")
+    assert not any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "question-call"
+        for message in storage.get_run(run.id).messages
+    )
+    await first.shutdown()
+
+    second = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider([_direct_response("Clarification applied")]),
+    )
+    await second.resume(run.id)
+    completed = await second.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED
+    paired_answers = [
+        message
+        for message in completed.messages
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "question-call"
+    ]
+    assert len(paired_answers) == 1
+    assert "Clarification answers" not in str(completed.messages)
+
+
+@pytest.mark.asyncio
+async def test_restarted_clarification_rounds_ignore_reopen_events_and_reused_call_ids(
+    settings: Settings, storage: Storage
+) -> None:
+    first = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider([_question_response("reused-question", prompt="First choice?")]),
+    )
+    run = await first.start_run("Clarify twice across restarts")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    first_request = storage.get_active_decision(run.id)
+    assert first_request is not None
+    await first.shutdown()
+
+    second = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider([_question_response("reused-question", prompt="Second choice?")]),
+    )
+    await second.resume(run.id)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    assert storage.get_active_decision(run.id) == first_request
+    await second.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="choice", option_id="a")],
+        request_id=first_request.request_id,
+    )
+    async with asyncio.timeout(3):
+        while True:
+            waiting = storage.get_run(run.id)
+            second_request = storage.get_active_decision(run.id)
+            if (
+                waiting.state is RunState.AWAITING_CLARIFICATION
+                and waiting.clarification is not None
+                and waiting.clarification.round == 2
+                and second_request is not None
+                and second_request.request_id != first_request.request_id
+            ):
+                break
+            await asyncio.sleep(0.01)
+    await second.shutdown()
+
+    third = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider([_direct_response("Both rounds applied")]),
+    )
+    await third.resume(run.id)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    reopened_second = storage.get_active_decision(run.id)
+    assert reopened_second is not None
+    assert reopened_second.request_id == second_request.request_id
+    await third.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="choice", option_id="b")],
+        request_id=reopened_second.request_id,
+    )
+    completed = await third.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED
+    request_events = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.CLARIFICATION_REQUESTED
+    ]
+    assert len(request_events) == 4
+    assert len({event.payload["request_id"] for event in request_events}) == 2
+    assert sum(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "reused-question"
+        for message in completed.messages
+    ) == 2
+
+
+@pytest.mark.asyncio
+async def test_accepted_plan_revision_after_restart_pairs_submit_plan_call(
+    settings: Settings, storage: Storage
+) -> None:
+    first = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="plan-call",
+                            name="submit_plan",
+                            arguments=_review_plan(),
+                        )
+                    ]
+                )
+            ]
+        ),
+    )
+    run = await first.start_run(
+        "Revise durably",
+        verifier_enabled=False,
+        mode=InteractionMode.PLAN,
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    receipt = storage.get_active_decision(run.id)
+    assert receipt is not None
+    storage.accept_decision(
+        run.id,
+        receipt.request_id,
+        DecisionKind.PLAN,
+        {"decision": "revise", "feedback": "Narrow the scope"},
+    )
+    await first.shutdown()
+
+    revised_plan = {**_review_plan(), "summary": "Narrow revised plan"}
+    second_provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="revised-plan",
+                        name="submit_plan",
+                        arguments=revised_plan,
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-revised",
+                        name="finish",
+                        arguments={"summary": "Applied revised plan"},
+                    )
+                ]
+            ),
+        ]
+    )
+    second = AgentManager(settings, storage, second_provider)
+    await second.resume(run.id)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+
+    planner_messages = second_provider.requests[0][0]
+    paired = [
+        message
+        for message in planner_messages
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "plan-call"
+    ]
+    assert len(paired) == 1
+    assert "Narrow the scope" in str(paired[0].get("content"))
+    revised_request = storage.get_active_decision(run.id)
+    assert revised_request is not None
+    await second.decide_plan(
+        run.id,
+        PlanDecision(decision="approve"),
+        request_id=revised_request.request_id,
+    )
+    assert (await second.wait(run.id)).state is RunState.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_rejected_action_result_survives_crash_after_decision_consumption(
+    settings: Settings, storage: Storage
+) -> None:
+    first = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="rejected-action",
+                            name="run_command",
+                            arguments={"argv": ["python", "app.py"]},
+                        )
+                    ]
+                ),
+            ]
+        ),
+    )
+    run = await first.start_run(
+        "Reject durably",
+        verifier_enabled=False,
+        approval_mode=ApprovalMode.MANUAL,
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    waiting = storage.get_run(run.id)
+    approval = waiting.pending_approval
+    assert approval is not None
+    storage.accept_decision(
+        run.id,
+        approval.id,
+        DecisionKind.ACTION,
+        {"approved": False},
+    )
+    permission = first.tools.resolve_permission(
+        approval.tool_call,
+        waiting.plan,
+        waiting.approval_mode,
+    )
+    persisted_result = await first._consume_action_decision(
+        waiting,
+        approval,
+        permission,
+        False,
+    )
+    assert persisted_result is not None
+    await first.shutdown()
+
+    second = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish-after-rejection",
+                            name="finish",
+                            arguments={"summary": "Preserved rejection"},
+                        )
+                    ]
+                )
+            ]
+        ),
+    )
+    await second.resume(run.id)
+    completed = await second.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    rejected_messages = [
+        message
+        for message in completed.messages
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "rejected-action"
+    ]
+    assert len(rejected_messages) == 1
+    assert "User rejected this action" in str(rejected_messages[0]["content"])
+    assert "stopped before this tool call completed" not in str(completed.messages)
+    completed_events = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TOOL_COMPLETED
+        and event.payload.get("approval_request_id") == approval.id
+    ]
+    assert len(completed_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_accepted_plan_survives_crash_before_worker_notification(
+    settings: Settings, storage: Storage
+) -> None:
+    first = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ]
+                )
+            ]
+        ),
+    )
+    run = await first.start_run(
+        "Resume an accepted plan", verifier_enabled=False, mode=InteractionMode.PLAN
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    receipt = storage.get_active_decision(run.id)
+    assert receipt is not None
+    storage.accept_decision(
+        run.id,
+        receipt.request_id,
+        DecisionKind.PLAN,
+        {"decision": "approve", "feedback": ""},
+    )
+    await first.shutdown()
+
+    interrupted = storage.get_run(run.id)
+    assert interrupted.state is RunState.INTERRUPTED
+    assert storage.get_active_decision(run.id) is not None
+    second = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish",
+                            name="finish",
+                            arguments={"summary": "Finished after durable approval"},
+                        )
+                    ]
+                )
+            ]
+        ),
+    )
+    await second.resume(run.id)
+    completed = await second.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    consumed = storage.get_decision(run.id, receipt.request_id)
+    assert consumed.status is DecisionStatus.CONSUMED
+    resumed = next(
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.RUN_RESUMED
+    )
+    assert resumed.payload["strategy"] == "consume_accepted_plan"
+
+
+@pytest.mark.asyncio
+async def test_accepted_action_before_crash_executes_once_after_explicit_resume(
+    settings: Settings, storage: Storage
+) -> None:
+    first = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="create",
+                            name="create_file",
+                            arguments={"path": "resumed.txt", "content": "once\n"},
+                        )
+                    ]
+                ),
+            ]
+        ),
+    )
+    run = await first.start_run(
+        "Create once",
+        verifier_enabled=False,
+        approval_mode=ApprovalMode.MANUAL,
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    approval = storage.get_run(run.id).pending_approval
+    assert approval is not None
+    storage.accept_decision(
+        run.id,
+        approval.id,
+        DecisionKind.ACTION,
+        {"approved": True},
+    )
+    await first.shutdown()
+    assert not (settings.workspace / "resumed.txt").exists()
+
+    second = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish",
+                            name="finish",
+                            arguments={"summary": "Created once after resume"},
+                        )
+                    ]
+                )
+            ]
+        ),
+    )
+    await second.resume(run.id)
+    completed = await second.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    assert (settings.workspace / "resumed.txt").read_text() == "once\n"
+    events = storage.get_events(run.id)
+    assert sum(
+        event.type is EventType.TOOL_STARTED and event.payload.get("id") == "create"
+        for event in events
+    ) == 1
+    receipt = storage.get_decision(run.id, approval.id)
+    assert receipt.status is DecisionStatus.CONSUMED
+    assert receipt.execution_started_at is not None
+
+
+@pytest.mark.asyncio
+async def test_started_approved_action_is_uncertain_and_never_replayed_after_crash(
+    settings: Settings, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execute_started = asyncio.Event()
+    never_release = asyncio.Event()
+    execute_calls = 0
+    first = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="write", name="list_files", arguments={})
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="write",
+                            name="create_file",
+                            arguments={"path": "must-not-replay.txt", "content": "x\n"},
+                        )
+                    ]
+                ),
+            ]
+        ),
+    )
+    original_execute = first.tools.execute
+
+    async def block_after_start(
+        run_id: str,
+        call: ToolCall,
+        *,
+        sandbox_bypass: bool = False,
+    ) -> ToolResult:
+        nonlocal execute_calls
+        if call.name != "create_file":
+            return await original_execute(
+                run_id,
+                call,
+                sandbox_bypass=sandbox_bypass,
+            )
+        execute_calls += 1
+        execute_started.set()
+        await never_release.wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(first.tools, "execute", block_after_start)
+    run = await first.start_run(
+        "Do not replay",
+        verifier_enabled=False,
+        approval_mode=ApprovalMode.MANUAL,
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    approval = storage.get_run(run.id).pending_approval
+    assert approval is not None
+    await first.decide_action(run.id, approval.id, approved=True)
+    await asyncio.wait_for(execute_started.wait(), timeout=3)
+    await first.shutdown()
+    assert execute_calls == 1
+
+    second = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish",
+                            name="finish",
+                            arguments={"summary": "Inspected uncertain action"},
+                        )
+                    ]
+                )
+            ]
+        ),
+    )
+    await second.resume(run.id)
+    completed = await second.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    assert execute_calls == 1
+    assert not (settings.workspace / "must-not-replay.txt").exists()
+    uncertain = storage.get_decision(run.id, approval.id)
+    assert uncertain.status is DecisionStatus.UNCERTAIN
+    resumed = next(
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.RUN_RESUMED
+    )
+    assert resumed.payload["uncertain_action_approvals"] == 1
+
+
+@pytest.mark.asyncio
+async def test_user_cancel_marks_a_started_approved_action_uncertain(
+    settings: Settings, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execute_started = asyncio.Event()
+    never_release = asyncio.Event()
+    manager = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="write",
+                            name="create_file",
+                            arguments={"path": "cancelled-action.txt", "content": "x\n"},
+                        )
+                    ]
+                ),
+            ]
+        ),
+    )
+
+    async def block_after_start(*_args: object, **_kwargs: object) -> ToolResult:
+        execute_started.set()
+        await never_release.wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(manager.tools, "execute", block_after_start)
+    run = await manager.start_run(
+        "Cancel after action start",
+        verifier_enabled=False,
+        approval_mode=ApprovalMode.MANUAL,
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    approval = storage.get_run(run.id).pending_approval
+    assert approval is not None
+    await manager.decide_action(run.id, approval.id, approved=True)
+    await asyncio.wait_for(execute_started.wait(), timeout=3)
+
+    cancelled = await manager.cancel(run.id)
+
+    assert cancelled.state is RunState.CANCELLED
+    receipt = storage.get_decision(run.id, approval.id)
+    assert receipt.status is DecisionStatus.UNCERTAIN
+    assert receipt.execution_started_at is not None
+    assert not (settings.workspace / "cancelled-action.txt").exists()
 
 
 @pytest.mark.asyncio

@@ -74,6 +74,7 @@ import type {
   ProviderProbe,
   ProviderUpdate,
   ReasoningEffort,
+  RollbackResult,
   Run,
   RunEvent,
   RunState,
@@ -425,30 +426,24 @@ export default function App() {
               provider={forge.provider}
               providerReady={providerReady}
               followUpEnabled={forge.status?.mode !== "demo"}
-              onAnswer={(answers) => {
-                void forge.answerQuestions(answers)?.catch(() => undefined);
-              }}
-              onPlan={(decision, feedback) => {
-                void forge.decidePlan(decision, feedback)?.catch(() => undefined);
-              }}
-              onAction={(approved) => {
-                void forge.decideAction(approved)?.catch(() => undefined);
-              }}
+              rollbackResult={forge.rollbackResult}
+              onAnswer={forge.answerQuestions}
+              onPlan={forge.decidePlan}
+              onAction={forge.decideAction}
               onCancel={() => {
                 void forge.cancel()?.catch(() => undefined);
               }}
               onResume={() => {
                 void forge.resume()?.catch(() => undefined);
               }}
-              onRollback={() => {
-                void forge.rollback()?.catch(() => undefined);
-              }}
+              onRollback={forge.rollback}
               onProof={(turnIndex) => {
                 const runId = forge.run!.id;
                 setProofSelection({ runId, turnIndex });
                 void forge.loadProofPack(runId, turnIndex).catch(() => undefined);
               }}
               onOpenWorkspace={() => forge.openWorkspace(forge.run!.id)}
+              onSelectRun={forge.selectRun}
               onFollowUp={async (prompt, mode, approvalMode, reasoningEffort) => {
                 await forge.followUp(prompt, mode, approvalMode, reasoningEffort);
               }}
@@ -1512,22 +1507,26 @@ function RunStage({
   onRollback,
   onProof,
   onOpenWorkspace,
+  onSelectRun,
   onFollowUp,
   followUpEnabled,
+  rollbackResult,
 }: {
   run: Run;
   events: RunEvent[];
   provider: ProviderConfig | null;
   providerReady: boolean;
   followUpEnabled: boolean;
-  onAnswer: (answers: ClarificationAnswer[]) => void;
-  onPlan: (decision: "approve" | "revise", feedback?: string) => void;
-  onAction: (approved: boolean) => void;
+  rollbackResult: RollbackResult | null;
+  onAnswer: (answers: ClarificationAnswer[]) => Promise<void>;
+  onPlan: (decision: "approve" | "revise", feedback?: string) => Promise<void>;
+  onAction: (approved: boolean) => Promise<void>;
   onCancel: () => void;
   onResume: () => void;
-  onRollback: () => void;
+  onRollback: () => Promise<RollbackResult>;
   onProof: (turnIndex: number) => void;
   onOpenWorkspace: () => Promise<unknown>;
+  onSelectRun: (runId: string) => void;
   onFollowUp: (
     prompt: string,
     mode: InteractionMode,
@@ -1537,6 +1536,7 @@ function RunStage({
 }) {
   const [confirmRollback, setConfirmRollback] = useState(false);
   const [openingWorkspace, setOpeningWorkspace] = useState(false);
+  const rollbackSummaryRef = useRef<HTMLDivElement>(null);
   const answeredTaskHasEdits = run.state === "answered"
     && run.turns.some((turn) => turn.changed_files.length > 0);
   const proofTurnIndexes = availableProofTurnIndexes(run);
@@ -1549,6 +1549,7 @@ function RunStage({
   const historicalProofTurnIndex = run.state === "succeeded"
     ? proofTurnIndexes.filter((turnIndex) => turnIndex !== currentTurnIndex).at(-1) ?? null
     : latestProofTurnIndex;
+  const effectiveRollbackResult = rollbackResult ?? latestRollbackResult(events);
   return (
     <div className="run-stage">
       <div className="run-header">
@@ -1560,6 +1561,9 @@ function RunStage({
             <ReasoningEffortBadge effort={run.reasoning_effort} />
             <span>{run.mode === "plan" ? "计划模式" : "普通 Agent"} · 第 {Math.max(run.turns.length, 1)} 轮</span>
             <span>任务 {run.id.slice(0, 8).toUpperCase()}</span>
+            {run.parent_run_id && (
+              <span title={`回滚前任务 ${run.parent_run_id}`}>续自回滚任务 {run.parent_run_id.slice(0, 8).toUpperCase()}</span>
+            )}
           </div>
           <h2 title={run.task}>{taskTitle(run)}</h2>
         </div>
@@ -1597,13 +1601,27 @@ function RunStage({
       <ActivityFeed run={run} events={events} />
       <div className="interaction-dock">
         {run.state === "awaiting_clarification" && run.clarification && (
-          <ClarificationPanel request={run.clarification} onSubmit={onAnswer} />
+          <ClarificationPanel
+            key={run.decision_request_id ?? `clarification:${run.clarification.round}`}
+            request={run.clarification}
+            onSubmit={onAnswer}
+          />
         )}
         {run.state === "awaiting_plan_approval" && run.plan && (
-          <PlanPanel runId={run.id} plan={run.plan} gate={run.plan_gate} onDecision={onPlan} />
+          <PlanPanel
+            key={run.decision_request_id ?? `plan:${run.updated_at}`}
+            runId={run.id}
+            plan={run.plan}
+            gate={run.plan_gate}
+            onDecision={onPlan}
+          />
         )}
         {run.state === "awaiting_action_approval" && run.pending_approval && (
-          <ApprovalPanel approval={run.pending_approval} onDecision={onAction} />
+          <ApprovalPanel
+            key={run.pending_approval.id}
+            approval={run.pending_approval}
+            onDecision={onAction}
+          />
         )}
         {run.state === "interrupted" && (
           <Notice icon={<Pause size={18} />} title="任务已安全暂停">
@@ -1622,6 +1640,14 @@ function RunStage({
             本轮没有修改文件、运行命令或生成完成证明；需要继续分析或开始实施时，直接在下方输入即可。
           </Notice>
         )}
+        {run.state === "rolled_back" && (
+          <RollbackSummary
+            result={effectiveRollbackResult}
+            successorRunId={run.successor_run_id}
+            onOpenSuccessor={onSelectRun}
+            focusRef={rollbackSummaryRef}
+          />
+        )}
         {run.error && <Notice icon={<OctagonX size={18} />} title={run.state === "interrupted" ? "暂停原因" : "停止原因"} danger={run.state !== "interrupted"}>{systemMessageLabel(run.error)}</Notice>}
         {run.state === "succeeded" && (
           <CompletionSummary
@@ -1633,7 +1659,7 @@ function RunStage({
         {historicalProofTurnIndex !== null && currentProofTurnIndex === null && (
           <HistoricalProofSummary turnIndex={historicalProofTurnIndex} onProof={onProof} />
         )}
-        {followUpEnabled && ["answered", "succeeded", "failed", "cancelled"].includes(run.state) && (
+        {followUpEnabled && ["answered", "succeeded", "failed", "cancelled", "rolled_back"].includes(run.state) && !(run.state === "rolled_back" && run.successor_run_id) && (
           <FollowUpComposer
             key={`${run.id}:${run.turns.length}`}
             defaultApprovalMode={run.approval_mode}
@@ -1647,9 +1673,10 @@ function RunStage({
       {confirmRollback && (
         <RollbackDialog
           onClose={() => setConfirmRollback(false)}
-          onConfirm={() => {
+          onConfirm={async () => {
+            await onRollback();
             setConfirmRollback(false);
-            onRollback();
+            window.requestAnimationFrame(() => rollbackSummaryRef.current?.focus());
           }}
         />
       )}
@@ -1657,25 +1684,55 @@ function RunStage({
   );
 }
 
-function RollbackDialog({ onClose, onConfirm }: { onClose: () => void; onConfirm: () => void }) {
-  const { dialogRef, onDialogKeyDown } = useDialogFocus(onClose);
+function RollbackDialog({
+  onClose,
+  onConfirm,
+}: {
+  onClose: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const close = () => {
+    if (!submittingRef.current) onClose();
+  };
+  const { dialogRef, onDialogKeyDown } = useDialogFocus(close);
   return (
     <div className="modal-backdrop" role="presentation">
-      <section ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="rollback-title" tabIndex={-1} onKeyDown={onDialogKeyDown}>
+      <section ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="rollback-title" aria-busy={submitting} tabIndex={-1} onKeyDown={onDialogKeyDown}>
         <div className="modal-heading">
           <div><p className="eyebrow">冲突感知回滚</p><h2 id="rollback-title">回滚本次运行？</h2></div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="关闭回滚确认"><X size={17} /></button>
+          <button className="icon-button" type="button" onClick={close} disabled={submitting} aria-label="关闭回滚确认"><X size={17} /></button>
         </div>
         <p className="modal-copy">
           TraceForge 会恢复本次任务记录过的文件修改。用户之后的编辑会作为冲突保留；
           回滚一旦完成，无法自动重做。
         </p>
+        {localError && <p className="decision-error" role="alert">{systemMessageLabel(localError)}</p>}
         <div className="modal-actions">
-          <span>只处理本次任务记录的快照。</span>
+          <span>{submitting ? "正在核对快照与用户后续修改…" : "只处理本次任务记录的快照。"}</span>
           <div className="button-row">
-            <button className="button ghost" type="button" onClick={onClose} data-dialog-initial-focus>取消</button>
-            <button className="button warning" type="button" onClick={onConfirm}>
-              <RotateCcw size={14} /> 回滚文件
+            <button className="button ghost" type="button" onClick={close} disabled={submitting} data-dialog-initial-focus>取消</button>
+            <button
+              className="button warning"
+              type="button"
+              disabled={submitting}
+              onClick={() => {
+                if (submittingRef.current) return;
+                submittingRef.current = true;
+                setSubmitting(true);
+                setLocalError(null);
+                void onConfirm()
+                  .catch((reason: unknown) => {
+                    submittingRef.current = false;
+                    setLocalError(reason instanceof Error ? reason.message : String(reason));
+                    setSubmitting(false);
+                  });
+              }}
+            >
+              {submitting ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />}
+              {submitting ? "正在回滚" : "回滚文件"}
             </button>
           </div>
         </div>
@@ -1860,15 +1917,24 @@ function ToolActivityItem({ event }: { event: RunEvent }) {
   );
 }
 
-function ClarificationPanel({ request, onSubmit }: { request: NonNullable<Run["clarification"]>; onSubmit: (answers: ClarificationAnswer[]) => void }) {
+function ClarificationPanel({
+  request,
+  onSubmit,
+}: {
+  request: NonNullable<Run["clarification"]>;
+  onSubmit: (answers: ClarificationAnswer[]) => Promise<void>;
+}) {
   const [selected, setSelected] = useState<Record<string, string>>({});
   const [custom, setCustom] = useState<Record<string, string>>({});
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const [localError, setLocalError] = useState<string | null>(null);
   const complete = request.questions.every((question) => selected[question.id] || custom[question.id]?.trim());
   return (
-    <div className="decision-panel clarification-panel">
+    <div className="decision-panel clarification-panel" aria-busy={submitting}>
       <div className="decision-heading"><MessageSquareMore size={19} /><div><p>需求澄清 · 第 {request.round} 轮</p><h3>这些选择会影响具体实现</h3></div></div>
       {request.questions.map((question) => (
-        <fieldset key={question.id}>
+        <fieldset key={question.id} disabled={submitting}>
           <legend>{question.prompt}</legend>
           <div className="option-grid">
             {question.options.map((option) => (
@@ -1901,32 +1967,122 @@ function ClarificationPanel({ request, onSubmit }: { request: NonNullable<Run["c
           </div>
         </fieldset>
       ))}
-      <div className="decision-actions"><span className="muted">TraceForge 会依据这些选择重新规划。</span><button className="button primary" type="button" disabled={!complete} onClick={() => onSubmit(request.questions.map((question) => custom[question.id]?.trim() ? { question_id: question.id, custom_text: custom[question.id].trim() } : { question_id: question.id, option_id: selected[question.id] }))}><Send size={15} /> 继续</button></div>
+      {localError && <p className="decision-error" role="alert">{systemMessageLabel(localError)}</p>}
+      <div className="decision-actions">
+        <span className="muted">{submitting ? "答复已持久接收，正在应用…" : "TraceForge 会依据这些选择重新规划。"}</span>
+        <button
+          className="button primary"
+          type="button"
+          disabled={!complete || submitting}
+          onClick={() => {
+            if (submittingRef.current) return;
+            const answers = request.questions.map((question) => (
+              custom[question.id]?.trim()
+                ? { question_id: question.id, custom_text: custom[question.id].trim() }
+                : { question_id: question.id, option_id: selected[question.id] }
+            ));
+            submittingRef.current = true;
+            setSubmitting(true);
+            setLocalError(null);
+            void onSubmit(answers).catch((reason: unknown) => {
+              submittingRef.current = false;
+              setLocalError(reason instanceof Error ? reason.message : String(reason));
+              setSubmitting(false);
+            });
+          }}
+        >
+          {submitting ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}
+          {submitting ? "正在提交" : "继续"}
+        </button>
+      </div>
     </div>
   );
 }
 
-function PlanPanel({ runId, plan, gate, onDecision }: { runId: string; plan: TaskPlan; gate: PlanGate | null; onDecision: (decision: "approve" | "revise", feedback?: string) => void }) {
+function PlanPanel({
+  runId,
+  plan,
+  gate,
+  onDecision,
+}: {
+  runId: string;
+  plan: TaskPlan;
+  gate: PlanGate | null;
+  onDecision: (decision: "approve" | "revise", feedback?: string) => Promise<void>;
+}) {
   const [revising, setRevising] = useState(false);
   const [feedback, setFeedback] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const submit = (decision: "approve" | "revise", revision = "") => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    setLocalError(null);
+    void onDecision(decision, revision).catch((reason: unknown) => {
+      submittingRef.current = false;
+      setLocalError(reason instanceof Error ? reason.message : String(reason));
+      setSubmitting(false);
+    });
+  };
   return (
-    <div className="decision-panel plan-panel">
+    <div className="decision-panel plan-panel" aria-busy={submitting}>
       <div className="decision-heading"><ClipboardCheck size={19} /><div><p>计划审批</p><h3>{plan.summary}</h3></div></div>
       {gate && <PlanGateSummary gate={gate} />}
       <div className="plan-document"><ReactMarkdown>{plan.markdown}</ReactMarkdown></div>
-      {revising && <textarea className="revision-input" autoFocus placeholder="这份计划需要怎样调整？" value={feedback} onChange={(event) => setFeedback(event.target.value)} />}
-      <div className="decision-actions"><a className="button ghost" href={`/api/runs/${runId}/plan.md`} download><Download size={14} /> 下载 Markdown</a><div className="button-row">{revising ? <><button className="button ghost" type="button" onClick={() => setRevising(false)}>返回</button><button className="button" type="button" disabled={!feedback.trim()} onClick={() => onDecision("revise", feedback.trim())}>提交修改意见</button></> : <><button className="button ghost" type="button" onClick={() => setRevising(true)}>调整计划</button><button className="button primary" type="button" onClick={() => onDecision("approve")}><Check size={15} /> 批准并执行</button></>}</div></div>
+      {revising && <textarea className="revision-input" autoFocus disabled={submitting} placeholder="这份计划需要怎样调整？" value={feedback} onChange={(event) => setFeedback(event.target.value)} />}
+      {localError && <p className="decision-error" role="alert">{systemMessageLabel(localError)}</p>}
+      <div className="decision-actions">
+        <a className="button ghost" href={`/api/runs/${runId}/plan.md`} download><Download size={14} /> 下载 Markdown</a>
+        <div className="button-row">
+          {revising ? <>
+            <button className="button ghost" type="button" disabled={submitting} onClick={() => setRevising(false)}>返回</button>
+            <button className="button" type="button" disabled={!feedback.trim() || submitting} onClick={() => submit("revise", feedback.trim())}>
+              {submitting && <LoaderCircle className="spin" size={14} />}
+              {submitting ? "正在提交" : "提交修改意见"}
+            </button>
+          </> : <>
+            <button className="button ghost" type="button" disabled={submitting} onClick={() => setRevising(true)}>调整计划</button>
+            <button className="button primary" type="button" disabled={submitting} onClick={() => submit("approve")}>
+              {submitting ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}
+              {submitting ? "正在批准" : "批准并执行"}
+            </button>
+          </>}
+        </div>
+      </div>
     </div>
   );
 }
 
-function ApprovalPanel({ approval, onDecision }: { approval: NonNullable<Run["pending_approval"]>; onDecision: (approved: boolean) => void }) {
+function ApprovalPanel({
+  approval,
+  onDecision,
+}: {
+  approval: NonNullable<Run["pending_approval"]>;
+  onDecision: (approved: boolean) => Promise<void>;
+}) {
+  const [submitting, setSubmitting] = useState<"approve" | "reject" | null>(null);
+  const submittingRef = useRef(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const submit = (approved: boolean) => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(approved ? "approve" : "reject");
+    setLocalError(null);
+    void onDecision(approved).catch((reason: unknown) => {
+      submittingRef.current = false;
+      setLocalError(reason instanceof Error ? reason.message : String(reason));
+      setSubmitting(null);
+    });
+  };
   return (
-    <div className="decision-panel approval-panel">
+    <div className="decision-panel approval-panel" aria-busy={Boolean(submitting)}>
       <div className="decision-heading"><AlertTriangle size={19} /><div><p>动作审批 · {approvalModeLabel(approval.approval_mode)} · {riskLabel(approval.risk)}</p><h3>{approval.summary}</h3></div></div>
       <p className="approval-reason">{approval.reason}</p>
       <pre>{JSON.stringify(approval.tool_call.arguments, null, 2)}</pre>
-      <div className="decision-actions"><span className="muted">{approval.sandbox_bypass_on_approve ? "批准后将仅本次绕过 OS 沙箱；凭证环境仍会清理。" : "批准不会主动绕过命令沙箱；主机若显示“仅策略限制”，则仍无 OS 级隔离。"} 工作区路径规则与证据记录始终保留。</span><div className="button-row"><button className="button danger-ghost" type="button" onClick={() => onDecision(false)}>拒绝</button><button className="button warning" type="button" onClick={() => onDecision(true)}>{approval.sandbox_bypass_on_approve ? "绕过并批准一次" : "批准并继续"}</button></div></div>
+      {localError && <p className="decision-error" role="alert">{systemMessageLabel(localError)}</p>}
+      <div className="decision-actions"><span className="muted">{submitting ? "决策已持久接收，正在进入下一步…" : <>{approval.sandbox_bypass_on_approve ? "批准后将仅本次绕过 OS 沙箱；凭证环境仍会清理。" : "批准不会主动绕过命令沙箱；主机若显示“仅策略限制”，则仍无 OS 级隔离。"} 工作区路径规则与证据记录始终保留。</>}</span><div className="button-row"><button className="button danger-ghost" type="button" disabled={Boolean(submitting)} onClick={() => submit(false)}>{submitting === "reject" && <LoaderCircle className="spin" size={14} />} {submitting === "reject" ? "正在拒绝" : "拒绝"}</button><button className="button warning" type="button" disabled={Boolean(submitting)} onClick={() => submit(true)}>{submitting === "approve" && <LoaderCircle className="spin" size={14} />} {submitting === "approve" ? "正在批准" : approval.sandbox_bypass_on_approve ? "绕过并批准一次" : "批准并继续"}</button></div></div>
     </div>
   );
 }
@@ -1977,6 +2133,88 @@ function HistoricalProofSummary({
   );
 }
 
+function RollbackSummary({
+  result,
+  successorRunId,
+  onOpenSuccessor,
+  focusRef,
+}: {
+  result: RollbackResult | null;
+  successorRunId: string | null;
+  onOpenSuccessor: (runId: string) => void;
+  focusRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const successorButton = successorRunId ? (
+    <button
+      className="button ghost"
+      type="button"
+      onClick={() => onOpenSuccessor(successorRunId)}
+    >
+      <ArrowRight size={14} /> 打开续跑任务
+    </button>
+  ) : null;
+  if (!result) {
+    return (
+      <div className="rollback-summary-focus" ref={focusRef} tabIndex={-1}>
+        <Notice icon={<RotateCcw size={18} />} title="本次任务已回滚">
+          <div className="rollback-result">
+            <p>回滚记录已持久保存。旧任务保留为审计历史；继续修改时会创建新的安全快照边界。</p>
+            {successorButton}
+          </div>
+        </Notice>
+      </div>
+    );
+  }
+  const changed = result.restored.length + result.removed.length;
+  return (
+    <div className="rollback-summary-focus" ref={focusRef} tabIndex={-1}>
+      <Notice
+        icon={result.conflicts.length ? <AlertTriangle size={18} /> : <RotateCcw size={18} />}
+        title={result.conflicts.length ? "已回滚，用户后续修改已保留" : "本次任务已安全回滚"}
+        danger={false}
+      >
+        <div className="rollback-result">
+          <p>
+            {changed} 个文件已恢复或移除；{result.conflicts.length
+              ? `${result.conflicts.length} 个冲突文件未覆盖。`
+              : "没有检测到冲突。"}
+          </p>
+          {result.restored.length > 0 && <RollbackFileGroup label="已恢复" paths={result.restored} />}
+          {result.removed.length > 0 && <RollbackFileGroup label="已移除" paths={result.removed} />}
+          {result.conflicts.length > 0 && <RollbackFileGroup label="保留冲突" paths={result.conflicts} />}
+          {successorButton}
+        </div>
+      </Notice>
+    </div>
+  );
+}
+
+function RollbackFileGroup({ label, paths }: { label: string; paths: string[] }) {
+  return (
+    <details>
+      <summary>{label} · {paths.length}</summary>
+      <ul>{paths.map((path) => <li key={path}><code>{path}</code></li>)}</ul>
+    </details>
+  );
+}
+
+function latestRollbackResult(events: RunEvent[]): RollbackResult | null {
+  const payload = [...events].reverse().find(
+    (event) => event.type === "rollback.completed",
+  )?.payload;
+  if (!payload) return null;
+  const paths = (key: keyof RollbackResult) => (
+    Array.isArray(payload[key])
+      ? payload[key].filter((value): value is string => typeof value === "string")
+      : []
+  );
+  return {
+    restored: paths("restored"),
+    removed: paths("removed"),
+    conflicts: paths("conflicts"),
+  };
+}
+
 function FollowUpComposer({
   defaultApprovalMode,
   defaultReasoningEffort,
@@ -2007,6 +2245,7 @@ function FollowUpComposer({
     ),
   );
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const supportedReasoning = provider?.supported_reasoning_efforts
     ?? DEFAULT_REASONING_EFFORTS;
   const effectiveReasoningEffort = supportedReasoningEffort(
@@ -2021,10 +2260,12 @@ function FollowUpComposer({
   return (
     <form
       className="follow-up-composer"
+      aria-busy={submitting}
       onSubmit={(event) => {
         event.preventDefault();
         const request = prompt.trim();
-        if (!request || submitting || !providerReady) return;
+        if (!request || submittingRef.current || !providerReady) return;
+        submittingRef.current = true;
         setSubmitting(true);
         persistApprovalMode(approvalMode);
         void onSubmit(
@@ -2035,10 +2276,14 @@ function FollowUpComposer({
         )
           .then(() => setPrompt(""))
           .catch(() => undefined)
-          .finally(() => setSubmitting(false));
+          .finally(() => {
+            submittingRef.current = false;
+            setSubmitting(false);
+          });
       }}
     >
       <textarea
+        disabled={submitting}
         value={prompt}
         onChange={(event) => setPrompt(event.target.value)}
         onKeyDown={(event) => {
@@ -2057,7 +2302,7 @@ function FollowUpComposer({
       />
       <div className="follow-up-actions">
         <label className="toggle-row">
-          <input type="checkbox" checked={planMode} onChange={(event) => setPlanMode(event.target.checked)} />
+          <input type="checkbox" disabled={submitting} checked={planMode} onChange={(event) => setPlanMode(event.target.checked)} />
           <span className="toggle" />
           <span><strong>计划模式</strong><small>本轮先审计划再执行</small></span>
         </label>
@@ -2066,6 +2311,7 @@ function FollowUpComposer({
           <select
             aria-label="本轮权限模式"
             value={approvalMode}
+            disabled={submitting}
             onChange={(event) => {
               const value = event.target.value as ApprovalMode;
               setApprovalMode(value);
@@ -2081,6 +2327,7 @@ function FollowUpComposer({
           value={effectiveReasoningEffort}
           onChange={setReasoningEffort}
           provider={provider}
+          disabled={submitting}
         />
         <span className="follow-up-hint">
           {providerReady
@@ -2299,7 +2546,7 @@ function StateBadge({ state }: { state: RunState }) {
 }
 
 function Notice({ icon, title, children, danger = false }: { icon: React.ReactNode; title: string; children: React.ReactNode; danger?: boolean }) {
-  return <div className={`notice ${danger ? "danger" : ""}`}><div>{icon}</div><div><strong>{title}</strong><p>{children}</p></div></div>;
+  return <div className={`notice ${danger ? "danger" : ""}`}><div>{icon}</div><div><strong>{title}</strong><div className="notice-copy">{children}</div></div></div>;
 }
 
 function formatArguments(value?: Record<string, unknown>): string {

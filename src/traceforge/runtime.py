@@ -22,6 +22,7 @@ from traceforge.models import (
     ProviderConfig,
     ReasoningEffort,
     RunRecord,
+    RunState,
     utc_now,
 )
 from traceforge.provider import ModelProvider, OpenAICompatibleProvider, ProviderError
@@ -317,7 +318,16 @@ class AgentRuntime:
     ) -> RunRecord:
         async with self._provider_lock:
             self.require_connection_verified()
-            return await self.manager_for_run(run_id).follow_up(
+            manager = self.manager_for_run(run_id)
+            if self.storage.get_run(run_id).state is RunState.ROLLED_BACK:
+                return await manager.continue_after_rollback(
+                    run_id,
+                    prompt,
+                    mode=mode,
+                    approval_mode=approval_mode,
+                    reasoning_effort=reasoning_effort,
+                )
+            return await manager.follow_up(
                 run_id,
                 prompt,
                 mode=mode,

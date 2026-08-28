@@ -40,6 +40,8 @@ from traceforge.models import (
     ClarificationAnswer,
     ClarificationRequest,
     ConversationTurn,
+    DecisionKind,
+    DecisionRequest,
     InteractionMode,
     PlanGate,
     ProjectRecord,
@@ -151,7 +153,12 @@ class ProviderProbeResponse(BaseModel):
 class ClarificationAnswersRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    request_id: str = Field(min_length=1, max_length=80)
     answers: list[ClarificationAnswer] = Field(min_length=1, max_length=3)
+
+
+class PlanDecisionRequest(PlanDecision):
+    request_id: str = Field(min_length=1, max_length=80)
 
 
 class ActionDecisionRequest(BaseModel):
@@ -203,10 +210,20 @@ class RunView(BaseModel):
     created_at: datetime
     updated_at: datetime
     proof_turn_indexes: list[int] = Field(default_factory=list)
+    decision_request_id: str | None = None
+    decision_kind: DecisionKind | None = None
+    parent_run_id: str | None = None
+    successor_run_id: str | None = None
 
     @classmethod
     def from_record(
-        cls, run: RunRecord, *, proof_turn_indexes: list[int] | None = None
+        cls,
+        run: RunRecord,
+        *,
+        proof_turn_indexes: list[int] | None = None,
+        decision: DecisionRequest | None = None,
+        parent_run_id: str | None = None,
+        successor_run_id: str | None = None,
     ) -> RunView:
         public = run.model_dump(
             exclude={
@@ -220,6 +237,10 @@ class RunView(BaseModel):
             run.messages
         )
         public["proof_turn_indexes"] = proof_turn_indexes or []
+        public["decision_request_id"] = decision.request_id if decision else None
+        public["decision_kind"] = decision.kind if decision else None
+        public["parent_run_id"] = parent_run_id
+        public["successor_run_id"] = successor_run_id
         return cls.model_validate(public)
 
 
@@ -262,6 +283,9 @@ def create_app(
         return RunView.from_record(
             run,
             proof_turn_indexes=storage.list_proof_pack_turn_indexes(run.id),
+            decision=storage.get_active_decision(run.id),
+            parent_run_id=storage.get_parent_run_id(run.id),
+            successor_run_id=storage.get_successor_run_id(run.id),
         )
 
     async def frozen_proof(
@@ -615,7 +639,9 @@ def create_app(
 
     @app.post("/api/runs/{run_id}/answers", status_code=status.HTTP_202_ACCEPTED)
     async def answer_questions(run_id: str, body: ClarificationAnswersRequest) -> dict[str, bool]:
-        await runtime.manager_for_run(run_id).answer_clarification(run_id, body.answers)
+        await runtime.manager_for_run(run_id).answer_clarification(
+            run_id, body.answers, request_id=body.request_id
+        )
         return {"accepted": True}
 
     @app.post("/api/runs/{run_id}/turns", response_model=RunView)
@@ -635,8 +661,12 @@ def create_app(
         return run_view(run)
 
     @app.post("/api/runs/{run_id}/plan-decision", status_code=status.HTTP_202_ACCEPTED)
-    async def decide_plan(run_id: str, body: PlanDecision) -> dict[str, bool]:
-        await runtime.manager_for_run(run_id).decide_plan(run_id, body)
+    async def decide_plan(run_id: str, body: PlanDecisionRequest) -> dict[str, bool]:
+        await runtime.manager_for_run(run_id).decide_plan(
+            run_id,
+            PlanDecision(decision=body.decision, feedback=body.feedback),
+            request_id=body.request_id,
+        )
         return {"accepted": True}
 
     @app.post(
@@ -646,9 +676,6 @@ def create_app(
     async def decide_action(
         run_id: str, approval_id: str, body: ActionDecisionRequest
     ) -> dict[str, bool]:
-        run = storage.get_run(run_id)
-        if run.pending_approval is None or run.pending_approval.id != approval_id:
-            raise HTTPException(status_code=409, detail="Approval is no longer pending")
         await runtime.manager_for_run(run_id).decide_action(
             run_id, approval_id, approved=body.approved
         )

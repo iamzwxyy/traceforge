@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -18,6 +19,9 @@ from traceforge.models import (
     ApprovalMode,
     ApprovalRequest,
     ClarificationRequest,
+    DecisionKind,
+    DecisionRequest,
+    DecisionStatus,
     EventType,
     InteractionMode,
     PlanGate,
@@ -47,6 +51,10 @@ class SnapshotRecord:
 
 class SecureCheckpointError(RuntimeError):
     """A WAL truncation needed for provider-private cleanup could not be confirmed."""
+
+
+class DecisionConflictError(RuntimeError):
+    """A durable user-decision request was stale, conflicting, or invalid."""
 
 
 class Storage:
@@ -196,6 +204,31 @@ class Storage:
                     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS decision_requests (
+                    run_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    turn_index INTEGER NOT NULL CHECK(turn_index >= 1),
+                    subject_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT,
+                    payload_sha256 TEXT,
+                    created_at TEXT NOT NULL,
+                    accepted_at TEXT,
+                    consumed_at TEXT,
+                    execution_started_at TEXT,
+                    PRIMARY KEY (run_id, request_id),
+                    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS run_lineage (
+                    child_run_id TEXT PRIMARY KEY,
+                    parent_run_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (child_run_id) REFERENCES runs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (parent_run_id) REFERENCES runs(id) ON DELETE RESTRICT
+                );
+
                 CREATE TABLE IF NOT EXISTS projects (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -227,6 +260,13 @@ class Storage:
 
                 CREATE INDEX IF NOT EXISTS idx_runs_workspace_updated
                     ON runs(workspace, updated_at DESC);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_requests_active
+                    ON decision_requests(run_id)
+                    WHERE status IN ('pending', 'accepted');
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_run_lineage_parent
+                    ON run_lineage(parent_run_id);
                 """
             )
             columns = {
@@ -382,7 +422,7 @@ class Storage:
                 )
             return len(rows)
 
-    def create_run(self, run: RunRecord) -> None:
+    def create_run(self, run: RunRecord, *, parent_run_id: str | None = None) -> None:
         with self._lock, self._connection:
             self._connection.execute(
                 """
@@ -398,6 +438,37 @@ class Storage:
                 """,
                 self._run_values(run),
             )
+            if parent_run_id is not None:
+                parent = self._connection.execute(
+                    "SELECT state FROM runs WHERE id = ?", (parent_run_id,)
+                ).fetchone()
+                if parent is None:
+                    raise KeyError(f"Parent run not found: {parent_run_id}")
+                if parent["state"] != RunState.ROLLED_BACK.value:
+                    raise ValueError("Only a rolled-back run can start a successor")
+                self._connection.execute(
+                    """
+                    INSERT INTO run_lineage(child_run_id, parent_run_id, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (run.id, parent_run_id, run.created_at.isoformat()),
+                )
+
+    def get_parent_run_id(self, run_id: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT parent_run_id FROM run_lineage WHERE child_run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return None if row is None else str(row["parent_run_id"])
+
+    def get_successor_run_id(self, run_id: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT child_run_id FROM run_lineage WHERE parent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return None if row is None else str(row["child_run_id"])
 
     def save_run(self, run: RunRecord) -> None:
         run.updated_at = utc_now()
@@ -588,6 +659,420 @@ class Storage:
                 (key, value),
             )
 
+    def get_decision(self, run_id: str, request_id: str) -> DecisionRequest:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM decision_requests WHERE run_id = ? AND request_id = ?",
+                (run_id, request_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Decision request not found: {request_id}")
+        return self._row_to_decision(row)
+
+    def get_active_decision(self, run_id: str) -> DecisionRequest | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM decision_requests
+                WHERE run_id = ? AND status IN (?, ?)
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (
+                    run_id,
+                    DecisionStatus.PENDING.value,
+                    DecisionStatus.ACCEPTED.value,
+                ),
+            ).fetchone()
+        return None if row is None else self._row_to_decision(row)
+
+    def open_decision(
+        self,
+        run: RunRecord,
+        *,
+        previous_state: RunState,
+        request_id: str,
+        kind: DecisionKind,
+        turn_index: int,
+        subject: dict[str, Any],
+        requested_event_type: EventType,
+        requested_payload: dict[str, Any],
+    ) -> tuple[DecisionRequest, list[RunEvent]]:
+        """Atomically expose a waiting run, its durable inbox row, and request event."""
+
+        if run.state is previous_state:
+            raise ValueError("A decision window must enter a distinct waiting state")
+        now = utc_now()
+        subject_sha256 = decision_payload_sha256(subject)
+        record = DecisionRequest(
+            run_id=run.id,
+            request_id=request_id,
+            kind=kind,
+            turn_index=turn_index,
+            subject_sha256=subject_sha256,
+            status=DecisionStatus.PENDING,
+            created_at=now,
+        )
+        with self._lock, self._connection:
+            current = self._connection.execute(
+                "SELECT state FROM runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Run not found: {run.id}")
+            if current["state"] != previous_state.value:
+                raise DecisionConflictError("Run state changed before the decision window opened")
+            active = self._connection.execute(
+                """
+                SELECT request_id FROM decision_requests
+                WHERE run_id = ? AND status IN (?, ?)
+                """,
+                (
+                    run.id,
+                    DecisionStatus.PENDING.value,
+                    DecisionStatus.ACCEPTED.value,
+                ),
+            ).fetchone()
+            if active is not None:
+                raise DecisionConflictError("Another decision request is already active")
+            run.updated_at = now
+            self._update_run_locked(run, expected_state=previous_state)
+            self._insert_decision_locked(record)
+            first_seq = self._next_event_seq_locked(run.id)
+            events = [
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq,
+                    type=EventType.STATE_CHANGED,
+                    payload={
+                        "state": run.state.value,
+                        "previous": previous_state.value,
+                    },
+                    created_at=now,
+                ),
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq + 1,
+                    type=requested_event_type,
+                    payload={
+                        **requested_payload,
+                        "request_id": request_id,
+                        "subject_sha256": subject_sha256,
+                    },
+                    created_at=now,
+                ),
+            ]
+            for event in events:
+                self._insert_event_locked(event)
+        return record, events
+
+    def reopen_decision(
+        self,
+        run: RunRecord,
+        request_id: str,
+        *,
+        previous_state: RunState,
+        requested_event_type: EventType,
+        requested_payload: dict[str, Any],
+    ) -> tuple[DecisionRequest, list[RunEvent]]:
+        """Re-expose a persisted pending/accepted request after explicit resume."""
+
+        now = utc_now()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM decision_requests WHERE run_id = ? AND request_id = ?",
+                (run.id, request_id),
+            ).fetchone()
+            if row is None:
+                raise DecisionConflictError("Decision request is no longer available")
+            record = self._row_to_decision(row)
+            if record.status not in {DecisionStatus.PENDING, DecisionStatus.ACCEPTED}:
+                raise DecisionConflictError("Decision request is no longer active")
+            current = self._connection.execute(
+                "SELECT state FROM runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Run not found: {run.id}")
+            if current["state"] != previous_state.value:
+                raise DecisionConflictError("Run state changed before decision recovery")
+            run.updated_at = now
+            self._update_run_locked(run, expected_state=previous_state)
+            first_seq = self._next_event_seq_locked(run.id)
+            events = [
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq,
+                    type=EventType.STATE_CHANGED,
+                    payload={
+                        "state": run.state.value,
+                        "previous": previous_state.value,
+                        "cause": "decision_reopened",
+                    },
+                    created_at=now,
+                ),
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq + 1,
+                    type=requested_event_type,
+                    payload={
+                        **requested_payload,
+                        "request_id": request_id,
+                        "subject_sha256": record.subject_sha256,
+                        "resumed": True,
+                    },
+                    created_at=now,
+                ),
+            ]
+            for event in events:
+                self._insert_event_locked(event)
+        return record, events
+
+    def accept_decision(
+        self,
+        run_id: str,
+        request_id: str,
+        kind: DecisionKind,
+        payload: dict[str, Any],
+    ) -> DecisionRequest:
+        """Persist a decision before HTTP acknowledges it; exact retries are idempotent."""
+
+        payload_sha256 = decision_payload_sha256(payload)
+        rendered = _canonical_json(payload)
+        now = utc_now()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM decision_requests WHERE run_id = ? AND request_id = ?",
+                (run_id, request_id),
+            ).fetchone()
+            if row is None:
+                raise DecisionConflictError("Decision request is unknown or expired")
+            record = self._row_to_decision(row)
+            if record.kind is not kind:
+                raise DecisionConflictError("Decision request kind does not match")
+            if record.status is DecisionStatus.PENDING:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE decision_requests
+                    SET status = ?, payload_json = ?, payload_sha256 = ?, accepted_at = ?
+                    WHERE run_id = ? AND request_id = ? AND status = ?
+                    """,
+                    (
+                        DecisionStatus.ACCEPTED.value,
+                        rendered,
+                        payload_sha256,
+                        now.isoformat(),
+                        run_id,
+                        request_id,
+                        DecisionStatus.PENDING.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise DecisionConflictError("Decision request changed while being accepted")
+            elif record.status in {
+                DecisionStatus.ACCEPTED,
+                DecisionStatus.CONSUMED,
+                DecisionStatus.UNCERTAIN,
+            }:
+                if record.payload_sha256 != payload_sha256:
+                    raise DecisionConflictError(
+                        "A different response was already submitted for this decision request"
+                    )
+                return record
+            else:
+                raise DecisionConflictError("Decision request was abandoned")
+            row = self._connection.execute(
+                "SELECT * FROM decision_requests WHERE run_id = ? AND request_id = ?",
+                (run_id, request_id),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_decision(row)
+
+    def consume_decision(
+        self,
+        run: RunRecord,
+        request_id: str,
+        kind: DecisionKind,
+        *,
+        previous_state: RunState,
+        resolved_event_type: EventType,
+        resolved_payload: dict[str, Any],
+        action_call_payload: dict[str, Any] | None = None,
+        completed_tool_payload: dict[str, Any] | None = None,
+    ) -> tuple[DecisionRequest, list[RunEvent]]:
+        """Atomically apply an accepted response, close its inbox row, and emit evidence."""
+
+        if (
+            action_call_payload is not None or completed_tool_payload is not None
+        ) and kind is not DecisionKind.ACTION:
+            raise ValueError("Only an action decision can persist tool execution evidence")
+        if action_call_payload is not None and completed_tool_payload is not None:
+            raise ValueError("An action cannot start and complete deterministically together")
+        now = utc_now()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM decision_requests WHERE run_id = ? AND request_id = ?",
+                (run.id, request_id),
+            ).fetchone()
+            if row is None:
+                raise DecisionConflictError("Decision request is no longer available")
+            record = self._row_to_decision(row)
+            if record.kind is not kind or record.status is not DecisionStatus.ACCEPTED:
+                raise DecisionConflictError("Decision request is not accepted and consumable")
+            current = self._connection.execute(
+                "SELECT state FROM runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Run not found: {run.id}")
+            if current["state"] != previous_state.value:
+                raise DecisionConflictError("Run state changed before decision consumption")
+            cursor = self._connection.execute(
+                """
+                UPDATE decision_requests
+                SET status = ?, consumed_at = ?, execution_started_at = ?
+                WHERE run_id = ? AND request_id = ? AND status = ?
+                """,
+                (
+                    DecisionStatus.CONSUMED.value,
+                    now.isoformat(),
+                    now.isoformat() if action_call_payload is not None else None,
+                    run.id,
+                    request_id,
+                    DecisionStatus.ACCEPTED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DecisionConflictError("Decision request changed before consumption")
+            run.updated_at = now
+            self._update_run_locked(run, expected_state=previous_state)
+            first_seq = self._next_event_seq_locked(run.id)
+            events = [
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq,
+                    type=resolved_event_type,
+                    payload={
+                        **resolved_payload,
+                        "request_id": request_id,
+                        "subject_sha256": record.subject_sha256,
+                    },
+                    created_at=now,
+                ),
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq + 1,
+                    type=EventType.STATE_CHANGED,
+                    payload={
+                        "state": run.state.value,
+                        "previous": previous_state.value,
+                    },
+                    created_at=now,
+                ),
+            ]
+            if action_call_payload is not None:
+                events.append(
+                    RunEvent(
+                        run_id=run.id,
+                        seq=first_seq + 2,
+                        type=EventType.TOOL_STARTED,
+                        payload={
+                            **action_call_payload,
+                            "approval_request_id": request_id,
+                        },
+                        created_at=now,
+                    )
+                )
+            if completed_tool_payload is not None:
+                events.append(
+                    RunEvent(
+                        run_id=run.id,
+                        seq=first_seq + 2,
+                        type=EventType.TOOL_COMPLETED,
+                        payload=completed_tool_payload,
+                        created_at=now,
+                    )
+                )
+            for event in events:
+                self._insert_event_locked(event)
+            row = self._connection.execute(
+                "SELECT * FROM decision_requests WHERE run_id = ? AND request_id = ?",
+                (run.id, request_id),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_decision(row), events
+
+    def abandon_decision(
+        self,
+        run: RunRecord,
+        request_id: str,
+        *,
+        event_type: EventType,
+        event_payload: dict[str, Any],
+    ) -> tuple[DecisionRequest, RunEvent]:
+        """Atomically clear a decision's run subject, close its inbox row, and audit it."""
+
+        now = utc_now()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM decision_requests WHERE run_id = ? AND request_id = ?",
+                (run.id, request_id),
+            ).fetchone()
+            if row is None:
+                raise DecisionConflictError("Decision request is no longer abandonable")
+            record = self._row_to_decision(row)
+            if record.status not in {DecisionStatus.PENDING, DecisionStatus.ACCEPTED}:
+                raise DecisionConflictError("Decision request is no longer abandonable")
+            cursor = self._connection.execute(
+                """
+                UPDATE decision_requests SET status = ?, consumed_at = ?
+                WHERE run_id = ? AND request_id = ? AND status IN (?, ?)
+                """,
+                (
+                    DecisionStatus.ABANDONED.value,
+                    now.isoformat(),
+                    run.id,
+                    request_id,
+                    DecisionStatus.PENDING.value,
+                    DecisionStatus.ACCEPTED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DecisionConflictError("Decision request is no longer abandonable")
+            run.updated_at = now
+            self._update_run_locked(run, expected_state=run.state)
+            event = RunEvent(
+                run_id=run.id,
+                seq=self._next_event_seq_locked(run.id),
+                type=event_type,
+                payload={
+                    **event_payload,
+                    "request_id": request_id,
+                    "kind": record.kind.value,
+                },
+                created_at=now,
+            )
+            self._insert_event_locked(event)
+            row = self._connection.execute(
+                "SELECT * FROM decision_requests WHERE run_id = ? AND request_id = ?",
+                (run.id, request_id),
+            ).fetchone()
+            assert row is not None
+            return self._row_to_decision(row), event
+
+    def mark_action_uncertain(self, run_id: str, request_id: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE decision_requests SET status = ?
+                WHERE run_id = ? AND request_id = ? AND kind = ? AND status = ?
+                  AND execution_started_at IS NOT NULL
+                """,
+                (
+                    DecisionStatus.UNCERTAIN.value,
+                    run_id,
+                    request_id,
+                    DecisionKind.ACTION.value,
+                    DecisionStatus.CONSUMED.value,
+                ),
+            )
+
     def append_event(
         self, run_id: str, event_type: EventType, payload: dict[str, Any] | None = None
     ) -> RunEvent:
@@ -696,6 +1181,52 @@ class Storage:
                 "DELETE FROM proof_backfill_candidates WHERE run_id = ?", (run.id,)
             )
         return terminal_events, stored
+
+    def commit_rollback(
+        self,
+        run: RunRecord,
+        *,
+        previous_state: RunState,
+        rollback_payload: dict[str, Any],
+    ) -> list[RunEvent]:
+        """Atomically publish the rolled-back state and its replayable result."""
+
+        if run.state is not RunState.ROLLED_BACK:
+            raise ValueError("Atomic rollback commit requires a rolled-back RunRecord")
+        now = utc_now()
+        with self._lock, self._connection:
+            current = self._connection.execute(
+                "SELECT state FROM runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Run not found: {run.id}")
+            if current["state"] != previous_state.value:
+                raise RuntimeError("Run state changed before its atomic rollback commit")
+            first_seq = self._next_event_seq_locked(run.id)
+            events = [
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq,
+                    type=EventType.STATE_CHANGED,
+                    payload={
+                        "state": RunState.ROLLED_BACK.value,
+                        "previous": previous_state.value,
+                    },
+                    created_at=now,
+                ),
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq + 1,
+                    type=EventType.ROLLBACK_COMPLETED,
+                    payload=rollback_payload,
+                    created_at=now,
+                ),
+            ]
+            run.updated_at = now
+            self._update_run_locked(run, expected_state=previous_state)
+            for event in events:
+                self._insert_event_locked(event)
+        return events
 
     def get_events(self, run_id: str, *, after_seq: int = 0) -> list[RunEvent]:
         with self._lock:
@@ -956,6 +1487,43 @@ class Storage:
             ),
         )
 
+    def _insert_decision_locked(self, decision: DecisionRequest) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO decision_requests(
+                run_id, request_id, kind, turn_index, subject_sha256, status,
+                payload_json, payload_sha256, created_at, accepted_at, consumed_at,
+                execution_started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision.run_id,
+                decision.request_id,
+                decision.kind.value,
+                decision.turn_index,
+                decision.subject_sha256,
+                decision.status.value,
+                _canonical_json(decision.payload) if decision.payload is not None else None,
+                decision.payload_sha256,
+                decision.created_at.isoformat(),
+                decision.accepted_at.isoformat() if decision.accepted_at else None,
+                decision.consumed_at.isoformat() if decision.consumed_at else None,
+                (
+                    decision.execution_started_at.isoformat()
+                    if decision.execution_started_at
+                    else None
+                ),
+            ),
+        )
+
+    def _next_event_seq_locked(self, run_id: str) -> int:
+        row = self._connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        assert row is not None
+        return int(row["seq"])
+
     @staticmethod
     def _row_to_run(row: sqlite3.Row) -> RunRecord:
         return RunRecord(
@@ -1001,11 +1569,53 @@ class Storage:
             last_opened_at=datetime.fromisoformat(row["last_opened_at"]).astimezone(UTC),
         )
 
+    @staticmethod
+    def _row_to_decision(row: sqlite3.Row) -> DecisionRequest:
+        return DecisionRequest(
+            run_id=row["run_id"],
+            request_id=row["request_id"],
+            kind=DecisionKind(row["kind"]),
+            turn_index=row["turn_index"],
+            subject_sha256=row["subject_sha256"],
+            status=DecisionStatus(row["status"]),
+            payload=json.loads(row["payload_json"]) if row["payload_json"] else None,
+            payload_sha256=row["payload_sha256"],
+            created_at=datetime.fromisoformat(row["created_at"]).astimezone(UTC),
+            accepted_at=(
+                datetime.fromisoformat(row["accepted_at"]).astimezone(UTC)
+                if row["accepted_at"]
+                else None
+            ),
+            consumed_at=(
+                datetime.fromisoformat(row["consumed_at"]).astimezone(UTC)
+                if row["consumed_at"]
+                else None
+            ),
+            execution_started_at=(
+                datetime.fromisoformat(row["execution_started_at"]).astimezone(UTC)
+                if row["execution_started_at"]
+                else None
+            ),
+        )
+
 
 def _dump_model(value: BaseModel | None) -> str | None:
     if value is None:
         return None
     return value.model_dump_json()
+
+
+def _canonical_json(value: dict[str, Any]) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def decision_payload_sha256(value: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
 def _load_model[ModelT: BaseModel](model: type[ModelT], raw: str | None) -> ModelT | None:
