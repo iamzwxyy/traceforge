@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _canonical_sha256(value: Any) -> str:
+    rendered = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
 
 
 class RunState(StrEnum):
@@ -342,9 +355,12 @@ class ProofCommandSandbox(BaseModel):
 class ProofPack(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["traceforge.proof-pack.v1"] = "traceforge.proof-pack.v1"
+    schema_version: Literal["traceforge.proof-pack.v2"]
     generated_at: datetime = Field(default_factory=utc_now)
     run_id: str
+    turn_index: int = Field(ge=1)
+    scope: Literal["cumulative_through_turn"]
+    event_through_seq: int = Field(ge=0)
     task: str
     workspace: str
     project_id: str | None = None
@@ -369,6 +385,30 @@ class ProofPack(BaseModel):
     created_at: datetime
     updated_at: datetime
     evidence_sha256: str
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @classmethod
+    def seal(cls, **data: Any) -> Self:
+        """Validate a Proof Pack after hashing its complete public artifact shape."""
+
+        provisional = cls.model_validate(
+            {**data, "artifact_sha256": "0" * 64},
+            context={"skip_artifact_sha256": True},
+        )
+        payload = provisional.model_dump(mode="json", exclude={"artifact_sha256"})
+        return cls.model_validate(
+            {**payload, "artifact_sha256": _canonical_sha256(payload)}
+        )
+
+    @model_validator(mode="after")
+    def validate_artifact_sha256(self, info: ValidationInfo) -> Self:
+        if info.context and info.context.get("skip_artifact_sha256") is True:
+            return self
+        payload = self.model_dump(mode="json", exclude={"artifact_sha256"})
+        expected = _canonical_sha256(payload)
+        if not hmac.compare_digest(self.artifact_sha256, expected):
+            raise ValueError("Proof Pack artifact SHA-256 does not match its public JSON")
+        return self
 
 
 class RunRecord(BaseModel):

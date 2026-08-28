@@ -59,10 +59,12 @@ separate and read-only.
 
 ### What does the Proof Pack hash prove?
 
-It fingerprints the persisted plan, gate, final diff, checks, verifier verdict, rollback state, and
-event ledger, making accidental changes and two exported packs easy to compare. It is not a digital
-signature or remote attestation; a local actor able to rewrite SQLite can recompute it. That precise
-claim is more defensible than calling the artifact tamper-proof.
+The v2 artifact hash covers the complete public frozen JSON for one successful turn; separate
+semantic, event-chain, and Diff hashes make individual layers easy to compare. The success state,
+closed turn, terminal events, and artifact are committed atomically, so there is no public
+half-success without evidence. None of these hashes is a digital signature or remote attestation;
+a local actor able to rewrite SQLite can recompute them. That precise claim is more defensible than
+calling the artifact tamper-proof.
 
 ### Why not run everything in Docker?
 

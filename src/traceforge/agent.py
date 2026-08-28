@@ -25,6 +25,7 @@ from traceforge.models import (
     FinishRequest,
     InteractionMode,
     PlanGate,
+    ProofPack,
     ReasoningEffort,
     RunEvent,
     RunRecord,
@@ -38,6 +39,11 @@ from traceforge.models import (
 )
 from traceforge.planning import assess_plan_gate
 from traceforge.prompts import BUILDER_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT
+from traceforge.proof import (
+    ProofNotReadyError,
+    build_success_proof_pack,
+    freeze_success_proof_pack,
+)
 from traceforge.provider import ModelProvider, ModelResponse, ProviderError
 from traceforge.storage import SecureCheckpointError, Storage
 from traceforge.tools import PermissionDecision, PermissionResolution, ToolRegistry
@@ -160,6 +166,7 @@ class AgentManager:
         self.broker = broker or EventBroker(storage)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._controls: dict[str, _Control] = {}
+        self._lifecycle_locks: dict[str, asyncio.Lock] = {}
         self._shutting_down = False
         self.storage.mark_active_runs_interrupted(settings.workspace)
 
@@ -229,6 +236,24 @@ class AgentManager:
         approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
     ) -> RunRecord:
+        async with self._lifecycle_lock(run_id):
+            return await self._follow_up_locked(
+                run_id,
+                prompt,
+                mode=mode,
+                approval_mode=approval_mode,
+                reasoning_effort=reasoning_effort,
+            )
+
+    async def _follow_up_locked(
+        self,
+        run_id: str,
+        prompt: str,
+        *,
+        mode: InteractionMode,
+        approval_mode: ApprovalMode,
+        reasoning_effort: ReasoningEffort,
+    ) -> RunRecord:
         clean_prompt = prompt.strip()
         if not clean_prompt:
             raise ValueError("Follow-up prompt must not be empty")
@@ -240,10 +265,12 @@ class AgentManager:
             RunState.CANCELLED,
         }:
             raise InvalidRunAction("Follow-up is available after the current turn stops")
+        await self._wait_for_terminal_task(run_id)
+        run = self.storage.get_run(run_id)
+        if run.state is RunState.SUCCEEDED:
+            self._freeze_success_or_reject(run)
         if self.storage.has_active_run(self.settings.workspace):
             raise RunConflictError("This workspace already has an active or interrupted run")
-        if run_id in self._tasks and not self._tasks[run_id].done():
-            raise RunConflictError("Run is already active")
         self._reasoning_capability().validate(reasoning_effort)
 
         index = len(run.turns) + 1
@@ -375,15 +402,35 @@ class AgentManager:
         return run
 
     async def rollback(self, run_id: str) -> RollbackResult:
+        async with self._lifecycle_lock(run_id):
+            return await self._rollback_locked(run_id)
+
+    async def _rollback_locked(self, run_id: str) -> RollbackResult:
         run = self.storage.get_run(run_id)
         if run.state is RunState.ANSWERED and not self.storage.list_snapshots(run_id):
             raise InvalidRunAction("Answer-only turns have no file changes to roll back")
         if not run.state.terminal and run.state is not RunState.INTERRUPTED:
             raise InvalidRunAction("Cancel the active run before rolling it back")
+        if run.state.terminal:
+            await self._wait_for_terminal_task(run_id)
+            run = self.storage.get_run(run_id)
+        if run.state is RunState.SUCCEEDED:
+            self._freeze_success_or_reject(run)
         result = self.workspace.rollback(run_id)
         await self._transition(run, RunState.ROLLED_BACK)
         await self.broker.emit(run_id, EventType.ROLLBACK_COMPLETED, _rollback_payload(result))
         return result
+
+    async def get_proof_pack(
+        self, run_id: str, turn_index: int | None = None
+    ) -> tuple[RunRecord, ProofPack | None]:
+        async with self._lifecycle_lock(run_id):
+            run = self.storage.get_run(run_id)
+            if run.state is RunState.SUCCEEDED:
+                await self._wait_for_terminal_task(run_id)
+                run = self.storage.get_run(run_id)
+                self._freeze_success_or_reject(run)
+            return run, self.storage.get_proof_pack(run_id, turn_index)
 
     async def wait(self, run_id: str) -> RunRecord:
         task = self._tasks.get(run_id)
@@ -404,6 +451,20 @@ class AgentManager:
     def _spawn(self, run_id: str, *, resume: bool) -> None:
         task = asyncio.create_task(self._run(run_id, resume=resume), name=f"traceforge:{run_id}")
         self._tasks[run_id] = task
+
+    def _lifecycle_lock(self, run_id: str) -> asyncio.Lock:
+        return self._lifecycle_locks.setdefault(run_id, asyncio.Lock())
+
+    async def _wait_for_terminal_task(self, run_id: str) -> None:
+        task = self._tasks.get(run_id)
+        if task is not None and not task.done():
+            await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+
+    def _freeze_success_or_reject(self, run: RunRecord) -> ProofPack:
+        try:
+            return freeze_success_proof_pack(run, self.storage)
+        except ProofNotReadyError as exc:
+            raise InvalidRunAction(str(exc)) from exc
 
     async def _run(self, run_id: str, *, resume: bool) -> None:
         run = self.storage.get_run(run_id)
@@ -1210,26 +1271,43 @@ class AgentManager:
         )
 
     async def _complete(self, run: RunRecord, report: VerificationReport) -> None:
-        if run.plan:
-            for step in run.plan.steps:
-                step.status = "completed"
-        self.storage.save_run(run)
-        if not await self._transition(run, RunState.SUCCEEDED):
-            return
-        await self._close_turn(
-            run,
-            "succeeded",
-            self._active_turn(run).summary or report.summary,
-        )
-        await self.broker.emit(
-            run.id,
-            EventType.RUN_COMPLETED,
-            {
+        async with self._lifecycle_lock(run.id):
+            if not await self._prepare_terminal_cleanup(run, RunState.SUCCEEDED):
+                return
+            previous = run.state
+            if run.plan:
+                for step in run.plan.steps:
+                    step.status = "completed"
+            turn = self._active_turn(run)
+            if turn.outcome != "in_progress":
+                raise RuntimeError("The successful turn was already closed")
+            turn.outcome = "succeeded"
+            turn.summary = self._redact(turn.summary or report.summary)[:4_000]
+            turn.completed_at = utc_now()
+            run.state = RunState.SUCCEEDED
+            completion_payload = {
                 "state": RunState.SUCCEEDED.value,
                 "verification": report.model_dump(mode="json"),
                 "diff": self.workspace.diff(run.id),
-            },
-        )
+            }
+            terminal_events, _pack = self.storage.commit_success(
+                run,
+                previous_state=previous,
+                turn_payload={
+                    "index": turn.index,
+                    "outcome": "succeeded",
+                    "summary": turn.summary,
+                    "changed_files": turn.changed_files,
+                    "approval_mode": turn.approval_mode.value,
+                    "reasoning_effort": turn.reasoning_effort.value,
+                },
+                completion_payload=completion_payload,
+                proof_factory=lambda events: build_success_proof_pack(
+                    run, self.storage, events
+                ),
+            )
+            for event in terminal_events:
+                await self.broker.publish(event)
 
     async def _complete_answer(self, run: RunRecord, content: str) -> None:
         if not await self._transition(run, RunState.ANSWERED):
@@ -1502,23 +1580,8 @@ class AgentManager:
         same_state = run.state is new_state
         if not same_state and new_state not in _ALLOWED_TRANSITIONS[run.state]:
             raise RuntimeError(f"Invalid run transition: {run.state.value} -> {new_state.value}")
-        if new_state.terminal:
-            # Persist and physically checkpoint the scrub while the row is still recoverable.
-            # A crash or busy WAL can then leave an interrupted run, never a terminal row that
-            # still contains provider-private replay state.
-            scrubbed = self._scrub_provider_reasoning(run)
-            run.provider_reasoning_cleanup_pending = (
-                run.provider_reasoning_cleanup_pending or scrubbed
-            )
-            self.storage.save_run(run)
-            if run.provider_reasoning_cleanup_pending:
-                try:
-                    self.storage.secure_checkpoint()
-                except SecureCheckpointError:
-                    await self._interrupt_for_reasoning_cleanup(run, new_state)
-                    return False
-                run.provider_reasoning_cleanup_pending = False
-                self.storage.save_run(run)
+        if new_state.terminal and not await self._prepare_terminal_cleanup(run, new_state):
+            return False
         if same_state:
             return True
         previous = run.state
@@ -1529,6 +1592,28 @@ class AgentManager:
             EventType.STATE_CHANGED,
             {"state": new_state.value, "previous": previous.value},
         )
+        return True
+
+    async def _prepare_terminal_cleanup(
+        self, run: RunRecord, intended_state: RunState
+    ) -> bool:
+        # Persist and physically checkpoint the scrub while the row is still recoverable. A
+        # crash or busy WAL can then leave a nonterminal/interrupted row, never a terminal row
+        # that still contains provider-private replay state.
+        scrubbed = self._scrub_provider_reasoning(run)
+        run.provider_reasoning_cleanup_pending = (
+            run.provider_reasoning_cleanup_pending or scrubbed
+        )
+        self.storage.save_run(run)
+        if not run.provider_reasoning_cleanup_pending:
+            return True
+        try:
+            self.storage.secure_checkpoint()
+        except SecureCheckpointError:
+            await self._interrupt_for_reasoning_cleanup(run, intended_state)
+            return False
+        run.provider_reasoning_cleanup_pending = False
+        self.storage.save_run(run)
         return True
 
     async def _interrupt_for_reasoning_cleanup(

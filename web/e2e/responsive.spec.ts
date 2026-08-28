@@ -9,6 +9,7 @@ const responsiveRun = {
   mode: "agent",
   approval_mode: "automatic",
   reasoning_effort: "high",
+  proof_turn_indexes: [1],
   turns: [{
     index: 1,
     request: "Check the responsive follow-up composer",

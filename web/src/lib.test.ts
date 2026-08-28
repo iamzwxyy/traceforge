@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  availableProofTurnIndexes,
   buildActivityChapters,
   mergeEvents,
   parseDiff,
   preferNewerRun,
   presentState,
+  proofPackTurnIndex,
   projectConversationEvents,
   projectProgressEvents,
   reasoningErrorLabel,
@@ -31,6 +33,27 @@ describe("mission control helpers", () => {
 
     expect(preferNewerRun(newer, stale)).toBe(newer);
     expect(preferNewerRun(stale, newer)).toBe(newer);
+  });
+
+  it("keeps immutable Proof availability when equal-timestamp metadata arrives late", () => {
+    const withProof = {
+      id: "run",
+      state: "succeeded",
+      updated_at: "2026-08-27T12:00:00.200Z",
+      proof_turn_indexes: [1],
+    } as Run;
+    const withoutProof = {
+      ...withProof,
+      proof_turn_indexes: [],
+    };
+
+    expect(preferNewerRun(withProof, withoutProof).proof_turn_indexes).toEqual([1]);
+  });
+
+  it("uses frozen Proof availability instead of successful turn outcomes", () => {
+    expect(availableProofTurnIndexes({ proof_turn_indexes: [1, 3] })).toEqual([1, 3]);
+    expect(availableProofTurnIndexes({ proof_turn_indexes: [] })).toEqual([]);
+    expect(proofPackTurnIndex({ turn_index: 3 })).toBe(3);
   });
 
   it("classifies unified diff lines", () => {

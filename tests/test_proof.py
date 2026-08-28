@@ -17,7 +17,11 @@ from traceforge.models import (
     Verdict,
     VerificationReport,
 )
-from traceforge.proof import build_proof_pack, proof_pack_markdown
+from traceforge.proof import (
+    build_proof_pack,
+    freeze_success_proof_pack,
+    proof_pack_markdown,
+)
 from traceforge.storage import Storage
 from traceforge.workspace import Workspace
 
@@ -118,6 +122,88 @@ def test_proof_pack_aggregates_stable_completion_evidence(
     assert first.evidence_sha256 in markdown
     assert "Independent read-only completion review" in markdown
     assert "## Command sandbox" in markdown
+
+
+def test_frozen_success_proof_ignores_later_turns_events_and_workspace_changes(
+    storage: Storage, workspace: Workspace
+) -> None:
+    run = RunRecord(
+        id="frozen-proof",
+        task="Create frozen.txt",
+        workspace=str(workspace.root),
+        state=RunState.SUCCEEDED,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Create frozen.txt",
+                outcome="succeeded",
+                summary="Created frozen.txt",
+                changed_files=["frozen.txt"],
+            )
+        ],
+        plan=TaskPlan(
+            summary="Create the file",
+            steps=[PlanStep(id="create", title="Create frozen.txt", status="completed")],
+            acceptance_checks=[
+                AcceptanceCheck(id="review", label="The file was reviewed")
+            ],
+            impacted_files=["frozen.txt"],
+        ),
+        verification=VerificationReport(
+            verdict=Verdict.PASS,
+            summary="The successful turn was independently reviewed.",
+        ),
+    )
+    storage.create_run(run)
+    path = workspace.root / "frozen.txt"
+    workspace.snapshot(run.id, path)
+    path.write_text("successful boundary\n")
+    workspace.record_agent_version(run.id, path)
+    storage.append_event(
+        run.id,
+        EventType.TURN_COMPLETED,
+        {"index": 1, "outcome": "succeeded", "summary": "Created frozen.txt"},
+    )
+    storage.append_event(
+        run.id,
+        EventType.RUN_COMPLETED,
+        {"state": "succeeded", "diff": workspace.diff(run.id)},
+    )
+
+    frozen = freeze_success_proof_pack(run, storage)
+    frozen_json = frozen.model_dump_json()
+    frozen_event_count = frozen.event_count
+
+    run.state = RunState.ANSWERED
+    run.plan = None
+    run.verification = None
+    run.turns.append(
+        ConversationTurn(
+            index=2,
+            request="What changed?",
+            outcome="answered",
+            summary="I described the earlier work.",
+        )
+    )
+    storage.save_run(run)
+    storage.append_event(
+        run.id,
+        EventType.TURN_COMPLETED,
+        {"index": 2, "outcome": "answered", "summary": "Later answer"},
+    )
+    storage.append_event(run.id, EventType.ROLLBACK_COMPLETED, {"removed": ["frozen.txt"]})
+    path.write_text("later workspace state\n")
+
+    reloaded = storage.get_proof_pack(run.id, 1)
+
+    assert reloaded is not None
+    assert reloaded.model_dump_json() == frozen_json
+    assert reloaded.event_count == frozen_event_count
+    assert len(reloaded.turns) == 1
+    assert reloaded.plan is not None
+    assert reloaded.verification is not None
+    assert reloaded.rollback.status == "available"
+    assert "later workspace state" not in reloaded.diff
 
 
 def test_proof_pack_marks_mixed_sandbox_execution(storage: Storage, workspace: Workspace) -> None:

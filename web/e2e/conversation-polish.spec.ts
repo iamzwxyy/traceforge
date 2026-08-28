@@ -58,6 +58,7 @@ function answeredRun(id: string, task: string, summary: string, effort = "auto")
     mode: "agent",
     approval_mode: "automatic",
     reasoning_effort: effort,
+    proof_turn_indexes: [],
     turns: [{
       index: 1,
       request: task,

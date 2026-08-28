@@ -203,10 +203,15 @@ from SSDs, backups, or filesystem snapshots.
 Rollback is hash-conditional. A file changed by the user after the agent wrote it is reported as a
 conflict and preserved. This prevents recovery from becoming a second destructive action.
 
-The Proof Pack reads the successful final diff from the persisted completion event, so later user
-edits do not silently change historical evidence. Its SHA-256 fingerprints provide integrity and
-comparison, not authenticity: TraceForge does not sign the artifact, and a local actor who can
-rewrite the database can also recompute the hashes.
+The successful RunRecord, closed turn, terminal events, and immutable per-turn Proof Pack are one
+SQLite transaction. A construction or identity conflict rolls back the whole success transition,
+so the public state cannot claim `succeeded` before its evidence exists. The pack reads the exact
+successful turn's final diff from its bounded persisted completion event, so later turns and user
+edits do not silently change historical evidence. Its full-artifact, semantic-evidence, event-chain,
+and Diff SHA-256 fingerprints provide integrity and comparison, not authenticity: TraceForge does
+not sign the artifact, and a local actor who can rewrite the database can also recompute the hashes.
+Proof responses disable HTTP caching; historical gaps from older versions are not reconstructed
+from a newer workspace state.
 
 ## Local web service
 

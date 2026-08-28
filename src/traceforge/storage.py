@@ -6,6 +6,7 @@ import sqlite3
 import stat
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from traceforge.models import (
     InteractionMode,
     PlanGate,
     ProjectRecord,
+    ProofPack,
     ProviderConfig,
     ReasoningEffort,
     RunEvent,
@@ -180,6 +182,20 @@ class Storage:
                     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS proof_packs (
+                    run_id TEXT NOT NULL,
+                    turn_index INTEGER NOT NULL CHECK(turn_index >= 1),
+                    proof_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (run_id, turn_index),
+                    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS proof_backfill_candidates (
+                    run_id TEXT PRIMARY KEY,
+                    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS projects (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -202,6 +218,11 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS preferences (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_runs_workspace_updated
@@ -247,6 +268,27 @@ class Storage:
                 "CREATE INDEX IF NOT EXISTS idx_runs_project_updated "
                 "ON runs(project_id, updated_at DESC)"
             )
+            proof_migration = self._connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                ("proof-packs-v2",),
+            ).fetchone()
+            if proof_migration is None:
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO proof_backfill_candidates(run_id)
+                    SELECT runs.id FROM runs
+                    WHERE runs.state = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM proof_packs
+                          WHERE proof_packs.run_id = runs.id
+                      )
+                    """,
+                    (RunState.SUCCEEDED.value,),
+                )
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+                    ("proof-packs-v2", utc_now().isoformat()),
+                )
             self._scrub_terminal_reasoning_rows()
             row = self._connection.execute(
                 "SELECT 1 FROM runs WHERE provider_reasoning_cleanup_pending = 1 LIMIT 1"
@@ -359,24 +401,8 @@ class Storage:
 
     def save_run(self, run: RunRecord) -> None:
         run.updated_at = utc_now()
-        values = self._run_values(run)
         with self._lock, self._connection:
-            cursor = self._connection.execute(
-                """
-                UPDATE runs SET
-                    task = ?, workspace = ?, project_id = ?, state = ?, mode = ?,
-                    approval_mode = ?, reasoning_effort = ?, turns_json = ?, verifier_enabled = ?,
-                    plan_json = ?, clarification_json = ?, pending_approval_json = ?,
-                    verification_json = ?, plan_gate_json = ?, messages_json = ?,
-                    provider_reasoning_cleanup_pending = ?, plan_approved = ?,
-                    interrupted_from = ?, step_count = ?,
-                    repair_cycles = ?, context_limit = ?, error = ?, created_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (*values[1:], values[0]),
-            )
-            if cursor.rowcount != 1:
-                raise KeyError(f"Run not found: {run.id}")
+            self._update_run_locked(run)
 
     def get_run(self, run_id: str) -> RunRecord:
         with self._lock:
@@ -594,6 +620,83 @@ class Storage:
             )
         return event
 
+    def commit_success(
+        self,
+        run: RunRecord,
+        *,
+        previous_state: RunState,
+        turn_payload: dict[str, Any],
+        completion_payload: dict[str, Any],
+        proof_factory: Callable[[list[RunEvent]], ProofPack],
+    ) -> tuple[list[RunEvent], ProofPack]:
+        """Atomically publish a closed successful turn, its events, and immutable proof."""
+
+        if run.state is not RunState.SUCCEEDED:
+            raise ValueError("Atomic success commit requires a successful RunRecord")
+        if not run.turns or run.turns[-1].outcome != "succeeded":
+            raise ValueError("Atomic success commit requires a closed successful turn")
+        with self._lock, self._connection:
+            current = self._connection.execute(
+                "SELECT state FROM runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Run not found: {run.id}")
+            if current["state"] != previous_state.value:
+                raise RuntimeError(
+                    "Run state changed before its atomic success commit"
+                )
+            existing_events = self.get_events(run.id)
+            now = utc_now()
+            first_seq = existing_events[-1].seq + 1 if existing_events else 1
+            terminal_events = [
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq,
+                    type=EventType.STATE_CHANGED,
+                    payload={
+                        "state": RunState.SUCCEEDED.value,
+                        "previous": previous_state.value,
+                    },
+                    created_at=now,
+                ),
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq + 1,
+                    type=EventType.TURN_COMPLETED,
+                    payload=turn_payload,
+                    created_at=now,
+                ),
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq + 2,
+                    type=EventType.RUN_COMPLETED,
+                    payload=completion_payload,
+                    created_at=now,
+                ),
+            ]
+            run.updated_at = now
+            self._update_run_locked(run, expected_state=previous_state)
+            for event in terminal_events:
+                self._insert_event_locked(event)
+            pack = proof_factory([*existing_events, *terminal_events])
+            if pack.turn_index != run.turns[-1].index:
+                raise ValueError(
+                    "Proof Pack turn does not match the atomically completed turn"
+                )
+            if pack.event_through_seq != terminal_events[-1].seq:
+                raise ValueError("Proof Pack does not end at the committed success event")
+            stored = self._save_proof_pack_if_absent_locked(
+                run.id, pack.turn_index, pack
+            )
+            if stored.artifact_sha256 != pack.artifact_sha256:
+                raise ValueError(
+                    "A different Proof Pack already exists for the completed turn"
+                )
+            self._connection.execute(
+                "DELETE FROM proof_backfill_candidates WHERE run_id = ?", (run.id,)
+            )
+        return terminal_events, stored
+
     def get_events(self, run_id: str, *, after_seq: int = 0) -> list[RunEvent]:
         with self._lock:
             rows = self._connection.execute(
@@ -610,6 +713,127 @@ class Storage:
             )
             for row in rows
         ]
+
+    def save_proof_pack_if_absent(
+        self, run_id: str, turn_index: int, pack: ProofPack
+    ) -> ProofPack:
+        """Persist one immutable successful-turn proof and return the stored value."""
+
+        self._validate_proof_pack_key(pack, run_id, turn_index)
+        with self._lock, self._connection:
+            stored = self._save_proof_pack_if_absent_locked(run_id, turn_index, pack)
+            self._connection.execute(
+                "DELETE FROM proof_backfill_candidates WHERE run_id = ?", (run_id,)
+            )
+            return stored
+
+    def get_proof_pack(
+        self, run_id: str, turn_index: int | None = None
+    ) -> ProofPack | None:
+        """Load and validate an exact or latest immutable successful-turn proof."""
+
+        if turn_index is not None and turn_index < 1:
+            raise ValueError("Proof Pack turn index must be positive")
+        with self._lock:
+            if turn_index is None:
+                row = self._connection.execute(
+                    """
+                    SELECT run_id, turn_index, proof_json FROM proof_packs
+                    WHERE run_id = ? ORDER BY turn_index DESC LIMIT 1
+                    """,
+                    (run_id,),
+                ).fetchone()
+            else:
+                row = self._connection.execute(
+                    """
+                    SELECT run_id, turn_index, proof_json FROM proof_packs
+                    WHERE run_id = ? AND turn_index = ?
+                    """,
+                    (run_id, turn_index),
+                ).fetchone()
+        if row is None:
+            return None
+        pack = ProofPack.model_validate_json(row["proof_json"])
+        self._validate_proof_pack_key(pack, str(row["run_id"]), int(row["turn_index"]))
+        return pack
+
+    def list_proof_pack_turn_indexes(self, run_id: str) -> list[int]:
+        """List frozen rows cheaply; exact reads validate the signed public artifact."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT turn_index FROM proof_packs
+                WHERE run_id = ? ORDER BY turn_index
+                """,
+                (run_id,),
+            ).fetchall()
+        return [int(row["turn_index"]) for row in rows]
+
+    def is_proof_backfill_candidate(self, run_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM proof_backfill_candidates WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return row is not None
+
+    def list_proof_backfill_candidate_ids(self) -> list[str]:
+        """Return legacy current-success rows that can still be frozen faithfully."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT proof_backfill_candidates.run_id
+                FROM proof_backfill_candidates
+                JOIN runs ON runs.id = proof_backfill_candidates.run_id
+                WHERE runs.state = ?
+                ORDER BY proof_backfill_candidates.run_id
+                """,
+                (RunState.SUCCEEDED.value,),
+            ).fetchall()
+        return [str(row["run_id"]) for row in rows]
+
+    def _save_proof_pack_if_absent_locked(
+        self, run_id: str, turn_index: int, pack: ProofPack
+    ) -> ProofPack:
+        pack = ProofPack.model_validate_json(pack.model_dump_json())
+        self._validate_proof_pack_key(pack, run_id, turn_index)
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO proof_packs(
+                run_id, turn_index, proof_json, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (run_id, turn_index, pack.model_dump_json(), utc_now().isoformat()),
+        )
+        row = self._connection.execute(
+            """
+            SELECT run_id, turn_index, proof_json FROM proof_packs
+            WHERE run_id = ? AND turn_index = ?
+            """,
+            (run_id, turn_index),
+        ).fetchone()
+        assert row is not None
+        stored = ProofPack.model_validate_json(row["proof_json"])
+        self._validate_proof_pack_key(
+            stored, str(row["run_id"]), int(row["turn_index"])
+        )
+        return stored
+
+    @staticmethod
+    def _validate_proof_pack_key(
+        pack: ProofPack, run_id: str, turn_index: int
+    ) -> None:
+        if turn_index < 1:
+            raise ValueError("Proof Pack turn index must be positive")
+        if pack.run_id != run_id:
+            raise ValueError("Proof Pack run id does not match its storage key")
+        if pack.turn_index != turn_index:
+            raise ValueError("Proof Pack turn index does not match its storage key")
+        if pack.state is not RunState.SUCCEEDED:
+            raise ValueError("Only successful runs can be frozen as Proof Packs")
+        if pack.event_count != pack.event_through_seq:
+            raise ValueError("Proof Pack event boundary is inconsistent")
 
     def save_snapshot_if_absent(self, snapshot: SnapshotRecord) -> bool:
         with self._lock, self._connection:
@@ -686,6 +910,50 @@ class Storage:
             run.error,
             run.created_at.isoformat(),
             run.updated_at.isoformat(),
+        )
+
+    def _update_run_locked(
+        self, run: RunRecord, *, expected_state: RunState | None = None
+    ) -> None:
+        values = self._run_values(run)
+        state_guard = " AND state = ?" if expected_state is not None else ""
+        parameters = (
+            (*values[1:], values[0], expected_state.value)
+            if expected_state is not None
+            else (*values[1:], values[0])
+        )
+        cursor = self._connection.execute(
+            f"""
+            UPDATE runs SET
+                task = ?, workspace = ?, project_id = ?, state = ?, mode = ?,
+                approval_mode = ?, reasoning_effort = ?, turns_json = ?, verifier_enabled = ?,
+                plan_json = ?, clarification_json = ?, pending_approval_json = ?,
+                verification_json = ?, plan_gate_json = ?, messages_json = ?,
+                provider_reasoning_cleanup_pending = ?, plan_approved = ?,
+                interrupted_from = ?, step_count = ?,
+                repair_cycles = ?, context_limit = ?, error = ?, created_at = ?, updated_at = ?
+            WHERE id = ?{state_guard}
+            """,
+            parameters,
+        )
+        if cursor.rowcount != 1:
+            if expected_state is None:
+                raise KeyError(f"Run not found: {run.id}")
+            raise RuntimeError(f"Run update lost its state guard: {run.id}")
+
+    def _insert_event_locked(self, event: RunEvent) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO events(run_id, seq, type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                event.run_id,
+                event.seq,
+                event.type.value,
+                json.dumps(event.payload, ensure_ascii=False),
+                event.created_at.isoformat(),
+            ),
         )
 
     @staticmethod

@@ -21,35 +21,105 @@ from traceforge.storage import Storage
 from traceforge.workspace import Workspace
 
 
-def build_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
-    events = storage.get_events(run.id)
+class ProofNotReadyError(RuntimeError):
+    """A successful state is not yet backed by a complete persisted terminal boundary."""
+
+
+def current_proof_turn_index(run: RunRecord) -> int:
+    return run.turns[-1].index if run.turns else 1
+
+
+def freeze_success_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
+    """Idempotently freeze the complete proof visible at one successful turn boundary."""
+
+    turn_index = current_proof_turn_index(run)
+    frozen = storage.get_proof_pack(run.id, turn_index)
+    if frozen is not None:
+        return frozen
+    pack = build_success_proof_pack(
+        run,
+        storage,
+        storage.get_events(run.id),
+        allow_legacy_current=storage.is_proof_backfill_candidate(run.id),
+    )
+    return storage.save_proof_pack_if_absent(
+        run.id,
+        turn_index,
+        pack,
+    )
+
+
+def build_success_proof_pack(
+    run: RunRecord,
+    storage: Storage,
+    events: list[RunEvent],
+    *,
+    allow_legacy_current: bool = False,
+) -> ProofPack:
+    turn_index, event_through_seq = _successful_boundary(
+        run,
+        events,
+        allow_legacy_current=allow_legacy_current,
+    )
+    return build_proof_pack(
+        run,
+        storage,
+        events=events,
+        turn_index=turn_index,
+        event_through_seq=event_through_seq,
+    )
+
+
+def build_proof_pack(
+    run: RunRecord,
+    storage: Storage,
+    *,
+    events: list[RunEvent] | None = None,
+    turn_index: int | None = None,
+    event_through_seq: int | None = None,
+) -> ProofPack:
+    selected_turn = turn_index or current_proof_turn_index(run)
+    selected_events = list(events if events is not None else storage.get_events(run.id))
+    selected_through_seq = (
+        event_through_seq
+        if event_through_seq is not None
+        else (selected_events[-1].seq if selected_events else 0)
+    )
+    selected_events = [
+        event for event in selected_events if event.seq <= selected_through_seq
+    ]
     snapshots = storage.list_snapshots(run.id)
-    diff, diff_source = _evidence_diff(run, storage, events)
-    rollback = _rollback_evidence(events, has_snapshots=bool(snapshots))
-    command_sandbox = _command_sandbox_evidence(events)
+    diff, diff_source = _evidence_diff(run, storage, selected_events)
+    rollback = _rollback_evidence(selected_events, has_snapshots=bool(snapshots))
+    command_sandbox = _command_sandbox_evidence(selected_events)
     proof_status = _proof_status(run)
     checks = run.plan.acceptance_checks if run.plan else []
     checks_fresh = bool(checks) and all(
         check.status is CheckStatus.PASSED for check in checks
     )
     event_chain_sha256 = _digest_json(
-        [event.model_dump(mode="json") for event in events]
+        [event.model_dump(mode="json") for event in selected_events]
     )
+    selected_turns = [turn for turn in run.turns if turn.index <= selected_turn]
     evidence: dict[str, Any] = {
-        "schema_version": "traceforge.proof-pack.v1",
+        "schema_version": "traceforge.proof-pack.v2",
         "run_id": run.id,
+        "turn_index": selected_turn,
+        "scope": "cumulative_through_turn",
+        "event_through_seq": selected_through_seq,
         "task": run.task,
         "workspace": run.workspace,
         "project_id": run.project_id,
         "mode": run.mode.value,
-        # v1 predates per-turn UI navigation, permission, and reasoning-setting hints. Keep its
-        # stable digest surface unchanged; those choices remain covered by the event chain.
+        # The evidence digest intentionally omits presentation-only turn hints. Permission and
+        # reasoning choices remain covered by the event chain, while artifact_sha256 protects
+        # the complete public v2 JSON including those fields.
         "turns": [
             turn.model_dump(
                 mode="json",
                 exclude={"changed_files", "approval_mode", "reasoning_effort"},
             )
-            for turn in run.turns
+            for turn in selected_turns
         ],
         "state": run.state.value,
         "proof_status": proof_status,
@@ -65,25 +135,68 @@ def build_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
         ),
         "rollback": rollback.model_dump(mode="json"),
         "command_sandbox": command_sandbox.model_dump(mode="json"),
-        "event_count": len(events),
+        "event_count": len(selected_events),
         "event_chain_sha256": event_chain_sha256,
         "step_count": run.step_count,
         "repair_cycles": run.repair_cycles,
         "created_at": run.created_at.isoformat(),
         "updated_at": run.updated_at.isoformat(),
     }
-    presentation = {**evidence, "turns": run.turns}
-    return ProofPack(
+    presentation = {**evidence, "turns": selected_turns}
+    return ProofPack.seal(
         generated_at=utc_now(),
         **presentation,
         evidence_sha256=_digest_json(evidence),
     )
 
 
+def _successful_boundary(
+    run: RunRecord,
+    events: list[RunEvent],
+    *,
+    allow_legacy_current: bool,
+) -> tuple[int, int]:
+    if run.state is not RunState.SUCCEEDED:
+        raise ProofNotReadyError("Only a currently successful run can freeze a Proof Pack")
+    turn_index = current_proof_turn_index(run)
+    if run.turns and run.turns[-1].outcome != "succeeded":
+        raise ProofNotReadyError("The successful turn has not been closed yet")
+    turn_position = next(
+        (
+            position
+            for position in range(len(events) - 1, -1, -1)
+            if events[position].type is EventType.TURN_COMPLETED
+            and events[position].payload.get("index") == turn_index
+            and events[position].payload.get("outcome") == "succeeded"
+        ),
+        None,
+    )
+    if turn_position is not None:
+        completion = next(
+            (
+                event
+                for event in events[turn_position + 1 :]
+                if event.type is EventType.RUN_COMPLETED
+                and event.payload.get("state") == RunState.SUCCEEDED.value
+                and isinstance(event.payload.get("diff"), str)
+            ),
+            None,
+        )
+        if completion is not None:
+            return turn_index, completion.seq
+    if allow_legacy_current:
+        return turn_index, events[-1].seq if events else 0
+    raise ProofNotReadyError(
+        "The successful turn is still finalizing or lacks a complete terminal event boundary"
+    )
+
+
 def proof_pack_markdown(pack: ProofPack) -> str:
     lines = [
-        f"# TraceForge Proof Pack · {pack.run_id[:8]}",
+        f"# TraceForge Proof Pack · {pack.run_id[:8]} · Turn {pack.turn_index}",
         "",
+        "- Scope: **cumulative through this successful turn**",
+        f"- Event boundary: `#{pack.event_through_seq}`",
         f"- Proof status: **{pack.proof_status}**",
         f"- Run state: `{pack.state.value}`",
         (
@@ -95,6 +208,7 @@ def proof_pack_markdown(pack: ProofPack) -> str:
             f"`{pack.turns[-1].reasoning_effort.value if pack.turns else 'auto'}`"
         ),
         f"- Evidence SHA-256: `{pack.evidence_sha256}`",
+        f"- Artifact SHA-256: `{pack.artifact_sha256}`",
         f"- Event chain SHA-256: `{pack.event_chain_sha256}` ({pack.event_count} events)",
         f"- Diff source: `{pack.diff_source}`",
         f"- Generated: {pack.generated_at.isoformat()}",

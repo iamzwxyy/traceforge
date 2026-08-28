@@ -13,6 +13,7 @@ function run(id: string, task: string, minute: number) {
     mode: "agent",
     approval_mode: "automatic",
     reasoning_effort: "auto",
+    proof_turn_indexes: [1],
     turns: [{
       index: 1,
       request: task,
@@ -51,9 +52,12 @@ const runB = run("run-b", "任务 B", 2);
 
 function proofPack(selectedRun: typeof runA) {
   return {
-    schema_version: "traceforge.proof-pack.v1",
+    schema_version: "traceforge.proof-pack.v2",
     generated_at: selectedRun.updated_at,
     run_id: selectedRun.id,
+    turn_index: 1,
+    scope: "cumulative_through_turn",
+    event_through_seq: 3,
     task: selectedRun.task,
     workspace: selectedRun.workspace,
     project_id: null,
@@ -91,6 +95,7 @@ function proofPack(selectedRun: typeof runA) {
     created_at: selectedRun.created_at,
     updated_at: selectedRun.updated_at,
     evidence_sha256: `EVIDENCE-${selectedRun.id.toUpperCase()}`,
+    artifact_sha256: "a".repeat(64),
   };
 }
 
@@ -198,7 +203,7 @@ async function mockTwoRuns(
     options.onRollback?.(runId);
     await route.fulfill(json({ restored: [], removed: [], conflicts: [] }));
   });
-  await page.route(/\/api\/runs\/(run-a|run-b)\/proof-pack$/, async (route) => {
+  await page.route(/\/api\/runs\/(run-a|run-b)\/proof-pack(?:\?turn_index=\d+)?$/, async (route) => {
     const isA = route.request().url().includes("/run-a/");
     if (isA) {
       options.onProofA?.();
@@ -412,14 +417,14 @@ test("proof dialog waits for evidence owned by the selected task", async ({ page
   await expect(page.getByRole("heading", { name: "任务 B" })).toBeVisible();
   await page.getByRole("button", { name: "查看证据" }).click();
   await expect.poll(() => proofBRequested).toBe(true);
-  const dialog = page.getByRole("dialog", { name: "证据包" });
-  await expect(dialog.getByText("正在汇总持久化证据…")).toBeVisible();
+  const dialog = page.getByRole("dialog", { name: "截至第 1 轮的累计证据包" });
+  await expect(dialog.getByText("正在读取持久化证据…")).toBeVisible();
 
-  const lateResponse = page.waitForResponse(/\/api\/runs\/run-a\/proof-pack$/);
+  const lateResponse = page.waitForResponse(/\/api\/runs\/run-a\/proof-pack\?turn_index=1$/);
   proofA.resolve();
   await (await lateResponse).finished();
   await afterBrowserCommit(page);
-  await expect(dialog.getByText("正在汇总持久化证据…")).toBeVisible();
+  await expect(dialog.getByText("正在读取持久化证据…")).toBeVisible();
   await expect(dialog).not.toContainText("任务 A");
   await expect(dialog).not.toContainText("EVIDENCE-RUN-A");
 
@@ -427,5 +432,5 @@ test("proof dialog waits for evidence owned by the selected task", async ({ page
   await expect(dialog.getByText("任务 B", { exact: true })).toBeVisible();
   await expect(dialog).toContainText("EVIDENCE-RUN-B");
   await expect(dialog.getByRole("link", { name: "下载 Markdown" }))
-    .toHaveAttribute("href", "/api/runs/run-b/proof-pack.md");
+    .toHaveAttribute("href", "/api/runs/run-b/proof-pack.md?turn_index=1");
 });

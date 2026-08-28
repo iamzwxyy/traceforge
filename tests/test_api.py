@@ -20,6 +20,7 @@ from traceforge.models import (
     ToolCall,
 )
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
+from traceforge.storage import Storage
 
 
 def _wait_for_state(client: TestClient, run_id: str, state: str) -> dict[str, object]:
@@ -248,6 +249,169 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
         assert second["turns"][1]["approval_mode"] == "manual"
         assert all(turn["reasoning_effort"] == "auto" for turn in second["turns"])
         assert all(turn["outcome"] == "succeeded" for turn in second["turns"])
+
+
+def test_api_keeps_each_success_proof_immutable_across_later_turns(
+    settings: Settings,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            _plan_response(),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-1",
+                        name="finish",
+                        arguments={"summary": "First success"},
+                    )
+                ]
+            ),
+            _plan_response(),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-2",
+                        name="finish",
+                        arguments={"summary": "Second success"},
+                    )
+                ]
+            ),
+            _answer_response("Both successful turns remain available."),
+        ]
+    )
+    app = create_app(settings, provider=provider)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={"task": "First request", "verifier_enabled": False},
+        )
+        run_id = created.json()["id"]
+        first_view = _wait_for_state(client, run_id, "succeeded")
+        assert first_view["proof_turn_indexes"] == [1]
+        first = client.get(
+            f"/api/runs/{run_id}/proof-pack", params={"turn_index": 1}
+        )
+        assert first.status_code == 200
+        assert first.headers["cache-control"] == "no-store"
+        first_json = first.json()
+        assert first_json["schema_version"] == "traceforge.proof-pack.v2"
+        assert first_json["run_id"] == run_id
+        assert first_json["turn_index"] == 1
+        assert first_json["scope"] == "cumulative_through_turn"
+        assert first_json["event_through_seq"] == first_json["event_count"]
+        assert len(first_json["artifact_sha256"]) == 64
+        assert len(first_json["turns"]) == 1
+
+        followed = client.post(
+            f"/api/runs/{run_id}/turns",
+            json={"prompt": "Second request"},
+        )
+        assert followed.status_code == 200
+        second_view = _wait_for_state(client, run_id, "succeeded")
+        assert second_view["proof_turn_indexes"] == [1, 2]
+        second_json = client.get(f"/api/runs/{run_id}/proof-pack").json()
+
+        assert len(second_json["turns"]) == 2
+        assert second_json == client.get(
+            f"/api/runs/{run_id}/proof-pack", params={"turn_index": 2}
+        ).json()
+        assert first_json == client.get(
+            f"/api/runs/{run_id}/proof-pack", params={"turn_index": 1}
+        ).json()
+        assert first_json["event_count"] < second_json["event_count"]
+        assert first_json["evidence_sha256"] != second_json["evidence_sha256"]
+
+        answered = client.post(
+            f"/api/runs/{run_id}/turns",
+            json={"prompt": "Were both requests completed?"},
+        )
+        assert answered.status_code == 200
+        answer_view = _wait_for_state(client, run_id, "answered")
+        assert answer_view["proof_turn_indexes"] == [1, 2]
+
+        assert client.get(f"/api/runs/{run_id}/proof-pack").json() == second_json
+        assert client.get(
+            f"/api/runs/{run_id}/proof-pack", params={"turn_index": 1}
+        ).json() == first_json
+        markdown = client.get(
+            f"/api/runs/{run_id}/proof-pack.md", params={"turn_index": 1}
+        )
+        assert markdown.status_code == 200
+        assert markdown.headers["cache-control"] == "no-store"
+        assert "turn-1-proof-pack.md" in markdown.headers["content-disposition"]
+        assert "First success" in markdown.text
+        assert "Second success" not in markdown.text
+        no_answer_proof = client.get(
+            f"/api/runs/{run_id}/proof-pack", params={"turn_index": 3}
+        )
+        missing = client.get(
+            f"/api/runs/{run_id}/proof-pack", params={"turn_index": 99}
+        )
+        assert no_answer_proof.status_code == 409
+        assert missing.status_code == 404
+
+
+def test_api_backfills_only_a_legacy_current_success(settings: Settings) -> None:
+    database = settings.data_dir / "traceforge.db"
+    legacy = Storage(database)
+    current = RunRecord(
+        id="legacy-current-success",
+        task="Legacy current success",
+        workspace=str(settings.workspace),
+        state=RunState.SUCCEEDED,
+        turns=[],
+    )
+    historical = RunRecord(
+        id="legacy-historical-success",
+        task="Legacy historical success",
+        workspace=str(settings.workspace),
+        state=RunState.ANSWERED,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Legacy implementation",
+                outcome="succeeded",
+                summary="Old success",
+            ),
+            ConversationTurn(
+                index=2,
+                request="Legacy question",
+                outcome="answered",
+                summary="Old answer",
+            ),
+        ],
+    )
+    legacy.create_run(current)
+    legacy.create_run(historical)
+    legacy.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE proof_backfill_candidates")
+        connection.execute("DROP TABLE proof_packs")
+        connection.execute("DROP TABLE schema_migrations")
+
+    app = create_app(replace(settings, api_key=""))
+
+    with TestClient(app) as client:
+        listed = client.get("/api/runs")
+        assert listed.status_code == 200
+        listed_by_id = {item["id"]: item for item in listed.json()}
+        assert listed_by_id["legacy-current-success"]["proof_turn_indexes"] == [1]
+        assert listed_by_id["legacy-historical-success"]["proof_turn_indexes"] == []
+
+        backfilled = client.get("/api/runs/legacy-current-success/proof-pack")
+        unavailable = client.get(
+            "/api/runs/legacy-historical-success/proof-pack",
+            params={"turn_index": 1},
+        )
+
+        assert backfilled.status_code == 200
+        assert backfilled.json()["turn_index"] == 1
+        assert backfilled.json()["turns"] == []
+        assert app.state.storage.get_proof_pack("legacy-current-success", 1) is not None
+        assert unavailable.status_code == 409
+        assert "cannot be reconstructed" in unavailable.json()["detail"]
+        assert app.state.storage.get_proof_pack("legacy-historical-success") is None
 
 
 def test_api_freezes_model_supported_reasoning_per_turn(settings: Settings) -> None:

@@ -357,6 +357,12 @@ class AgentRuntime:
     def manager_for_run(self, run_id: str) -> AgentManager:
         return self.manager_for_workspace(self.storage.get_run(run_id).workspace)
 
+    def existing_manager_for_run(self, run_id: str) -> AgentManager | None:
+        """Return an already-loaded manager without constructing a provider."""
+
+        run = self.storage.get_run(run_id)
+        return self._managers.get(Path(run.workspace))
+
     def manager_for_workspace(self, workspace: str | Path) -> AgentManager:
         resolved = resolve_workspace(workspace)
         manager = self._managers.get(resolved)

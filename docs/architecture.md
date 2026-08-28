@@ -194,31 +194,32 @@ than claiming it captures every command side effect.
 
 ## Proof Pack projection
 
-`GET /api/runs/{id}/proof-pack` assembles a versioned evidence projection from the run, snapshots,
-and sequenced events. For completed work it prefers the diff stored in the completion event; for
-earlier terminal states it uses the last persisted diff event, falling back to the live workspace
-only when no persisted diff exists. Later user edits therefore do not rewrite a successful run's
-historical delivery evidence. It also counts commands by enforced, bypassed, and policy-only
-execution, while rejected or denied commands are counted separately as not executed. The exported
-artifact therefore cannot imply stronger isolation—or more executed commands—than the event ledger
-proves.
+Each successful turn stores one immutable `traceforge.proof-pack.v2` row keyed by `(run_id,
+turn_index)`. The successful RunRecord, closed conversation turn, `state.changed`, `turn.completed`,
+and `run.completed` events, and Proof row are committed in one SQLite transaction. The broker
+publishes those already-persisted terminal events only after commit. A proof-construction failure,
+state race, or conflicting pre-existing artifact rolls the entire transaction back, so readers
+cannot observe `succeeded` without its frozen evidence.
 
-The projection includes the visible plan and gate, touched paths, final diff, fresh check results,
-independent verdict, rollback outcome, counts, and two SHA-256 values: one for the event sequence
-and one for the assembled evidence. The Markdown route renders the same projection as a download.
+The pack declares `scope=cumulative_through_turn` and its terminal `event_through_seq`. It includes
+the plan and gate, cumulative snapshot paths, completion-event diff, fresh checks, independent
+verdict, rollback capability at freeze time, per-turn counters, and command isolation aggregated
+only through that boundary. Rejected or denied commands remain separate from executed commands.
+Later answers, failures, cancellations, rollbacks, and workspace edits cannot rewrite an earlier
+successful artifact.
+
+`artifact_sha256` covers the complete public v2 JSON except the hash field itself. The semantic
+evidence, event chain, and Diff retain separate hashes so consumers can compare the relevant layer.
 These hashes detect accidental or post-export changes; they are not signatures or a defense
-against a local user deliberately rewriting both SQLite and the artifact.
+against a local user deliberately rewriting both SQLite and the artifact. Exact reads validate the
+artifact and its storage identity before returning it.
 
-Per-turn `changed_files` was added after the `traceforge.proof-pack.v1` digest surface. It is a UI
-navigation hint rather than new signed evidence, so v1 turn serialization excludes the field;
-the cumulative snapshot paths remain covered by the existing top-level `changed_files`. A future
-artifact that signs per-turn attribution must use a new schema version instead of silently changing
-v1 hashes.
-
-Action-permission and reasoning-effort fields follow the same compatibility rule: the current
-projection and Markdown display them, while the v1 stable evidence digest excludes the later-added
-turn hints. Their `turn.started`, `turn.completed`, `tool.completed`, and `model.requested` events
-remain covered by the event-chain digest.
+`GET /api/runs/{id}/proof-pack?turn_index=N` and the matching Markdown route read an exact frozen
+turn; omission selects the latest successful turn. Run views advertise actual stored turn indexes,
+and Proof responses are `no-store`. A one-time migration may freeze a legacy run only while its
+current state is still `succeeded`; a historical success already followed by another turn is left
+unavailable rather than reconstructed from mutable current state. Startup backfill and stored-proof
+reads do not construct a model provider or require credentials.
 
 The browser treats run identity as part of every evidence value. Selecting a different run first
 invalidates outstanding Diff and Proof generations and clears the prior projection. HTTP results
@@ -343,8 +344,9 @@ saves clear verification, and runtime methods serialize provider changes with st
 up, or resuming work; all three task entry points reject an unverified saved connection.
 run-scoped `POST /api/runs/{id}/open-workspace` accepts no path from the browser: it re-resolves the
 persisted canonical workspace, rejects symlink retargeting, and invokes Finder or `xdg-open` with a
-fixed argv and scrubbed environment. JSON and Markdown Proof Pack routes expose the evidence
-projection. WebSocket pushes the persisted event stream. Mutating HTTP requests reject untrusted
+fixed argv and scrubbed environment. JSON and Markdown Proof Pack routes expose exact immutable
+successful-turn artifacts and disable HTTP caching. WebSocket pushes the persisted event stream.
+Mutating HTTP requests reject untrusted
 origins and cross-site fetch metadata; WebSocket origins are restricted to localhost, and
 IPv4/IPv6 loopback origins share the same policy. Responses include CSP, frame denial, referrer,
 and MIME-sniffing headers. The React production

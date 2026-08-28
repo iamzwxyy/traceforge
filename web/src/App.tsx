@@ -50,9 +50,11 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import {
+  availableProofTurnIndexes,
   isActiveState,
   parseDiff,
   presentState,
+  proofPackTurnIndex,
   projectConversationEvents,
   projectProgressEvents,
   reasoningErrorLabel,
@@ -78,7 +80,7 @@ import type {
   RunTarget,
   TaskPlan,
 } from "./types";
-import { useTraceForge } from "./useTraceForge";
+import { useTraceForge, type ProofLoadState } from "./useTraceForge";
 
 type InspectorTab = "timeline" | "diff" | "checks" | "verifier";
 
@@ -235,7 +237,10 @@ export default function App() {
   const [composerProjectId, setComposerProjectId] = useState<string | null>(null);
   const [showProject, setShowProject] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [showProof, setShowProof] = useState(false);
+  const [proofSelection, setProofSelection] = useState<{
+    runId: string;
+    turnIndex: number;
+  } | null>(null);
   const [mobilePane, setMobilePane] = useState<"sidebar" | "inspector" | null>(null);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("timeline");
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
@@ -259,7 +264,7 @@ export default function App() {
     if (forge.run?.state === "succeeded") setInspectorTab("checks");
   }, [forge.run?.state]);
 
-  useEffect(() => setShowProof(false), [forge.run?.id]);
+  useEffect(() => setProofSelection(null), [forge.run?.id]);
   useEffect(() => {
     const closeObsoleteDrawer = () => {
       setViewportWidth(window.innerWidth);
@@ -438,9 +443,10 @@ export default function App() {
               onRollback={() => {
                 void forge.rollback()?.catch(() => undefined);
               }}
-              onProof={() => {
-                setShowProof(true);
-                void forge.loadProofPack(forge.run!.id).catch(() => undefined);
+              onProof={(turnIndex) => {
+                const runId = forge.run!.id;
+                setProofSelection({ runId, turnIndex });
+                void forge.loadProofPack(runId, turnIndex).catch(() => undefined);
               }}
               onOpenWorkspace={() => forge.openWorkspace(forge.run!.id)}
               onFollowUp={async (prompt, mode, approvalMode, reasoningEffort) => {
@@ -479,11 +485,23 @@ export default function App() {
           onTest={forge.testProvider}
         />
       )}
-      {showProof && forge.run && (
+      {proofSelection && forge.run?.id === proofSelection.runId && (
         <ProofPackDialog
           pack={forge.proofPack}
+          loadState={forge.proofLoadState}
           runId={forge.run.id}
-          onClose={() => setShowProof(false)}
+          turnIndexes={availableProofTurnIndexes(forge.run)}
+          selectedTurnIndex={proofSelection.turnIndex}
+          onTurnChange={(turnIndex) => {
+            const runId = forge.run!.id;
+            setProofSelection({ runId, turnIndex });
+            void forge.loadProofPack(runId, turnIndex).catch(() => undefined);
+          }}
+          onRetry={() => {
+            const { runId, turnIndex } = proofSelection;
+            void forge.loadProofPack(runId, turnIndex).catch(() => undefined);
+          }}
+          onClose={() => setProofSelection(null)}
         />
       )}
       {showProject && (
@@ -1508,7 +1526,7 @@ function RunStage({
   onCancel: () => void;
   onResume: () => void;
   onRollback: () => void;
-  onProof: () => void;
+  onProof: (turnIndex: number) => void;
   onOpenWorkspace: () => Promise<unknown>;
   onFollowUp: (
     prompt: string,
@@ -1521,6 +1539,16 @@ function RunStage({
   const [openingWorkspace, setOpeningWorkspace] = useState(false);
   const answeredTaskHasEdits = run.state === "answered"
     && run.turns.some((turn) => turn.changed_files.length > 0);
+  const proofTurnIndexes = availableProofTurnIndexes(run);
+  const latestProofTurnIndex = proofTurnIndexes.at(-1) ?? null;
+  const currentTurnIndex = run.turns.at(-1)?.index ?? 1;
+  const currentProofTurnIndex = run.state === "succeeded"
+    && proofTurnIndexes.includes(currentTurnIndex)
+    ? currentTurnIndex
+    : null;
+  const historicalProofTurnIndex = run.state === "succeeded"
+    ? proofTurnIndexes.filter((turnIndex) => turnIndex !== currentTurnIndex).at(-1) ?? null
+    : latestProofTurnIndex;
   return (
     <div className="run-stage">
       <div className="run-header">
@@ -1595,7 +1623,16 @@ function RunStage({
           </Notice>
         )}
         {run.error && <Notice icon={<OctagonX size={18} />} title={run.state === "interrupted" ? "暂停原因" : "停止原因"} danger={run.state !== "interrupted"}>{systemMessageLabel(run.error)}</Notice>}
-        {run.state === "succeeded" && <CompletionSummary run={run} onProof={onProof} />}
+        {run.state === "succeeded" && (
+          <CompletionSummary
+            run={run}
+            turnIndex={currentProofTurnIndex}
+            onProof={onProof}
+          />
+        )}
+        {historicalProofTurnIndex !== null && currentProofTurnIndex === null && (
+          <HistoricalProofSummary turnIndex={historicalProofTurnIndex} onProof={onProof} />
+        )}
         {followUpEnabled && ["answered", "succeeded", "failed", "cancelled"].includes(run.state) && (
           <FollowUpComposer
             key={`${run.id}:${run.turns.length}`}
@@ -1894,16 +1931,48 @@ function ApprovalPanel({ approval, onDecision }: { approval: NonNullable<Run["pe
   );
 }
 
-function CompletionSummary({ run, onProof }: { run: Run; onProof: () => void }) {
+function CompletionSummary({
+  run,
+  turnIndex,
+  onProof,
+}: {
+  run: Run;
+  turnIndex: number | null;
+  onProof: (turnIndex: number) => void;
+}) {
   const passed = run.plan?.acceptance_checks.filter((check) => check.status === "passed").length ?? 0;
   return (
     <div className="completion-summary">
       <CheckCircle2 size={17} />
       <div>
         <strong>本轮已完成</strong>
+        {turnIndex === null && <small className="proof-unavailable">暂无冻结证据</small>}
         <span>{passed} 项检查通过{run.verification?.summary ? ` · ${run.verification.summary}` : ""}</span>
       </div>
-      <button className="button ghost" type="button" onClick={onProof}><Fingerprint size={14} /> 查看证据</button>
+      {turnIndex !== null && (
+        <button className="button ghost" type="button" onClick={() => onProof(turnIndex)}><Fingerprint size={14} /> 查看证据</button>
+      )}
+    </div>
+  );
+}
+
+function HistoricalProofSummary({
+  turnIndex,
+  onProof,
+}: {
+  turnIndex: number;
+  onProof: (turnIndex: number) => void;
+}) {
+  return (
+    <div className="completion-summary historical-proof-summary">
+      <Fingerprint size={17} />
+      <div>
+        <strong>第 {turnIndex} 轮已证实</strong>
+        <span>查看截至该轮冻结的累计证据；不代表当前轮已完成。</span>
+      </div>
+      <button className="button ghost" type="button" onClick={() => onProof(turnIndex)}>
+        查看历史证据
+      </button>
     </div>
   );
 }
@@ -2144,21 +2213,74 @@ function PlanGateSummary({ gate }: { gate: PlanGate }) {
   return <div className={`plan-gate-summary ${automatic ? "fast" : "review"}`}><div>{automatic ? <Zap size={15} /> : <ShieldCheck size={15} />}<span><strong>{title}</strong><small>工作边界评估 · {riskLabel(gate.risk)}</small></span></div><ul>{gate.reasons.map((reason) => <li key={reason}>{planGateReasonLabel(reason)}</li>)}</ul></div>;
 }
 
-function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; runId: string; onClose: () => void }) {
+function ProofPackDialog({
+  pack,
+  loadState,
+  runId,
+  turnIndexes,
+  selectedTurnIndex,
+  onTurnChange,
+  onRetry,
+  onClose,
+}: {
+  pack: ProofPack | null;
+  loadState: ProofLoadState | null;
+  runId: string;
+  turnIndexes: number[];
+  selectedTurnIndex: number;
+  onTurnChange: (turnIndex: number) => void;
+  onRetry: () => void;
+  onClose: () => void;
+}) {
   const { dialogRef, onDialogKeyDown } = useDialogFocus(onClose);
-  const visiblePack = pack?.run_id === runId ? pack : null;
+  const visiblePack = pack?.run_id === runId
+    && proofPackTurnIndex(pack) === selectedTurnIndex
+    ? pack
+    : null;
+  const visibleLoadState = loadState?.runId === runId
+    && loadState.turnIndex === selectedTurnIndex
+    ? loadState
+    : null;
+  const loadError = visibleLoadState?.status === "error"
+    ? visibleLoadState.error
+    : null;
   return (
     <div className="modal-backdrop" role="presentation">
-      <section ref={dialogRef} className="modal proof-modal" role="dialog" aria-modal="true" aria-labelledby="proof-title" tabIndex={-1} onKeyDown={onDialogKeyDown}>
-        <div className="modal-heading"><div><p className="eyebrow">可审计完成记录</p><h2 id="proof-title">证据包</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭证据包"><X size={17} /></button></div>
-        {!visiblePack ? <div className="proof-loading"><LoaderCircle className="spin" size={18} /> 正在汇总持久化证据…</div> : <>
+      <section ref={dialogRef} className="modal proof-modal" role="dialog" aria-modal="true" aria-labelledby="proof-title" aria-busy={!visiblePack && !loadError} tabIndex={-1} onKeyDown={onDialogKeyDown}>
+        <div className="modal-heading proof-heading">
+          <div><p className="eyebrow">可审计完成记录</p><h2 id="proof-title">截至第 {selectedTurnIndex} 轮的累计证据包</h2></div>
+          {turnIndexes.length > 1 && (
+            <label className="proof-turn-picker">
+              <span>证据轮次</span>
+              <select
+                aria-label="选择证据轮次"
+                value={selectedTurnIndex}
+                onChange={(event) => onTurnChange(Number(event.target.value))}
+              >
+                {turnIndexes.map((turnIndex) => (
+                  <option value={turnIndex} key={turnIndex}>第 {turnIndex} 轮</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <button className="icon-button" type="button" onClick={onClose} aria-label="关闭证据包"><X size={17} /></button>
+        </div>
+        {!visiblePack && loadError ? (
+          <div className="proof-load-error" role="alert">
+            <AlertTriangle size={22} />
+            <div><strong>证据读取失败</strong><span>{systemMessageLabel(loadError)}</span></div>
+            <button className="button ghost" type="button" onClick={onRetry}>重试</button>
+          </div>
+        ) : !visiblePack ? (
+          <div className="proof-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={18} /> 正在读取持久化证据…</div>
+        ) : <>
           <div className={`proof-verdict ${visiblePack.proof_status}`}><div className="evidence-seal"><Fingerprint size={22} /></div><div><span>证明状态</span><strong>{proofStatusLabel(visiblePack.proof_status)}</strong><small>{visiblePack.verification?.summary ?? "仍在汇总证据。"}</small></div><div><span>新鲜检查</span><strong>{visiblePack.checks_fresh ? "是" : "否"}</strong></div></div>
-          <div className="proof-grid"><article><span>工作边界</span><strong>{visiblePack.plan_gate ? planDecisionLabel(visiblePack.plan_gate.decision) : "未评估"}</strong><small>{visiblePack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>动作权限</span><strong>{approvalModeLabel(visiblePack.turns.at(-1)?.approval_mode ?? "automatic")}</strong><small>逐轮冻结 · 实际授权与 bypass 写入工具事件</small></article><article><span>思考强度</span><strong>{reasoningEffortLabel(visiblePack.turns.at(-1)?.reasoning_effort ?? "auto")}</strong><small>逐轮冻结 · 仅记录请求档位，不展示隐藏推理</small></article><article><span>变更范围</span><strong>{visiblePack.changed_files.length} 个文件</strong><small>{visiblePack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(visiblePack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(visiblePack.command_sandbox.status)}</strong><small>{visiblePack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {visiblePack.command_sandbox.sandboxed_commands} 个已强制隔离 · {visiblePack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(visiblePack.rollback.status)}</strong><small>{visiblePack.rollback.conflicts.length ? `保留 ${visiblePack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>全任务 {visiblePack.event_count} 条事件</strong><small>当前轮 {visiblePack.step_count} 个工具动作 · {visiblePack.repair_cycles} 轮修复</small></article></div>
+          <div className="proof-grid"><article><span>工作边界</span><strong>{visiblePack.plan_gate ? planDecisionLabel(visiblePack.plan_gate.decision) : "未评估"}</strong><small>{visiblePack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>动作权限</span><strong>{approvalModeLabel(visiblePack.turns.at(-1)?.approval_mode ?? "automatic")}</strong><small>逐轮冻结 · 实际授权与 bypass 写入工具事件</small></article><article><span>思考强度</span><strong>{reasoningEffortLabel(visiblePack.turns.at(-1)?.reasoning_effort ?? "auto")}</strong><small>逐轮冻结 · 仅记录请求档位，不展示隐藏推理</small></article><article><span>累计变更范围</span><strong>{visiblePack.changed_files.length} 个文件</strong><small>截至第 {selectedTurnIndex} 轮 · {visiblePack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(visiblePack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(visiblePack.command_sandbox.status)}</strong><small>{visiblePack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {visiblePack.command_sandbox.sandboxed_commands} 个已强制隔离 · {visiblePack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>冻结时回滚能力</span><strong>{rollbackStatusLabel(visiblePack.rollback.status)}</strong><small>生成证据时的能力快照，不代表当前仍可回滚</small></article><article><span>事件账本</span><strong>截至事件 #{visiblePack.event_through_seq} · {visiblePack.event_count} 条</strong><small>第 {selectedTurnIndex} 轮 · {visiblePack.step_count} 个工具动作 · {visiblePack.repair_cycles} 轮修复</small></article></div>
           <div className="proof-section"><div className="section-kicker">原始任务</div><p>{visiblePack.task}</p></div>
-          <div className="proof-section"><div className="section-kicker">验收证据</div>{visiblePack.plan?.acceptance_checks.map((check) => <div className="proof-check" key={check.id}><CheckCircle2 size={14} /><span><strong>{check.label}</strong><small>{check.evidence || check.command?.join(" ") || "等待证据"}</small></span><em>{checkStatusLabel(check.status)}</em></div>) ?? <p className="muted">尚无完成契约。</p>}</div>
-          <div className="digest-card"><Fingerprint size={15} /><span><small>稳定证据 SHA-256</small><code>{visiblePack.evidence_sha256}</code></span></div>
+          <div className="proof-section"><div className="section-kicker">截至该轮的验收证据</div>{visiblePack.plan?.acceptance_checks.map((check) => <div className="proof-check" key={check.id}><CheckCircle2 size={14} /><span><strong>{check.label}</strong><small>{check.evidence || check.command?.join(" ") || "等待证据"}</small></span><em>{checkStatusLabel(check.status)}</em></div>) ?? <p className="muted">尚无完成契约。</p>}</div>
+          <div className="digest-card"><Fingerprint size={15} /><span><small>完整证据包 SHA-256</small><code>{visiblePack.artifact_sha256}</code><small>语义证据：{visiblePack.evidence_sha256}</small></span></div>
         </>}
-        <div className="modal-actions"><span className="muted">摘要覆盖已持久化的计划、差异、检查、结论、回滚状态和事件账本。</span><div className="button-row"><button className="button ghost" type="button" onClick={onClose}>关闭</button><a className={`button primary ${visiblePack ? "" : "disabled"}`} href={visiblePack ? `/api/runs/${runId}/proof-pack.md` : undefined} download><Download size={14} /> 下载 Markdown</a></div></div>
+        <div className="modal-actions"><span className="muted">这是截至所选成功轮冻结的累计快照；后续轮次不会改写它。</span><div className="button-row"><button className="button ghost" type="button" onClick={onClose}>关闭</button><a className={`button primary ${visiblePack ? "" : "disabled"}`} href={visiblePack ? `/api/runs/${runId}/proof-pack.md?turn_index=${selectedTurnIndex}` : undefined} download><Download size={14} /> 下载 Markdown</a></div></div>
       </section>
     </div>
   );

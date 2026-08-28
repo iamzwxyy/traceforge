@@ -118,6 +118,7 @@ export interface Run {
   approval_mode: ApprovalMode;
   reasoning_effort: ReasoningEffort;
   turns: ConversationTurn[];
+  proof_turn_indexes: number[];
   verifier_enabled: boolean;
   plan: TaskPlan | null;
   clarification: ClarificationRequest | null;
@@ -258,9 +259,12 @@ export interface ProofRollback {
 }
 
 export interface ProofPack {
-  schema_version: "traceforge.proof-pack.v1";
+  schema_version: "traceforge.proof-pack.v2";
   generated_at: string;
   run_id: string;
+  turn_index: number;
+  scope: "cumulative_through_turn";
+  event_through_seq: number;
   task: string;
   workspace: string;
   project_id: string | null;
@@ -292,6 +296,7 @@ export interface ProofPack {
   created_at: string;
   updated_at: string;
   evidence_sha256: string;
+  artifact_sha256: string;
 }
 
 export interface ClarificationAnswer {

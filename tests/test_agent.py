@@ -12,6 +12,7 @@ from traceforge.config import Settings
 from traceforge.models import (
     ApprovalMode,
     ClarificationAnswer,
+    ConversationTurn,
     EventType,
     InteractionMode,
     PlanGate,
@@ -545,6 +546,287 @@ async def test_follow_up_continues_the_same_task_with_prior_turn_context(
     event_types = [event.type for event in storage.get_events(first.id)]
     assert event_types.count(EventType.TURN_STARTED) == 2
     assert event_types.count(EventType.TURN_COMPLETED) == 2
+
+
+@pytest.mark.asyncio
+async def test_success_freezes_proof_after_the_completion_event(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Reviewed"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Review the workspace", verifier_enabled=False)
+
+    completed = await manager.wait(run.id)
+    events = storage.get_events(run.id)
+    frozen = storage.get_proof_pack(run.id, 1)
+
+    assert completed.state is RunState.SUCCEEDED
+    assert events[-1].type is EventType.RUN_COMPLETED
+    assert frozen is not None
+    assert frozen.event_count == len(events)
+    assert frozen.turns[-1].outcome == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_atomic_success_failure_leaves_no_half_terminal_boundary(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Reviewed before the follow-up"},
+                    )
+                ]
+            ),
+        ]
+    )
+    def fail_proof_insert(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("atomic proof insert failed")
+
+    monkeypatch.setattr(storage, "_save_proof_pack_if_absent_locked", fail_proof_insert)
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Review the workspace", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+    events = storage.get_events(run.id)
+
+    assert completed.state is RunState.FAILED
+    assert completed.turns[-1].outcome == "failed"
+    assert completed.plan is not None
+    assert completed.plan.steps[-1].status != "completed"
+    assert storage.get_proof_pack(run.id) is None
+    assert not any(
+        event.type is EventType.STATE_CHANGED
+        and event.payload.get("state") == RunState.SUCCEEDED.value
+        for event in events
+    )
+    assert not any(
+        event.type is EventType.TURN_COMPLETED
+        and event.payload.get("outcome") == "succeeded"
+        for event in events
+    )
+    assert not any(
+        event.type is EventType.RUN_COMPLETED
+        and event.payload.get("state") == RunState.SUCCEEDED.value
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["follow_up", "rollback"])
+async def test_success_fallback_freeze_failure_has_zero_lifecycle_mutation(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    run = RunRecord(
+        id=f"fallback-freeze-{action}",
+        task="Preserve the successful evidence",
+        workspace=str(settings.workspace),
+        state=RunState.SUCCEEDED,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Preserve the successful evidence",
+                outcome="succeeded",
+                summary="Evidence ready",
+            )
+        ],
+    )
+    storage.create_run(run)
+    storage.append_event(
+        run.id,
+        EventType.TURN_COMPLETED,
+        {"index": 1, "outcome": "succeeded", "summary": "Evidence ready"},
+    )
+    storage.append_event(
+        run.id,
+        EventType.RUN_COMPLETED,
+        {"state": RunState.SUCCEEDED.value, "diff": ""},
+    )
+    manager = AgentManager(settings, storage, ScriptedProvider([]))
+    before_run = storage.get_run(run.id).model_dump_json()
+    before_events = [event.model_dump_json() for event in storage.get_events(run.id)]
+
+    def fail_save(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("proof storage unavailable")
+
+    monkeypatch.setattr(storage, "save_proof_pack_if_absent", fail_save)
+
+    with pytest.raises(RuntimeError, match="proof storage unavailable"):
+        if action == "follow_up":
+            await manager.follow_up(run.id, "Continue only after freezing")
+        else:
+            await manager.rollback(run.id)
+
+    assert storage.get_run(run.id).model_dump_json() == before_run
+    assert [event.model_dump_json() for event in storage.get_events(run.id)] == before_events
+    assert storage.get_proof_pack(run.id) is None
+
+
+@pytest.mark.asyncio
+async def test_gets_and_follow_up_wait_for_atomic_success_finalization(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Finalized atomically"},
+                    )
+                ]
+            ),
+            _direct_response("The frozen success is still available."),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    entered_finalization = asyncio.Event()
+    release_finalization = asyncio.Event()
+    original_cleanup = manager._prepare_terminal_cleanup
+
+    async def pause_before_commit(run: RunRecord, intended_state: RunState) -> bool:
+        ready = await original_cleanup(run, intended_state)
+        if ready and intended_state is RunState.SUCCEEDED:
+            entered_finalization.set()
+            await release_finalization.wait()
+        return ready
+
+    monkeypatch.setattr(manager, "_prepare_terminal_cleanup", pause_before_commit)
+    run = await manager.start_run("Review atomically", verifier_enabled=False)
+    await asyncio.wait_for(entered_finalization.wait(), timeout=3)
+
+    persisted = storage.get_run(run.id)
+    assert persisted.state is RunState.VERIFYING
+    assert persisted.turns[-1].outcome == "in_progress"
+    assert storage.get_proof_pack(run.id) is None
+    assert not any(
+        event.type is EventType.RUN_COMPLETED
+        and event.payload.get("state") == RunState.SUCCEEDED.value
+        for event in storage.get_events(run.id)
+    )
+
+    first_get = asyncio.create_task(manager.get_proof_pack(run.id))
+    second_get = asyncio.create_task(manager.get_proof_pack(run.id, 1))
+    follow_up = asyncio.create_task(
+        manager.follow_up(run.id, "Describe the completed review")
+    )
+    await asyncio.sleep(0)
+    assert not first_get.done()
+    assert not second_get.done()
+    assert not follow_up.done()
+
+    release_finalization.set()
+    first_result, second_result, continued = await asyncio.gather(
+        first_get, second_get, follow_up
+    )
+    first_pack = first_result[1]
+    second_pack = second_result[1]
+
+    assert first_pack is not None
+    assert second_pack is not None
+    assert first_pack.artifact_sha256 == second_pack.artifact_sha256
+    assert continued.turns[-1].index == 2
+    answered = await manager.wait(run.id)
+    assert answered.state is RunState.ANSWERED
+    assert storage.get_proof_pack(run.id, 1) == first_pack
+
+
+@pytest.mark.asyncio
+async def test_get_and_rollback_wait_for_atomic_success_finalization(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Ready before rollback"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    entered_finalization = asyncio.Event()
+    release_finalization = asyncio.Event()
+    original_cleanup = manager._prepare_terminal_cleanup
+
+    async def pause_before_commit(run: RunRecord, intended_state: RunState) -> bool:
+        ready = await original_cleanup(run, intended_state)
+        if ready and intended_state is RunState.SUCCEEDED:
+            entered_finalization.set()
+            await release_finalization.wait()
+        return ready
+
+    monkeypatch.setattr(manager, "_prepare_terminal_cleanup", pause_before_commit)
+    run = await manager.start_run("Review before rollback", verifier_enabled=False)
+    await asyncio.wait_for(entered_finalization.wait(), timeout=3)
+
+    proof_request = asyncio.create_task(manager.get_proof_pack(run.id))
+    rollback_request = asyncio.create_task(manager.rollback(run.id))
+    await asyncio.sleep(0)
+    assert not proof_request.done()
+    assert not rollback_request.done()
+
+    release_finalization.set()
+    proof_result, rollback_result = await asyncio.gather(
+        proof_request, rollback_request
+    )
+    pack = proof_result[1]
+
+    assert pack is not None
+    assert rollback_result.restored == []
+    assert rollback_result.removed == []
+    assert storage.get_run(run.id).state is RunState.ROLLED_BACK
+    assert storage.get_proof_pack(run.id, 1) == pack
+    assert pack.rollback.status == "not_available"
 
 
 @pytest.mark.asyncio

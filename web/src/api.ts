@@ -43,7 +43,9 @@ export const api = {
   getDiff: (runId: string) => request<{ diff: string }>(`/api/runs/${runId}/diff`),
   openWorkspace: (runId: string) =>
     request<OpenWorkspaceResult>(`/api/runs/${runId}/open-workspace`, { method: "POST" }),
-  getProofPack: (runId: string) => request<ProofPack>(`/api/runs/${runId}/proof-pack`),
+  getProofPack: (runId: string, turnIndex?: number) => request<ProofPack>(
+    `/api/runs/${runId}/proof-pack${turnIndex === undefined ? "" : `?turn_index=${turnIndex}`}`,
+  ),
   createRun: (
     task: string,
     mode: InteractionMode,

@@ -1,4 +1,4 @@
-import type { ReasoningEffort, Run, RunEvent, RunState } from "./types";
+import type { ProofPack, ReasoningEffort, Run, RunEvent, RunState } from "./types";
 
 export interface StatePresentation {
   label: string;
@@ -43,7 +43,27 @@ export function mergeEvents(current: RunEvent[], incoming: RunEvent[]): RunEvent
 
 export function preferNewerRun(current: Run | null, incoming: Run): Run {
   if (!current || current.id !== incoming.id) return incoming;
-  return incoming.updated_at >= current.updated_at ? incoming : current;
+  const preferred = incoming.updated_at >= current.updated_at ? incoming : current;
+  const proofTurnIndexes = [...new Set([
+    ...(current.proof_turn_indexes ?? []),
+    ...(incoming.proof_turn_indexes ?? []),
+  ])].sort((left, right) => left - right);
+  const preferredIndexes = preferred.proof_turn_indexes ?? [];
+  if (
+    preferredIndexes.length === proofTurnIndexes.length
+    && preferredIndexes.every((turnIndex, index) => turnIndex === proofTurnIndexes[index])
+  ) return preferred;
+  return { ...preferred, proof_turn_indexes: proofTurnIndexes };
+}
+
+export function availableProofTurnIndexes(
+  run: Pick<Run, "proof_turn_indexes">,
+): number[] {
+  return run.proof_turn_indexes;
+}
+
+export function proofPackTurnIndex(pack: Pick<ProofPack, "turn_index">): number {
+  return pack.turn_index;
 }
 
 export interface DiffLine {

@@ -19,6 +19,13 @@ class EventBroker:
         self, run_id: str, event_type: EventType, payload: dict[str, Any] | None = None
     ) -> RunEvent:
         event = self.storage.append_event(run_id, event_type, payload)
+        await self.publish(event)
+        return event
+
+    async def publish(self, event: RunEvent) -> None:
+        """Publish an event that was already committed by a larger storage transaction."""
+
+        run_id = event.run_id
         for queue in self._subscribers.get(run_id, set()).copy():
             try:
                 queue.put_nowait(event)
@@ -31,7 +38,6 @@ class EventBroker:
                 except asyncio.QueueEmpty:
                     pass
                 queue.put_nowait(event)
-        return event
 
     def subscribe(self, run_id: str) -> asyncio.Queue[RunEvent]:
         queue: asyncio.Queue[RunEvent] = asyncio.Queue(maxsize=500)

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 
 import pytest
+from pydantic import ValidationError
 
 from traceforge.config import Settings
 from traceforge.models import (
@@ -13,11 +15,14 @@ from traceforge.models import (
     ConversationTurn,
     EventType,
     ProjectRecord,
+    ProofPack,
     ProviderConfig,
     ReasoningEffort,
+    RunEvent,
     RunRecord,
     RunState,
 )
+from traceforge.proof import build_proof_pack, build_success_proof_pack
 from traceforge.storage import SecureCheckpointError, SnapshotRecord, Storage
 
 
@@ -65,6 +70,229 @@ def test_snapshot_is_write_once(storage: Storage, tmp_path: Path) -> None:
     assert storage.save_snapshot_if_absent(first)
     assert not storage.save_snapshot_if_absent(second)
     assert storage.list_snapshots("run-1")[0].content == b"a"
+
+
+def test_proof_pack_storage_is_write_once_and_validates_persisted_json(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "proof.db"
+    repository = Storage(database)
+    run = RunRecord(
+        id="proof-run",
+        task="Prove it",
+        workspace=str(workspace),
+        state=RunState.SUCCEEDED,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Prove it",
+                outcome="succeeded",
+                summary="Proven",
+            )
+        ],
+    )
+    repository.create_run(run)
+    first = build_proof_pack(run, repository)
+    stored = repository.save_proof_pack_if_absent(run.id, 1, first)
+    replacement_payload = first.model_dump(mode="python", exclude={"artifact_sha256"})
+    replacement_payload["task"] = "replacement must not win"
+    replacement = ProofPack.seal(**replacement_payload)
+
+    assert repository.save_proof_pack_if_absent(run.id, 1, replacement) == stored
+    assert repository.get_proof_pack(run.id) == stored
+    assert repository.get_proof_pack(run.id, 1) == stored
+    assert repository.get_proof_pack(run.id, 2) is None
+    repository.close()
+
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "UPDATE proof_packs SET proof_json = '{}' WHERE run_id = ? AND turn_index = ?",
+        (run.id, 1),
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = Storage(database)
+    try:
+        with pytest.raises(ValidationError):
+            reopened.get_proof_pack(run.id, 1)
+    finally:
+        reopened.close()
+
+
+def test_proof_pack_storage_rejects_hash_and_storage_identity_corruption(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "proof-corruption.db"
+    repository = Storage(database)
+    run = RunRecord(
+        id="proof-identity",
+        task="Keep proof identity",
+        workspace=str(workspace),
+        state=RunState.SUCCEEDED,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Keep proof identity",
+                outcome="succeeded",
+                summary="Identity preserved",
+            )
+        ],
+    )
+    repository.create_run(run)
+    pack = build_proof_pack(run, repository)
+    repository.save_proof_pack_if_absent(run.id, 1, pack)
+    repository.close()
+
+    tampered = pack.model_dump(mode="json")
+    tampered["task"] = "tampered without resealing"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE proof_packs SET proof_json = ? WHERE run_id = ? AND turn_index = 1",
+            (json.dumps(tampered), run.id),
+        )
+    reopened = Storage(database)
+    try:
+        with pytest.raises(ValidationError, match="artifact SHA-256"):
+            reopened.get_proof_pack(run.id, 1)
+    finally:
+        reopened.close()
+
+    wrong_identity_payload = pack.model_dump(
+        mode="python", exclude={"artifact_sha256"}
+    )
+    wrong_identity_payload["run_id"] = "different-run"
+    wrong_identity = ProofPack.seal(**wrong_identity_payload)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE proof_packs SET proof_json = ? WHERE run_id = ? AND turn_index = 1",
+            (wrong_identity.model_dump_json(), run.id),
+        )
+    reopened = Storage(database)
+    try:
+        with pytest.raises(ValueError, match="run id does not match"):
+            reopened.get_proof_pack(run.id, 1)
+    finally:
+        reopened.close()
+
+
+def test_atomic_success_commit_rolls_back_run_events_and_proof_together(
+    storage: Storage, settings: Settings
+) -> None:
+    run = RunRecord(
+        id="atomic-success",
+        task="Commit success atomically",
+        workspace=str(settings.workspace),
+        state=RunState.VERIFYING,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Commit success atomically",
+                outcome="in_progress",
+            )
+        ],
+    )
+    storage.create_run(run)
+    storage.append_event(run.id, EventType.STATE_CHANGED, {"state": "verifying"})
+    before_events = storage.get_events(run.id)
+    run.state = RunState.SUCCEEDED
+    run.turns[-1].outcome = "succeeded"
+    run.turns[-1].summary = "Committed"
+
+    def fail_proof(_events: list[RunEvent]) -> ProofPack:
+        raise RuntimeError("proof construction failed")
+
+    with pytest.raises(RuntimeError, match="proof construction failed"):
+        storage.commit_success(
+            run,
+            previous_state=RunState.VERIFYING,
+            turn_payload={"index": 1, "outcome": "succeeded", "summary": "Committed"},
+            completion_payload={"state": "succeeded", "diff": ""},
+            proof_factory=fail_proof,
+        )
+
+    persisted = storage.get_run(run.id)
+    assert persisted.state is RunState.VERIFYING
+    assert persisted.turns[-1].outcome == "in_progress"
+    assert storage.get_events(run.id) == before_events
+    assert storage.get_proof_pack(run.id) is None
+
+    terminal_events, pack = storage.commit_success(
+        run,
+        previous_state=RunState.VERIFYING,
+        turn_payload={"index": 1, "outcome": "succeeded", "summary": "Committed"},
+        completion_payload={"state": "succeeded", "diff": ""},
+        proof_factory=lambda events: build_success_proof_pack(run, storage, events),
+    )
+
+    assert [event.type for event in terminal_events] == [
+        EventType.STATE_CHANGED,
+        EventType.TURN_COMPLETED,
+        EventType.RUN_COMPLETED,
+    ]
+    assert storage.get_run(run.id).state is RunState.SUCCEEDED
+    assert storage.get_proof_pack(run.id, 1) == pack
+
+
+def test_atomic_success_rejects_a_different_preexisting_turn_proof(
+    storage: Storage, settings: Settings
+) -> None:
+    run = RunRecord(
+        id="atomic-proof-conflict",
+        task="Reject a conflicting frozen proof",
+        workspace=str(settings.workspace),
+        state=RunState.VERIFYING,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Reject a conflicting frozen proof",
+                outcome="in_progress",
+            )
+        ],
+    )
+    storage.create_run(run)
+    storage.append_event(run.id, EventType.STATE_CHANGED, {"state": "verifying"})
+    before_events = storage.get_events(run.id)
+    already_frozen_run = run.model_copy(deep=True)
+    already_frozen_run.state = RunState.SUCCEEDED
+    already_frozen_run.turns[-1].outcome = "succeeded"
+    already_frozen_run.turns[-1].summary = "Different historical result"
+    already_frozen = build_proof_pack(
+        already_frozen_run,
+        storage,
+        events=before_events,
+        turn_index=1,
+        event_through_seq=before_events[-1].seq,
+    )
+    storage.save_proof_pack_if_absent(run.id, 1, already_frozen)
+
+    run.state = RunState.SUCCEEDED
+    run.turns[-1].outcome = "succeeded"
+    run.turns[-1].summary = "New result must not replace frozen evidence"
+    with pytest.raises(ValueError, match="different Proof Pack already exists"):
+        storage.commit_success(
+            run,
+            previous_state=RunState.VERIFYING,
+            turn_payload={
+                "index": 1,
+                "outcome": "succeeded",
+                "summary": run.turns[-1].summary,
+            },
+            completion_payload={"state": "succeeded", "diff": ""},
+            proof_factory=lambda events: build_success_proof_pack(
+                run, storage, events
+            ),
+        )
+
+    persisted = storage.get_run(run.id)
+    assert persisted.state is RunState.VERIFYING
+    assert persisted.turns[-1].outcome == "in_progress"
+    assert storage.get_events(run.id) == before_events
+    assert storage.get_proof_pack(run.id, 1) == already_frozen
 
 
 def test_mark_active_runs_interrupted(storage: Storage, settings: Settings) -> None:
@@ -218,6 +446,18 @@ def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        INSERT INTO runs(
+            id, task, workspace, state, verifier_enabled, messages_json,
+            created_at, updated_at
+        ) VALUES (
+            'legacy-success', 'Legacy success', ?, 'succeeded', 1, '[]',
+            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+        )
+        """,
+        (str(tmp_path),),
+    )
     connection.commit()
     connection.close()
 
@@ -232,6 +472,9 @@ def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:
         assert loaded.approval_mode is ApprovalMode.AUTOMATIC
         assert loaded.reasoning_effort is ReasoningEffort.AUTO
         assert loaded.provider_reasoning_cleanup_pending is False
+        assert migrated.get_proof_pack("new") is None
+        assert migrated.is_proof_backfill_candidate("legacy-success") is True
+        assert migrated.is_proof_backfill_candidate("new") is False
     finally:
         migrated.close()
 

@@ -390,7 +390,11 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 13px; font-weight: 600; 
 .completion-summary > div { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .completion-summary strong { color: #c7d8d1; font-size: 11px; }
 .completion-summary span { overflow: hidden; color: #718477; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.completion-summary .proof-unavailable { color: var(--amber); font-size: 10px; line-height: 1.4; white-space: normal; }
 .completion-summary .button { min-height: 30px; padding: 0 8px; font-size: 10px; }
+.historical-proof-summary { color: #8faed8; border-top-color: rgba(112, 167, 255, 0.18); }
+.historical-proof-summary strong { color: #bdcde2; }
+.historical-proof-summary span { color: #70839e; }
 .evidence-seal { width: 40px; height: 40px; display: grid; place-items: center; color: var(--accent); border: 1px solid rgba(62, 214, 157, 0.3); border-radius: 50%; background: var(--accent-soft); }
 
 .inspector { min-width: 0; min-height: 0; position: relative; display: flex; flex-direction: column; border-left: 1px solid var(--line); }
@@ -455,7 +459,16 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 13px; font-weight: 600; 
 .finding p, .finding small { color: #8f9bab; font-size: 11px; line-height: 1.55; }
 
 .proof-modal { width: min(860px, 100%); }
+.proof-heading { align-items: center; }
+.proof-turn-picker { margin-left: auto; display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
+.proof-turn-picker span { white-space: nowrap; }
+.proof-turn-picker select { min-height: 34px; padding: 0 28px 0 10px; color: #d3dce7; border: 1px solid #344054; border-radius: 7px; background: #111925; font-size: 12px; }
+.proof-turn-picker select:focus-visible { outline: 2px solid rgba(112, 167, 255, 0.8); outline-offset: 2px; }
 .proof-loading { min-height: 320px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.proof-load-error { min-height: 240px; padding: 28px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; color: var(--red); }
+.proof-load-error > div { display: flex; flex-direction: column; gap: 4px; }
+.proof-load-error strong { color: #f3c0c0; font-size: 13px; }
+.proof-load-error span { color: #b99297; font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
 .proof-verdict { padding: 14px; display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: center; gap: 12px; color: var(--accent); border: 1px solid rgba(62, 214, 157, 0.28); border-radius: 10px; background: linear-gradient(140deg, rgba(19, 49, 39, 0.68), rgba(12, 20, 22, 0.92)); }
 .proof-verdict.not_proven { color: var(--red); border-color: rgba(241, 120, 120, 0.25); background: rgba(60, 20, 27, 0.35); }
 .proof-verdict.in_progress, .proof-verdict.checks_only { color: var(--amber); border-color: rgba(240, 182, 91, 0.25); background: rgba(54, 39, 17, 0.35); }
@@ -538,6 +551,10 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 13px; font-weight: 600; 
   .follow-up-actions { flex-wrap: wrap; }
   .follow-up-hint { display: none; }
   .follow-up-actions .button { margin-left: auto; }
+  .proof-heading { align-items: flex-start; flex-wrap: wrap; gap: 10px; }
+  .proof-heading > div:first-child { min-width: 0; flex: 1; }
+  .proof-turn-picker { width: 100%; order: 3; }
+  .proof-turn-picker select { min-width: 0; flex: 1; }
   .option-grid { grid-template-columns: 1fr; }
   .decision-actions { align-items: flex-start; flex-direction: column; }
   .decision-actions .button-row { width: 100%; justify-content: flex-end; }
@@ -545,6 +562,11 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 13px; font-weight: 600; 
   .proof-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .proof-verdict { grid-template-columns: 36px minmax(0, 1fr); }
   .proof-verdict > div:last-child { display: none; }
+  .proof-modal .modal-actions { align-items: stretch; flex-direction: column; }
+  .proof-modal .modal-actions > span { max-width: none; overflow: visible; text-overflow: clip; white-space: normal; }
+  .proof-modal .modal-actions .button-row { justify-content: flex-end; }
+  .proof-load-error { grid-template-columns: auto minmax(0, 1fr); }
+  .proof-load-error .button { grid-column: 1 / -1; justify-self: end; }
 }
 
 @media (prefers-reduced-motion: reduce) {

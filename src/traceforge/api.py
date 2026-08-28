@@ -52,13 +52,17 @@ from traceforge.models import (
     TaskPlan,
     VerificationReport,
 )
-from traceforge.proof import build_proof_pack, proof_pack_markdown
+from traceforge.proof import (
+    ProofNotReadyError,
+    freeze_success_proof_pack,
+    proof_pack_markdown,
+)
 from traceforge.provider import ModelProvider
 from traceforge.runtime import AgentRuntime, resolve_workspace
 from traceforge.sandbox import sandbox_status
 from traceforge.storage import Storage
 from traceforge.tools import scrubbed_environment
-from traceforge.workspace import Workspace
+from traceforge.workspace import Workspace, WorkspaceViolation
 
 
 class CreateRunRequest(BaseModel):
@@ -198,9 +202,12 @@ class RunView(BaseModel):
     error: str | None
     created_at: datetime
     updated_at: datetime
+    proof_turn_indexes: list[int] = Field(default_factory=list)
 
     @classmethod
-    def from_record(cls, run: RunRecord) -> RunView:
+    def from_record(
+        cls, run: RunRecord, *, proof_turn_indexes: list[int] | None = None
+    ) -> RunView:
         public = run.model_dump(
             exclude={
                 "messages",
@@ -212,6 +219,7 @@ class RunView(BaseModel):
         public["context_tokens"] = ContextManager(run.context_limit).estimated_tokens(
             run.messages
         )
+        public["proof_turn_indexes"] = proof_turn_indexes or []
         return cls.model_validate(public)
 
 
@@ -226,6 +234,7 @@ def create_app(
         raise ValueError("Instance identity and configuration fingerprint must be paired")
     storage = Storage(settings.data_dir / "traceforge.db")
     storage.mark_all_active_runs_interrupted()
+    _backfill_legacy_success_proofs(storage)
     broker = EventBroker(storage)
     runtime = AgentRuntime(settings, storage, broker, provider_override=provider)
 
@@ -249,6 +258,24 @@ def create_app(
     app.state.instance_id = instance_id
     app.state.instance_config_fingerprint = instance_config_fingerprint
 
+    def run_view(run: RunRecord) -> RunView:
+        return RunView.from_record(
+            run,
+            proof_turn_indexes=storage.list_proof_pack_turn_indexes(run.id),
+        )
+
+    async def frozen_proof(
+        run_id: str, turn_index: int | None
+    ) -> tuple[RunRecord, ProofPack | None]:
+        run = storage.get_run(run_id)
+        pack = storage.get_proof_pack(run_id, turn_index)
+        if pack is not None:
+            return run, pack
+        manager = runtime.existing_manager_for_run(run_id)
+        if manager is not None:
+            return await manager.get_proof_pack(run_id, turn_index)
+        return run, None
+
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Any) -> Any:
         response: Response
@@ -270,6 +297,8 @@ def create_app(
             "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; "
             "style-src 'self' 'unsafe-inline'; script-src 'self'"
         )
+        if request.url.path.endswith(("/proof-pack", "/proof-pack.md")):
+            response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.exception_handler(KeyError)
@@ -457,7 +486,7 @@ def create_app(
         records = storage.list_runs(project_id=project_id)
         if direct_only:
             records = [run for run in records if run.project_id is None]
-        return [RunView.from_record(run) for run in records]
+        return [run_view(run) for run in records]
 
     @app.post("/api/runs", response_model=RunView, status_code=status.HTTP_201_CREATED)
     async def create_run(body: CreateRunRequest) -> RunView:
@@ -505,11 +534,11 @@ def create_app(
             if created_workspace is not None:
                 _remove_empty_directory(created_workspace)
             raise
-        return RunView.from_record(run)
+        return run_view(run)
 
     @app.get("/api/runs/{run_id}", response_model=RunView)
     async def get_run(run_id: str) -> RunView:
-        return RunView.from_record(storage.get_run(run_id))
+        return run_view(storage.get_run(run_id))
 
     @app.get("/api/runs/{run_id}/events", response_model=list[RunEvent])
     async def get_events(
@@ -541,14 +570,14 @@ def create_app(
         )
 
     @app.get("/api/runs/{run_id}/proof-pack", response_model=ProofPack)
-    async def get_proof_pack(run_id: str) -> ProofPack:
-        run = storage.get_run(run_id)
-        if run.state is RunState.ANSWERED:
-            raise HTTPException(
-                status_code=409,
-                detail="The latest answer-only turn has no completion Proof Pack",
-            )
-        return build_proof_pack(run, storage)
+    async def get_proof_pack(
+        run_id: str,
+        response: Response,
+        turn_index: Annotated[int | None, Query(ge=1)] = None,
+    ) -> ProofPack:
+        run, pack = await frozen_proof(run_id, turn_index)
+        response.headers["Cache-Control"] = "no-store"
+        return _require_frozen_proof_pack(run, pack, turn_index=turn_index)
 
     @app.get("/api/runs/{run_id}/plan.md", response_class=PlainTextResponse)
     async def download_plan(run_id: str) -> PlainTextResponse:
@@ -566,20 +595,20 @@ def create_app(
         )
 
     @app.get("/api/runs/{run_id}/proof-pack.md", response_class=PlainTextResponse)
-    async def download_proof_pack(run_id: str) -> PlainTextResponse:
-        run = storage.get_run(run_id)
-        if run.state is RunState.ANSWERED:
-            raise HTTPException(
-                status_code=409,
-                detail="The latest answer-only turn has no completion Proof Pack",
-            )
-        pack = build_proof_pack(run, storage)
+    async def download_proof_pack(
+        run_id: str,
+        turn_index: Annotated[int | None, Query(ge=1)] = None,
+    ) -> PlainTextResponse:
+        run, frozen = await frozen_proof(run_id, turn_index)
+        pack = _require_frozen_proof_pack(run, frozen, turn_index=turn_index)
         return PlainTextResponse(
             proof_pack_markdown(pack),
             media_type="text/markdown; charset=utf-8",
             headers={
+                "Cache-Control": "no-store",
                 "Content-Disposition": (
-                    f'attachment; filename="traceforge-{run_id[:8]}-proof-pack.md"'
+                    f'attachment; filename="traceforge-{run_id[:8]}-'
+                    f'turn-{pack.turn_index}-proof-pack.md"'
                 )
             },
         )
@@ -603,7 +632,7 @@ def create_app(
             approval_mode=body.approval_mode,
             reasoning_effort=body.reasoning_effort,
         )
-        return RunView.from_record(run)
+        return run_view(run)
 
     @app.post("/api/runs/{run_id}/plan-decision", status_code=status.HTTP_202_ACCEPTED)
     async def decide_plan(run_id: str, body: PlanDecision) -> dict[str, bool]:
@@ -627,13 +656,11 @@ def create_app(
 
     @app.post("/api/runs/{run_id}/cancel", response_model=RunView)
     async def cancel_run(run_id: str) -> RunView:
-        return RunView.from_record(
-            await runtime.manager_for_run(run_id).cancel(run_id)
-        )
+        return run_view(await runtime.manager_for_run(run_id).cancel(run_id))
 
     @app.post("/api/runs/{run_id}/resume", response_model=RunView)
     async def resume_run(run_id: str) -> RunView:
-        return RunView.from_record(await runtime.resume_run(run_id))
+        return run_view(await runtime.resume_run(run_id))
 
     @app.post("/api/runs/{run_id}/rollback")
     async def rollback_run(run_id: str) -> dict[str, list[str]]:
@@ -708,6 +735,52 @@ def create_app(
 
     _mount_frontend(app)
     return app
+
+
+def _require_frozen_proof_pack(
+    run: RunRecord,
+    pack: ProofPack | None,
+    *,
+    turn_index: int | None,
+) -> ProofPack:
+    """Return a frozen success proof without reconstructing historical mutable state."""
+
+    if pack is not None:
+        return pack
+    if turn_index is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This task has no frozen successful-turn Proof Pack",
+        )
+    matching_turn = next((turn for turn in run.turns if turn.index == turn_index), None)
+    if matching_turn is None:
+        raise HTTPException(status_code=404, detail=f"Turn {turn_index} was not found")
+    if matching_turn.outcome != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Turn {turn_index} did not complete successfully and has no Proof Pack",
+        )
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Turn {turn_index} predates frozen Proof Packs and cannot be reconstructed "
+            "without changing its historical evidence"
+        ),
+    )
+
+
+def _backfill_legacy_success_proofs(storage: Storage) -> None:
+    """Freeze reconstructable pre-v2 current successes before serving the UI.
+
+    A stale or removed workspace must not prevent TraceForge from starting. Such rows remain
+    marked as candidates and are not advertised as available Proof Packs.
+    """
+
+    for run_id in storage.list_proof_backfill_candidate_ids():
+        try:
+            freeze_success_proof_pack(storage.get_run(run_id), storage)
+        except (OSError, ProofNotReadyError, WorkspaceViolation):
+            continue
 
 
 def _allowed_origin(origin: str) -> bool:

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import { mergeEvents, preferNewerRun } from "./lib";
+import { mergeEvents, preferNewerRun, proofPackTurnIndex } from "./lib";
 import type {
   AppStatus,
   ApprovalMode,
@@ -36,12 +36,20 @@ const refreshEventTypes = new Set([
   "rollback.completed",
 ]);
 
+export interface ProofLoadState {
+  runId: string;
+  turnIndex: number | null;
+  status: "loading" | "ready" | "error";
+  error: string | null;
+}
+
 export function useTraceForge() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [provider, setProvider] = useState<ProviderConfig | null>(null);
   const [proofPack, setProofPack] = useState<ProofPack | null>(null);
+  const [proofLoadState, setProofLoadState] = useState<ProofLoadState | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [diff, setDiff] = useState("");
@@ -70,6 +78,7 @@ export function useTraceForge() {
     setEvents([]);
     setDiff("");
     setProofPack(null);
+    setProofLoadState(null);
     setConnected(false);
     setError(null);
     setSelectedRunId(runId);
@@ -139,6 +148,7 @@ export function useTraceForge() {
       setEvents([]);
       setDiff("");
       setProofPack(null);
+      setProofLoadState(null);
       return;
     }
     let disposed = false;
@@ -146,6 +156,7 @@ export function useTraceForge() {
     let socket: WebSocket | undefined;
     lastSeq.current = 0;
     setProofPack(null);
+    setProofLoadState(null);
     const ownsSelection = () => !disposed && selectedRunIdRef.current === selectedRunId;
 
     const connect = () => {
@@ -330,23 +341,44 @@ export function useTraceForge() {
     }
   }, []);
 
-  const loadProofPack = useCallback(async (runId: string): Promise<ProofPack> => {
+  const loadProofPack = useCallback(async (
+    runId: string,
+    turnIndex?: number,
+  ): Promise<ProofPack> => {
     if (selectedRunIdRef.current !== runId) {
       throw new Error("当前任务已切换，请在当前任务中重新打开证据包");
     }
     const requestVersion = proofRequestVersion.current + 1;
     proofRequestVersion.current = requestVersion;
-    if (selectedRunIdRef.current === runId) setError(null);
+    if (selectedRunIdRef.current === runId) {
+      setError(null);
+      setProofPack(null);
+      setProofLoadState({
+        runId,
+        turnIndex: turnIndex ?? null,
+        status: "loading",
+        error: null,
+      });
+    }
     try {
-      const pack = await api.getProofPack(runId);
+      const pack = await api.getProofPack(runId, turnIndex);
       if (pack.run_id !== runId) {
         throw new Error("证据包响应与请求的任务不匹配");
+      }
+      if (turnIndex !== undefined && proofPackTurnIndex(pack) !== turnIndex) {
+        throw new Error("证据包响应与请求的轮次不匹配");
       }
       if (
         selectedRunIdRef.current === runId
         && proofRequestVersion.current === requestVersion
       ) {
         setProofPack(pack);
+        setProofLoadState({
+          runId,
+          turnIndex: proofPackTurnIndex(pack),
+          status: "ready",
+          error: null,
+        });
       }
       return pack;
     } catch (reason) {
@@ -354,7 +386,12 @@ export function useTraceForge() {
         selectedRunIdRef.current === runId
         && proofRequestVersion.current === requestVersion
       ) {
-        setError(reason instanceof Error ? reason.message : String(reason));
+        setProofLoadState({
+          runId,
+          turnIndex: turnIndex ?? null,
+          status: "error",
+          error: reason instanceof Error ? reason.message : String(reason),
+        });
       }
       throw reason;
     }
@@ -365,6 +402,7 @@ export function useTraceForge() {
     projects,
     provider,
     proofPack,
+    proofLoadState,
     runs,
     run,
     events,

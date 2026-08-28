@@ -27,9 +27,12 @@ Its differentiator is a defensible engineering loop with useful human control.
   and evidence stay visible. A write outside the declared file scope pauses for action approval.
 - **Independent completion review.** The reviewer cannot write files or run commands. A rejection
   returns concrete findings to the builder for at most two repair cycles.
-- **Downloadable Proof Pack.** One auditable Markdown artifact joins the persisted final diff,
-  fresh checks, verifier verdict, conflict-aware rollback state, event ledger, and SHA-256
-  integrity fingerprints. The visible run, controls, errors, Diff, event stream, and Proof response
+- **Downloadable Proof Pack.** Every successful turn atomically freezes an immutable v2 artifact
+  joining its persisted completion diff, fresh checks, verifier verdict, conflict-aware rollback
+  state, bounded event ledger, and layered SHA-256 integrity fingerprints. Later answers, failures,
+  cancellations, rollbacks, or workspace edits cannot rewrite that historical turn. JSON and
+  Markdown can select an exact successful turn, while legacy gaps stay honestly unavailable.
+  The visible run, controls, errors, Diff, event stream, and Proof response
   are owned by the selected task, so a late network response cannot be projected or acted on beneath
   another task's title.
 - **Conversation without losing the Trace.** Follow-up prompts continue the same task and preserve
@@ -237,8 +240,8 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 287 backend tests at 88.33% coverage (with a hard 85% gate), 16 frontend
-unit tests, and 16 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 300 backend tests at 88.38% coverage (with a hard 85% gate), 18 frontend
+unit tests, and 19 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 

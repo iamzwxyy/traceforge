@@ -111,20 +111,21 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByText("实时", { exact: true })).toBeVisible();
   await expect(page.getByText("1 项检查通过", { exact: false })).toBeVisible();
   await page.getByRole("button", { name: "查看证据" }).click();
-  const proofDialog = page.getByRole("dialog", { name: "证据包" });
+  const proofDialog = page.getByRole("dialog", { name: /截至第 \d+ 轮的累计证据包/ });
   await expect(proofDialog).toBeVisible();
   await expect(proofDialog.getByText("已证实", { exact: true })).toBeVisible();
-  await expect(proofDialog.getByText("稳定证据 SHA-256")).toBeVisible();
+  await expect(proofDialog.getByText("完整证据包 SHA-256")).toBeVisible();
+  await expect(proofDialog.getByText(/^语义证据：[a-f0-9]{64}$/)).toBeVisible();
   await expect(proofDialog).toContainText("4 passed");
   await expect(proofDialog.getByText("命令沙箱")).toBeVisible();
   await expect(proofDialog.getByText("思考强度")).toBeVisible();
-  await expect(proofDialog.getByText(/当前轮 \d+ 个工具动作 · \d+ 轮修复/)).toBeVisible();
+  await expect(proofDialog.getByText(/第 \d+ 轮 · \d+ 个工具动作 · \d+ 轮修复/)).toBeVisible();
   await expect(proofDialog.getByText(/\d+ 个已强制隔离 · 0 个运行前拦截/)).toBeVisible();
   await expectNoWcagViolations(page, "proof pack dialog");
   await expect(page.getByRole("link", { name: "下载 Markdown" }))
-    .toHaveAttribute("href", /proof-pack\.md$/);
+    .toHaveAttribute("href", /proof-pack\.md\?turn_index=\d+$/);
   await page.keyboard.press("Escape");
-  await expect(page.getByRole("dialog", { name: "证据包" })).toHaveCount(0);
+  await expect(page.getByRole("dialog", { name: /截至第 \d+ 轮的累计证据包/ })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "查看证据" })).toBeFocused();
   await page.getByRole("button", { name: "回滚", exact: true }).click();
   const rollbackDialog = page.getByRole("dialog", { name: "回滚本次运行？" });
