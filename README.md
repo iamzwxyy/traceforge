@@ -29,7 +29,9 @@ Its differentiator is a defensible engineering loop with useful human control.
   returns concrete findings to the builder for at most two repair cycles.
 - **Downloadable Proof Pack.** One auditable Markdown artifact joins the persisted final diff,
   fresh checks, verifier verdict, conflict-aware rollback state, event ledger, and SHA-256
-  integrity fingerprints.
+  integrity fingerprints. The visible run, controls, errors, Diff, event stream, and Proof response
+  are owned by the selected task, so a late network response cannot be projected or acted on beneath
+  another task's title.
 - **Conversation without losing the Trace.** Follow-up prompts continue the same task and preserve
   prior turn summaries, workspace, and evidence. The main feed reads like a coding conversation;
   each final answer names the files actually changed by native edit tools in that turn, while the
@@ -217,7 +219,7 @@ uv run python scripts/evaluate_real_model.py \
 ```
 
 The current suite has 231 backend tests at 88.03% coverage (with a hard 85% gate), ten frontend
-unit tests, and four serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+unit tests, and nine serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 

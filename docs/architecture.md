@@ -207,6 +207,17 @@ projection and Markdown display them, while the v1 stable evidence digest exclud
 turn hints. Their `turn.started`, `turn.completed`, `tool.completed`, and `model.requested` events
 remain covered by the event-chain digest.
 
+The browser treats run identity as part of every evidence value. Selecting a different run first
+invalidates outstanding Diff and Proof generations and clears the prior projection. HTTP results
+are committed only when both their run owner and request generation still match; a newer
+`diff.updated` WebSocket event also invalidates an older in-flight Diff fetch. Socket callbacks are
+likewise ignored after ownership changes, inbound events and Proof payloads must echo the requested
+`run_id`, and task-scoped errors are exposed only while their owner remains selected. The visible
+run is derived from the selected id and the run cache instead of being independent state. Actions
+recheck that identity before dispatch, while `RunStage` is keyed by run id so form, confirmation,
+and loading state cannot survive a task switch. This keeps transport and render timing from
+relabeling one run's state or acting on another run.
+
 ## Reasoning effort and provider-private replay
 
 `ReasoningEffort` is a per-turn input, separate from Agent/Plan interaction mode and action

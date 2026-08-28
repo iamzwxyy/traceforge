@@ -210,6 +210,15 @@ starting a hanging process. Security headers deny framing, MIME sniffing, and ou
 default. Binding to another interface expands the trust boundary and should only be done behind
 controls chosen by the user.
 
+The frontend also enforces a local evidence boundary between runs. A task switch invalidates old
+Diff and Proof requests and detaches the previous event stream; late callbacks are ignored unless
+their run owner and generation still match the selected run. Proof JSON must additionally carry
+the requested `run_id`, as must every accepted event. The visible run is derived from the current
+selection, per-run component state is remounted, task errors retain owner checks, and actions reject
+a stale UI owner before dispatch. These checks prevent ordinary response or render reordering from
+displaying one workspace's evidence—or targeting its controls—under another task, while the backend
+remains the authority for access to each run-scoped route.
+
 ## Residual risks
 
 - A user-approved bypass has the user's OS permissions and can ignore the workspace boundary.

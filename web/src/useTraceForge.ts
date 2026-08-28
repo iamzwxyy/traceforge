@@ -43,29 +43,54 @@ export function useTraceForge() {
   const [provider, setProvider] = useState<ProviderConfig | null>(null);
   const [proofPack, setProofPack] = useState<ProofPack | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  const [run, setRun] = useState<Run | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [diff, setDiff] = useState("");
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const lastSeq = useRef(0);
   const selectedRunIdRef = useRef<string | null>(null);
+  const diffRequestVersions = useRef(new Map<string, number>());
+  const diffEventVersions = useRef(new Map<string, number>());
+  const proofRequestVersion = useRef(0);
+  const run = selectedRunId
+    ? runs.find((candidate) => candidate.id === selectedRunId) ?? null
+    : null;
 
   const selectRun = useCallback((runId: string | null) => {
+    if (selectedRunIdRef.current === runId) return;
     selectedRunIdRef.current = runId;
+    if (runId) {
+      diffRequestVersions.current.set(
+        runId,
+        (diffRequestVersions.current.get(runId) ?? 0) + 1,
+      );
+    }
+    proofRequestVersion.current += 1;
+    lastSeq.current = 0;
+    setEvents([]);
+    setDiff("");
+    setProofPack(null);
+    setConnected(false);
+    setError(null);
     setSelectedRunId(runId);
   }, []);
 
   const refreshRuns = useCallback(async () => {
     const next = await api.listRuns();
-    setRuns(next);
+    setRuns((current) => {
+      const returnedIds = new Set(next.map((candidate) => candidate.id));
+      return [
+        ...next.map((candidate) => preferNewerRun(
+          current.find((existing) => existing.id === candidate.id) ?? null,
+          candidate,
+        )),
+        ...current.filter((candidate) => !returnedIds.has(candidate.id)),
+      ].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+    });
     return next;
   }, []);
 
   const storeRun = useCallback((nextRun: Run) => {
-    setRun((current) =>
-      selectedRunIdRef.current === nextRun.id ? preferNewerRun(current, nextRun) : current,
-    );
     setRuns((current) => {
       const previous = current.find((item) => item.id === nextRun.id) ?? null;
       const selected = preferNewerRun(previous, nextRun);
@@ -81,9 +106,21 @@ export function useTraceForge() {
   }, [storeRun]);
 
   const refreshRun = useCallback(async (runId: string) => {
-    const [nextRun, nextDiff] = await Promise.all([api.getRun(runId), api.getDiff(runId)]);
-    storeRun(nextRun);
-    setDiff(nextDiff.diff);
+    const requestVersion = (diffRequestVersions.current.get(runId) ?? 0) + 1;
+    diffRequestVersions.current.set(runId, requestVersion);
+    const eventVersion = diffEventVersions.current.get(runId) ?? 0;
+    const metadataRequest = api.getRun(runId).then((nextRun) => {
+      storeRun(nextRun);
+      return nextRun;
+    });
+    const [, nextDiff] = await Promise.all([metadataRequest, api.getDiff(runId)]);
+    if (
+      selectedRunIdRef.current === runId
+      && diffRequestVersions.current.get(runId) === requestVersion
+      && (diffEventVersions.current.get(runId) ?? 0) === eventVersion
+    ) {
+      setDiff(nextDiff.diff);
+    }
   }, [storeRun]);
 
   useEffect(() => {
@@ -92,14 +129,13 @@ export function useTraceForge() {
         setStatus(nextStatus);
         setProjects(nextProjects);
         setProvider(nextProvider);
-        if (!selectedRunId && nextRuns.length) selectRun(nextRuns[0].id);
+        if (!selectedRunIdRef.current && nextRuns.length) selectRun(nextRuns[0].id);
       })
       .catch((reason: unknown) => setError(String(reason)));
-  }, [refreshRuns, selectRun, selectedRunId]);
+  }, [refreshRuns, selectRun]);
 
   useEffect(() => {
     if (!selectedRunId) {
-      setRun(null);
       setEvents([]);
       setDiff("");
       setProofPack(null);
@@ -110,26 +146,43 @@ export function useTraceForge() {
     let socket: WebSocket | undefined;
     lastSeq.current = 0;
     setProofPack(null);
+    const ownsSelection = () => !disposed && selectedRunIdRef.current === selectedRunId;
 
     const connect = () => {
+      if (!ownsSelection()) return;
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       socket = new WebSocket(
         `${protocol}//${window.location.host}/api/runs/${selectedRunId}/events?after_seq=${lastSeq.current}`,
       );
-      socket.onopen = () => setConnected(true);
+      socket.onopen = () => {
+        if (ownsSelection()) setConnected(true);
+      };
       socket.onmessage = (message) => {
+        if (!ownsSelection()) return;
         const event = JSON.parse(message.data as string) as RunEvent;
+        if (event.run_id !== selectedRunId) return;
         lastSeq.current = Math.max(lastSeq.current, event.seq);
         setEvents((current) => mergeEvents(current, [event]));
-        if (refreshEventTypes.has(event.type)) void refreshRunMetadata(selectedRunId);
+        if (refreshEventTypes.has(event.type)) {
+          void refreshRunMetadata(selectedRunId).catch((reason: unknown) => {
+            if (ownsSelection()) setError(String(reason));
+          });
+        }
         if (event.type === "diff.updated") {
           const payloadDiff = event.payload.diff;
-          if (typeof payloadDiff === "string") setDiff(payloadDiff);
+          if (typeof payloadDiff === "string") {
+            diffEventVersions.current.set(
+              selectedRunId,
+              (diffEventVersions.current.get(selectedRunId) ?? 0) + 1,
+            );
+            setDiff(payloadDiff);
+          }
         }
       };
       socket.onclose = () => {
+        if (!ownsSelection()) return;
         setConnected(false);
-        if (!disposed) reconnectTimer = window.setTimeout(connect, 800);
+        reconnectTimer = window.setTimeout(connect, 800);
       };
       socket.onerror = () => socket?.close();
     };
@@ -139,12 +192,15 @@ export function useTraceForge() {
       api.getEvents(selectedRunId),
     ])
       .then(([, initialEvents]) => {
-        if (disposed) return;
-        setEvents(initialEvents);
-        lastSeq.current = initialEvents.at(-1)?.seq ?? 0;
+        if (!ownsSelection()) return;
+        const ownedEvents = initialEvents.filter((event) => event.run_id === selectedRunId);
+        setEvents(ownedEvents);
+        lastSeq.current = ownedEvents.at(-1)?.seq ?? 0;
         connect();
       })
-      .catch((reason: unknown) => setError(String(reason)));
+      .catch((reason: unknown) => {
+        if (ownsSelection()) setError(String(reason));
+      });
 
     return () => {
       disposed = true;
@@ -154,19 +210,24 @@ export function useTraceForge() {
   }, [refreshRun, refreshRunMetadata, selectedRunId]);
 
   const perform = useCallback(
-    async (operation: () => Promise<unknown>) => {
-      setError(null);
+    async (runId: string, operation: () => Promise<unknown>) => {
+      if (selectedRunIdRef.current !== runId) {
+        throw new Error("当前任务已切换，请在当前任务中重试此操作");
+      }
+      if (selectedRunIdRef.current === runId) setError(null);
       try {
         await operation();
-        setProofPack(null);
-        if (selectedRunId) await refreshRun(selectedRunId);
+        if (selectedRunIdRef.current === runId) setProofPack(null);
+        await refreshRun(runId);
         await refreshRuns();
       } catch (reason) {
-        setError(reason instanceof Error ? reason.message : String(reason));
+        if (selectedRunIdRef.current === runId) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
         throw reason;
       }
     },
-    [refreshRun, refreshRuns, selectedRunId],
+    [refreshRun, refreshRuns],
   );
 
   const createRun = useCallback(
@@ -224,13 +285,18 @@ export function useTraceForge() {
   }, []);
 
   const openWorkspace = useCallback(async (runId: string) => {
+    if (selectedRunIdRef.current !== runId) {
+      throw new Error("当前任务已切换，请在当前任务中重试此操作");
+    }
     setError(null);
     try {
       const result = await api.openWorkspace(runId);
       if (!result.supported) throw new Error("当前系统没有可用的文件管理器");
       return result;
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (selectedRunIdRef.current === runId) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
       throw reason;
     }
   }, []);
@@ -262,13 +328,31 @@ export function useTraceForge() {
   }, []);
 
   const loadProofPack = useCallback(async (runId: string): Promise<ProofPack> => {
-    setError(null);
+    if (selectedRunIdRef.current !== runId) {
+      throw new Error("当前任务已切换，请在当前任务中重新打开证据包");
+    }
+    const requestVersion = proofRequestVersion.current + 1;
+    proofRequestVersion.current = requestVersion;
+    if (selectedRunIdRef.current === runId) setError(null);
     try {
       const pack = await api.getProofPack(runId);
-      setProofPack(pack);
+      if (pack.run_id !== runId) {
+        throw new Error("证据包响应与请求的任务不匹配");
+      }
+      if (
+        selectedRunIdRef.current === runId
+        && proofRequestVersion.current === requestVersion
+      ) {
+        setProofPack(pack);
+      }
       return pack;
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (
+        selectedRunIdRef.current === runId
+        && proofRequestVersion.current === requestVersion
+      ) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
       throw reason;
     }
   }, []);
@@ -293,7 +377,7 @@ export function useTraceForge() {
       mode: InteractionMode,
       approvalMode: ApprovalMode,
       reasoningEffort: ReasoningEffort,
-    ) => run && perform(() => api.followUp(
+    ) => run && perform(run.id, () => api.followUp(
       run.id,
       prompt,
       mode,
@@ -308,14 +392,14 @@ export function useTraceForge() {
     chooseDirectory,
     openWorkspace,
     answerQuestions: (answers: ClarificationAnswer[]) =>
-      run && perform(() => api.answerQuestions(run.id, answers)),
+      run && perform(run.id, () => api.answerQuestions(run.id, answers)),
     decidePlan: (decision: "approve" | "revise", feedback = "") =>
-      run && perform(() => api.decidePlan(run.id, decision, feedback)),
+      run && perform(run.id, () => api.decidePlan(run.id, decision, feedback)),
     decideAction: (approved: boolean) =>
       run?.pending_approval &&
-      perform(() => api.decideAction(run.id, run.pending_approval!.id, approved)),
-    cancel: () => run && perform(() => api.cancel(run.id)),
-    resume: () => run && perform(() => api.resume(run.id)),
-    rollback: () => run && perform(() => api.rollback(run.id)),
+      perform(run.id, () => api.decideAction(run.id, run.pending_approval!.id, approved)),
+    cancel: () => run && perform(run.id, () => api.cancel(run.id)),
+    resume: () => run && perform(run.id, () => api.resume(run.id)),
+    rollback: () => run && perform(run.id, () => api.rollback(run.id)),
   };
 }

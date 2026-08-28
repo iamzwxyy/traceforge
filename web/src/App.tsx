@@ -401,19 +401,32 @@ export default function App() {
             />
           ) : (
             <RunStage
+              key={forge.run.id}
               run={forge.run}
               events={forge.events}
               provider={forge.provider}
               followUpEnabled={forge.status?.mode !== "demo"}
-              onAnswer={(answers) => void forge.answerQuestions(answers)}
-              onPlan={(decision, feedback) => void forge.decidePlan(decision, feedback)}
-              onAction={(approved) => void forge.decideAction(approved)}
-              onCancel={() => void forge.cancel()}
-              onResume={() => void forge.resume()}
-              onRollback={() => void forge.rollback()}
+              onAnswer={(answers) => {
+                void forge.answerQuestions(answers)?.catch(() => undefined);
+              }}
+              onPlan={(decision, feedback) => {
+                void forge.decidePlan(decision, feedback)?.catch(() => undefined);
+              }}
+              onAction={(approved) => {
+                void forge.decideAction(approved)?.catch(() => undefined);
+              }}
+              onCancel={() => {
+                void forge.cancel()?.catch(() => undefined);
+              }}
+              onResume={() => {
+                void forge.resume()?.catch(() => undefined);
+              }}
+              onRollback={() => {
+                void forge.rollback()?.catch(() => undefined);
+              }}
               onProof={() => {
                 setShowProof(true);
-                void forge.loadProofPack(forge.run!.id);
+                void forge.loadProofPack(forge.run!.id).catch(() => undefined);
               }}
               onOpenWorkspace={() => forge.openWorkspace(forge.run!.id)}
               onFollowUp={async (prompt, mode, approvalMode, reasoningEffort) => {
@@ -2025,18 +2038,19 @@ function PlanGateSummary({ gate }: { gate: PlanGate }) {
 
 function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; runId: string; onClose: () => void }) {
   const { dialogRef, onDialogKeyDown } = useDialogFocus(onClose);
+  const visiblePack = pack?.run_id === runId ? pack : null;
   return (
     <div className="modal-backdrop" role="presentation">
       <section ref={dialogRef} className="modal proof-modal" role="dialog" aria-modal="true" aria-labelledby="proof-title" tabIndex={-1} onKeyDown={onDialogKeyDown}>
         <div className="modal-heading"><div><p className="eyebrow">可审计完成记录</p><h2 id="proof-title">证据包</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭证据包"><X size={17} /></button></div>
-        {!pack ? <div className="proof-loading"><LoaderCircle className="spin" size={18} /> 正在汇总持久化证据…</div> : <>
-          <div className={`proof-verdict ${pack.proof_status}`}><div className="evidence-seal"><Fingerprint size={22} /></div><div><span>证明状态</span><strong>{proofStatusLabel(pack.proof_status)}</strong><small>{pack.verification?.summary ?? "仍在汇总证据。"}</small></div><div><span>新鲜检查</span><strong>{pack.checks_fresh ? "是" : "否"}</strong></div></div>
-          <div className="proof-grid"><article><span>工作边界</span><strong>{pack.plan_gate ? planDecisionLabel(pack.plan_gate.decision) : "未评估"}</strong><small>{pack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>动作权限</span><strong>{approvalModeLabel(pack.turns.at(-1)?.approval_mode ?? "automatic")}</strong><small>逐轮冻结 · 实际授权与 bypass 写入工具事件</small></article><article><span>思考强度</span><strong>{reasoningEffortLabel(pack.turns.at(-1)?.reasoning_effort ?? "auto")}</strong><small>逐轮冻结 · 仅记录请求档位，不展示隐藏推理</small></article><article><span>变更范围</span><strong>{pack.changed_files.length} 个文件</strong><small>{pack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(pack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(pack.command_sandbox.status)}</strong><small>{pack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {pack.command_sandbox.sandboxed_commands} 个已强制隔离 · {pack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(pack.rollback.status)}</strong><small>{pack.rollback.conflicts.length ? `保留 ${pack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>{pack.event_count} 条事件</strong><small>{pack.step_count} 个工具步骤 · {pack.repair_cycles} 轮修复</small></article></div>
-          <div className="proof-section"><div className="section-kicker">原始任务</div><p>{pack.task}</p></div>
-          <div className="proof-section"><div className="section-kicker">验收证据</div>{pack.plan?.acceptance_checks.map((check) => <div className="proof-check" key={check.id}><CheckCircle2 size={14} /><span><strong>{check.label}</strong><small>{check.evidence || check.command?.join(" ") || "等待证据"}</small></span><em>{checkStatusLabel(check.status)}</em></div>) ?? <p className="muted">尚无完成契约。</p>}</div>
-          <div className="digest-card"><Fingerprint size={15} /><span><small>稳定证据 SHA-256</small><code>{pack.evidence_sha256}</code></span></div>
+        {!visiblePack ? <div className="proof-loading"><LoaderCircle className="spin" size={18} /> 正在汇总持久化证据…</div> : <>
+          <div className={`proof-verdict ${visiblePack.proof_status}`}><div className="evidence-seal"><Fingerprint size={22} /></div><div><span>证明状态</span><strong>{proofStatusLabel(visiblePack.proof_status)}</strong><small>{visiblePack.verification?.summary ?? "仍在汇总证据。"}</small></div><div><span>新鲜检查</span><strong>{visiblePack.checks_fresh ? "是" : "否"}</strong></div></div>
+          <div className="proof-grid"><article><span>工作边界</span><strong>{visiblePack.plan_gate ? planDecisionLabel(visiblePack.plan_gate.decision) : "未评估"}</strong><small>{visiblePack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>动作权限</span><strong>{approvalModeLabel(visiblePack.turns.at(-1)?.approval_mode ?? "automatic")}</strong><small>逐轮冻结 · 实际授权与 bypass 写入工具事件</small></article><article><span>思考强度</span><strong>{reasoningEffortLabel(visiblePack.turns.at(-1)?.reasoning_effort ?? "auto")}</strong><small>逐轮冻结 · 仅记录请求档位，不展示隐藏推理</small></article><article><span>变更范围</span><strong>{visiblePack.changed_files.length} 个文件</strong><small>{visiblePack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(visiblePack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(visiblePack.command_sandbox.status)}</strong><small>{visiblePack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {visiblePack.command_sandbox.sandboxed_commands} 个已强制隔离 · {visiblePack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(visiblePack.rollback.status)}</strong><small>{visiblePack.rollback.conflicts.length ? `保留 ${visiblePack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>{visiblePack.event_count} 条事件</strong><small>{visiblePack.step_count} 个工具步骤 · {visiblePack.repair_cycles} 轮修复</small></article></div>
+          <div className="proof-section"><div className="section-kicker">原始任务</div><p>{visiblePack.task}</p></div>
+          <div className="proof-section"><div className="section-kicker">验收证据</div>{visiblePack.plan?.acceptance_checks.map((check) => <div className="proof-check" key={check.id}><CheckCircle2 size={14} /><span><strong>{check.label}</strong><small>{check.evidence || check.command?.join(" ") || "等待证据"}</small></span><em>{checkStatusLabel(check.status)}</em></div>) ?? <p className="muted">尚无完成契约。</p>}</div>
+          <div className="digest-card"><Fingerprint size={15} /><span><small>稳定证据 SHA-256</small><code>{visiblePack.evidence_sha256}</code></span></div>
         </>}
-        <div className="modal-actions"><span className="muted">摘要覆盖已持久化的计划、差异、检查、结论、回滚状态和事件账本。</span><div className="button-row"><button className="button ghost" type="button" onClick={onClose}>关闭</button><a className={`button primary ${pack ? "" : "disabled"}`} href={pack ? `/api/runs/${runId}/proof-pack.md` : undefined} download><Download size={14} /> 下载 Markdown</a></div></div>
+        <div className="modal-actions"><span className="muted">摘要覆盖已持久化的计划、差异、检查、结论、回滚状态和事件账本。</span><div className="button-row"><button className="button ghost" type="button" onClick={onClose}>关闭</button><a className={`button primary ${visiblePack ? "" : "disabled"}`} href={visiblePack ? `/api/runs/${runId}/proof-pack.md` : undefined} download><Download size={14} /> 下载 Markdown</a></div></div>
       </section>
     </div>
   );
