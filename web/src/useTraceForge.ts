@@ -209,6 +209,18 @@ export function useTraceForge() {
     }
   }, []);
 
+  const openWorkspace = useCallback(async (runId: string) => {
+    setError(null);
+    try {
+      const result = await api.openWorkspace(runId);
+      if (!result.supported) throw new Error("当前系统没有可用的文件管理器");
+      return result;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      throw reason;
+    }
+  }, []);
+
   const saveProvider = useCallback(
     async (config: ProviderUpdate) => {
       setError(null);
@@ -270,6 +282,7 @@ export function useTraceForge() {
     loadProofPack,
     listDirectories: api.listDirectories,
     chooseDirectory,
+    openWorkspace,
     answerQuestions: (answers: ClarificationAnswer[]) =>
       run && perform(() => api.answerQuestions(run.id, answers)),
     decidePlan: (decision: "approve" | "revise", feedback = "") =>

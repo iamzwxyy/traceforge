@@ -284,6 +284,7 @@ class ConversationTurn(BaseModel):
         "in_progress"
     )
     summary: str = Field(default="", max_length=20_000)
+    changed_files: list[str] = Field(default_factory=list)
     started_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
 

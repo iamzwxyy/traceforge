@@ -3,8 +3,20 @@ import { expectNoWcagViolations } from "./a11y";
 
 test("demo proves a tenant-isolation fix without runtime errors", async ({ page }) => {
   const consoleErrors: string[] = [];
+  let openerCalls = 0;
   page.on("console", (message) => {
     if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  await page.route(/\/api\/runs\/[^/]+\/open-workspace$/, async (route) => {
+    openerCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(openerCalls === 1
+        ? { supported: true, opened: true, application: "Finder" }
+        : { supported: false, opened: false, application: null }),
+    });
   });
 
   await page.goto("/");
@@ -45,11 +57,22 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
     .toHaveAttribute("href", /plan\.md$/);
   await page.getByRole("button", { name: "批准并执行" }).click();
 
-  await expect(page.getByRole("heading", { name: "工作已被证明，而不只是宣称完成" }))
-    .toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("本轮已完成", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole("region", { name: "第 1 轮由编辑工具更改的文件" }))
+    .toContainText("src/tenant_cache_api/cache.py");
+  await expect(page.getByRole("region", { name: "第 1 轮由编辑工具更改的文件" }))
+    .toContainText("tests/test_tenant_isolation.py");
+  await page.getByRole("button", { name: "打开目录" }).click();
+  await expect(page.getByRole("button", { name: "正在打开" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "打开目录" })).toBeEnabled();
+  expect(openerCalls).toBe(1);
+  await page.getByRole("button", { name: "打开目录" }).click();
+  await expect(page.getByRole("alert")).toContainText("当前系统没有可用的文件管理器");
+  await page.getByRole("button", { name: "关闭错误提示" }).click();
+  expect(openerCalls).toBe(2);
   await expect(page.getByLabel("继续此任务")).toHaveCount(0);
   await expectNoWcagViolations(page, "completed run");
-  await expect(page.getByText("4 passed", { exact: false }).first()).toBeVisible();
+  await expect(page.getByText("1 项检查通过", { exact: false })).toBeVisible();
   await expect(page.getByText(/\d+(\.\d+)?k? \/ 64k 上下文/)).toBeVisible();
   await expect(page.getByText("实时", { exact: true })).toBeVisible();
   const trace = page.locator(".trace-details");
@@ -61,15 +84,15 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(trace).toContainText("完成后复核");
 
   await page.reload();
-  await expect(page.getByRole("heading", { name: "工作已被证明，而不只是宣称完成" }))
-    .toBeVisible();
+  await expect(page.getByText("本轮已完成", { exact: true })).toBeVisible();
   await expect(page.getByText("实时", { exact: true })).toBeVisible();
-  await expect(page.getByText("4 passed", { exact: false }).first()).toBeVisible();
-  await page.getByRole("button", { name: "证据包" }).click();
+  await expect(page.getByText("1 项检查通过", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: "查看证据" }).click();
   const proofDialog = page.getByRole("dialog", { name: "证据包" });
   await expect(proofDialog).toBeVisible();
   await expect(proofDialog.getByText("已证实", { exact: true })).toBeVisible();
   await expect(proofDialog.getByText("稳定证据 SHA-256")).toBeVisible();
+  await expect(proofDialog).toContainText("4 passed");
   await expect(proofDialog.getByText("命令沙箱")).toBeVisible();
   await expect(proofDialog.getByText(/\d+ 个已强制隔离 · 0 个运行前拦截/)).toBeVisible();
   await expectNoWcagViolations(page, "proof pack dialog");
@@ -77,7 +100,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
     .toHaveAttribute("href", /proof-pack\.md$/);
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog", { name: "证据包" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "证据包" })).toBeFocused();
+  await expect(page.getByRole("button", { name: "查看证据" })).toBeFocused();
   await page.getByRole("button", { name: "回滚", exact: true }).click();
   const rollbackDialog = page.getByRole("dialog", { name: "回滚本次运行？" });
   await expect(rollbackDialog).toBeVisible();

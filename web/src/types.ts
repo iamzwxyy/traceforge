@@ -124,6 +124,7 @@ export interface ConversationTurn {
   mode: InteractionMode;
   outcome: "in_progress" | "answered" | "succeeded" | "failed" | "cancelled";
   summary: string;
+  changed_files: string[];
   started_at: string;
   completed_at: string | null;
 }
@@ -209,6 +210,12 @@ export interface DirectoryListing {
 export interface DirectoryChoice {
   supported: boolean;
   path: string | null;
+}
+
+export interface OpenWorkspaceResult {
+  supported: boolean;
+  opened: boolean;
+  application: "Finder" | "file_manager" | null;
 }
 
 export interface RunTarget {

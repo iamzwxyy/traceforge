@@ -264,10 +264,90 @@ async def test_create_patch_command_and_rollback(
     )
 
     assert create.ok and patch.ok and command.ok
+    assert create.metadata["changed_files"] == ["src/example.py"]
+    assert patch.metadata["changed_files"] == ["src/example.py"]
+    assert "changed_files" not in command.metadata
     assert (workspace.root / "src/example.py").read_text() == "value = 2\n"
     assert "verified" in command.output
     workspace.rollback("run-1")
     assert not (workspace.root / "src/example.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_mutation_metadata_reports_only_files_that_actually_changed(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage.create_run(RunRecord(id="run-1", task="Patch", workspace=str(workspace.root)))
+    first = workspace.root / "first.txt"
+    second = workspace.root / "second.txt"
+    first.write_text("before one\n")
+    second.write_text("before two\n")
+    registry = ToolRegistry(workspace, settings)
+    original_write_text = Path.write_text
+
+    def fail_second_write(path: Path, content: str, **kwargs: object) -> int:
+        if path.resolve() == second.resolve():
+            raise OSError("simulated second-file write failure")
+        return original_write_text(path, content, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_second_write)
+    result = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="partial",
+            name="apply_patch",
+            arguments={
+                "patch": (
+                    "--- a/first.txt\n+++ b/first.txt\n"
+                    "@@ -1 +1 @@\n-before one\n+after one\n"
+                    "--- a/second.txt\n+++ b/second.txt\n"
+                    "@@ -1 +1 @@\n-before two\n+after two\n"
+                )
+            },
+        ),
+    )
+
+    assert not result.ok
+    assert result.metadata["changed_files"] == ["first.txt"]
+    assert first.read_text() == "after one\n"
+    assert second.read_text() == "before two\n"
+
+
+@pytest.mark.asyncio
+async def test_mutation_metadata_canonicalizes_aliases_and_ignores_no_ops(
+    settings: Settings, workspace: Workspace, storage: Storage
+) -> None:
+    storage.create_run(RunRecord(id="run-1", task="Patch", workspace=str(workspace.root)))
+    target = workspace.root / "src" / "example.py"
+    target.parent.mkdir()
+    target.write_text("value = 1\n")
+    registry = ToolRegistry(workspace, settings)
+    call = ToolCall(
+        id="noop",
+        name="apply_patch",
+        arguments={
+            "patch": (
+                "--- a/src/../src/example.py\n"
+                "+++ b/src/../src/example.py\n"
+                "@@ -1 +1 @@\n"
+                "-value = 1\n"
+                "+value = 1\n"
+            )
+        },
+    )
+    plan = _plan(["uv", "run", "pytest"]).model_copy(
+        update={"impacted_files": ["src/example.py"]}
+    )
+
+    assert registry.assess(call, plan).decision is PermissionDecision.ALLOW
+    result = await registry.execute("run-1", call)
+
+    assert result.ok
+    assert result.metadata["changed_files"] == []
+    assert target.read_text() == "value = 1\n"
 
 
 @pytest.mark.asyncio

@@ -38,12 +38,15 @@ import {
   Zap,
 } from "lucide-react";
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import ReactMarkdown from "react-markdown";
 import { isActiveState, parseDiff, presentState, shouldSubmitPrompt } from "./lib";
@@ -67,11 +70,49 @@ import { useTraceForge } from "./useTraceForge";
 
 type InspectorTab = "timeline" | "diff" | "checks" | "verifier";
 
+const PANEL_PREFERENCE_VERSION = "v1";
+const LEFT_PANEL_MIN = 220;
+const LEFT_PANEL_MAX = 420;
+const LEFT_PANEL_DEFAULT = 276;
+const RIGHT_PANEL_MIN = 300;
+const RIGHT_PANEL_MAX = 560;
+const RIGHT_PANEL_DEFAULT = 390;
+
+function panelPreferenceKey(name: string): string {
+  return `traceforge:layout:${PANEL_PREFERENCE_VERSION}:${name}`;
+}
+
+function storedBoolean(name: string, fallback: boolean): boolean {
+  try {
+    const value = window.localStorage.getItem(panelPreferenceKey(name));
+    return value === null ? fallback : value === "true";
+  } catch {
+    return fallback;
+  }
+}
+
+function storedPanelWidth(name: string, fallback: number, minimum: number, maximum: number): number {
+  try {
+    const value = Number(window.localStorage.getItem(panelPreferenceKey(name)));
+    return Number.isFinite(value) && value >= minimum && value <= maximum ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function persistPanelPreference(name: string, value: boolean | number): void {
+  try {
+    window.localStorage.setItem(panelPreferenceKey(name), String(value));
+  } catch {
+    // Layout preferences are best-effort and must never block the local agent UI.
+  }
+}
+
 function dialogFocusables(dialog: HTMLElement): HTMLElement[] {
   return Array.from(dialog.querySelectorAll<HTMLElement>(
     "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), "
       + "textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
-  ));
+  )).filter((element) => element.getClientRects().length > 0);
 }
 
 function useDialogFocus(onClose: () => void) {
@@ -163,6 +204,17 @@ export default function App() {
   const [showProof, setShowProof] = useState(false);
   const [mobilePane, setMobilePane] = useState<"sidebar" | "inspector" | null>(null);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("timeline");
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  const [leftCollapsed, setLeftCollapsed] = useState(() => storedBoolean("left-collapsed", false));
+  const [rightCollapsed, setRightCollapsed] = useState(() => storedBoolean("right-collapsed", true));
+  const [leftWidth, setLeftWidth] = useState(() => storedPanelWidth(
+    "left-width", LEFT_PANEL_DEFAULT, LEFT_PANEL_MIN, LEFT_PANEL_MAX,
+  ));
+  const [rightWidth, setRightWidth] = useState(() => storedPanelWidth(
+    "right-width", RIGHT_PANEL_DEFAULT, RIGHT_PANEL_MIN, RIGHT_PANEL_MAX,
+  ));
+  const leftDrawerMode = viewportWidth <= 680;
+  const rightDrawerMode = viewportWidth <= 980;
 
   useEffect(() => {
     if (forge.run?.state === "verifying") setInspectorTab("verifier");
@@ -171,14 +223,22 @@ export default function App() {
 
   useEffect(() => setShowProof(false), [forge.run?.id]);
   useEffect(() => {
-    const closeObsoleteDrawer = () => setMobilePane((current) => {
-      if (current === "sidebar" && window.innerWidth > 680) return null;
-      if (current === "inspector" && window.innerWidth > 980) return null;
-      return current;
-    });
+    const closeObsoleteDrawer = () => {
+      setViewportWidth(window.innerWidth);
+      setMobilePane((current) => {
+        if (current === "sidebar" && window.innerWidth > 680) return null;
+        if (current === "inspector" && window.innerWidth > 980) return null;
+        return current;
+      });
+    };
     window.addEventListener("resize", closeObsoleteDrawer);
     return () => window.removeEventListener("resize", closeObsoleteDrawer);
   }, []);
+
+  useEffect(() => persistPanelPreference("left-collapsed", leftCollapsed), [leftCollapsed]);
+  useEffect(() => persistPanelPreference("right-collapsed", rightCollapsed), [rightCollapsed]);
+  useEffect(() => persistPanelPreference("left-width", leftWidth), [leftWidth]);
+  useEffect(() => persistPanelPreference("right-width", rightWidth), [rightWidth]);
 
   const openDirectComposer = () => {
     setComposerProjectId(null);
@@ -207,6 +267,46 @@ export default function App() {
     await forge.createProject(projectNameFromPath(choice.path), choice.path, false);
   };
 
+  const toggleHistory = () => {
+    if (leftDrawerMode) {
+      setMobilePane((current) => current === "sidebar" ? null : "sidebar");
+    } else {
+      setLeftCollapsed((current) => !current);
+    }
+  };
+  const toggleInspector = () => {
+    if (rightDrawerMode) {
+      setMobilePane((current) => current === "inspector" ? null : "inspector");
+    } else {
+      setRightCollapsed((current) => !current);
+    }
+  };
+  const mainStageMinimum = viewportWidth <= 1280 ? 360 : 480;
+  const leftPanelMaximum = Math.min(
+    LEFT_PANEL_MAX,
+    Math.max(
+      LEFT_PANEL_MIN,
+      viewportWidth - (!rightCollapsed && !rightDrawerMode ? RIGHT_PANEL_MIN : 0) - mainStageMinimum,
+    ),
+  );
+  const visibleLeftWidth = leftCollapsed || leftDrawerMode
+    ? 0
+    : Math.min(leftWidth, leftPanelMaximum);
+  const rightPanelMaximum = Math.min(
+    RIGHT_PANEL_MAX,
+    Math.max(
+      RIGHT_PANEL_MIN,
+      viewportWidth - visibleLeftWidth - mainStageMinimum,
+    ),
+  );
+  const visibleRightWidth = rightCollapsed || rightDrawerMode
+    ? 0
+    : Math.min(rightWidth, rightPanelMaximum);
+  const workspaceGridStyle = {
+    "--sidebar-width": `${visibleLeftWidth}px`,
+    "--inspector-width": `${visibleRightWidth}px`,
+  } as CSSProperties;
+
   return (
     <div className="app-shell">
       <Header
@@ -214,9 +314,10 @@ export default function App() {
         connected={forge.connected}
         run={forge.run}
         providerReady={Boolean(forge.provider?.api_key_configured)}
-        mobilePane={mobilePane}
-        onHistory={() => setMobilePane((current) => current === "sidebar" ? null : "sidebar")}
-        onInspector={() => setMobilePane((current) => current === "inspector" ? null : "inspector")}
+        historyExpanded={leftDrawerMode ? mobilePane === "sidebar" : !leftCollapsed}
+        inspectorExpanded={rightDrawerMode ? mobilePane === "inspector" : !rightCollapsed}
+        onHistory={toggleHistory}
+        onInspector={toggleInspector}
         onSettings={() => setShowSettings(true)}
       />
       {forge.error && (
@@ -226,7 +327,7 @@ export default function App() {
           <button type="button" aria-label="关闭错误提示" onClick={forge.clearError}><X size={15} /></button>
         </div>
       )}
-      <main className="workspace-grid">
+      <main className="workspace-grid" style={workspaceGridStyle}>
         <Sidebar
           runs={forge.runs}
           projects={forge.projects}
@@ -238,6 +339,10 @@ export default function App() {
           onAddProject={() => void addProject().catch(() => undefined)}
           mobileOpen={mobilePane === "sidebar"}
           onMobileClose={() => setMobilePane(null)}
+          collapsed={leftCollapsed && !leftDrawerMode}
+          width={visibleLeftWidth || leftWidth}
+          maximumWidth={leftPanelMaximum}
+          onResize={setLeftWidth}
         />
         <section className="main-stage">
           {!forge.run || showComposer ? (
@@ -271,6 +376,7 @@ export default function App() {
                 setShowProof(true);
                 void forge.loadProofPack(forge.run!.id);
               }}
+              onOpenWorkspace={() => forge.openWorkspace(forge.run!.id)}
               onFollowUp={async (prompt, mode) => {
                 await forge.followUp(prompt, mode);
               }}
@@ -285,6 +391,10 @@ export default function App() {
           onTab={setInspectorTab}
           mobileOpen={mobilePane === "inspector"}
           onMobileClose={() => setMobilePane(null)}
+          collapsed={rightCollapsed && !rightDrawerMode}
+          width={visibleRightWidth || rightWidth}
+          maximumWidth={rightPanelMaximum}
+          onResize={setRightWidth}
         />
       </main>
       {mobilePane && (
@@ -330,7 +440,8 @@ function Header({
   connected,
   run,
   providerReady,
-  mobilePane,
+  historyExpanded,
+  inspectorExpanded,
   onHistory,
   onInspector,
   onSettings,
@@ -339,7 +450,8 @@ function Header({
   connected: boolean;
   run: Run | null;
   providerReady: boolean;
-  mobilePane: "sidebar" | "inspector" | null;
+  historyExpanded: boolean;
+  inspectorExpanded: boolean;
   onHistory: () => void;
   onInspector: () => void;
   onSettings: () => void;
@@ -359,11 +471,11 @@ function Header({
   return (
     <header className="topbar">
       <button
-        className="icon-button mobile-nav-button history-toggle"
+        className="icon-button panel-nav-button history-toggle"
         type="button"
         onClick={onHistory}
         aria-label="任务与项目"
-        aria-expanded={mobilePane === "sidebar"}
+        aria-expanded={historyExpanded}
       ><PanelLeft size={18} /></button>
       <div className="brand">
         <div className="brand-mark"><Hammer size={18} /></div>
@@ -374,11 +486,11 @@ function Header({
       </div>
       <div className="topbar-context">
         <button
-          className="icon-button mobile-nav-button inspector-toggle"
+          className="icon-button panel-nav-button inspector-toggle"
           type="button"
           onClick={onInspector}
-          aria-label="运行证据"
-          aria-expanded={mobilePane === "inspector"}
+          aria-label="任务详情"
+          aria-expanded={inspectorExpanded}
         ><PanelRight size={18} /></button>
         <div className="context-item workspace-path" title={run?.workspace ?? status?.workspace}>
           <GitBranch size={14} />
@@ -434,6 +546,10 @@ function Sidebar({
   onAddProject,
   mobileOpen,
   onMobileClose,
+  collapsed,
+  width,
+  maximumWidth,
+  onResize,
 }: {
   runs: Run[];
   projects: Project[];
@@ -445,6 +561,10 @@ function Sidebar({
   onAddProject: () => void;
   mobileOpen: boolean;
   onMobileClose: () => void;
+  collapsed: boolean;
+  width: number;
+  maximumWidth: number;
+  onResize: (width: number) => void;
 }) {
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
   const directRuns = runs.filter((run) => run.project_id === null);
@@ -462,7 +582,7 @@ function Sidebar({
   return (
     <aside
       ref={drawerRef}
-      className={`sidebar panel-edge ${mobileOpen ? "mobile-open" : ""}`}
+      className={`sidebar panel-edge ${collapsed ? "collapsed" : ""} ${mobileOpen ? "mobile-open" : ""}`}
       role={mobileOpen ? "dialog" : undefined}
       aria-modal={mobileOpen || undefined}
       aria-label={mobileOpen ? "任务与项目" : undefined}
@@ -540,7 +660,87 @@ function Sidebar({
         <ShieldCheck size={14} />
         <span>仅在本地 · 受工作区边界保护</span>
       </div>
+      <PanelResizer
+        side="left"
+        width={width}
+        minimum={LEFT_PANEL_MIN}
+        maximum={maximumWidth}
+        defaultWidth={LEFT_PANEL_DEFAULT}
+        onResize={onResize}
+      />
     </aside>
+  );
+}
+
+function PanelResizer({
+  side,
+  width,
+  minimum,
+  maximum,
+  defaultWidth,
+  onResize,
+}: {
+  side: "left" | "right";
+  width: number;
+  minimum: number;
+  maximum: number;
+  defaultWidth: number;
+  onResize: (width: number) => void;
+}) {
+  const drag = useRef<{ pointerX: number; width: number } | null>(null);
+  const clamp = (value: number) => Math.min(maximum, Math.max(minimum, Math.round(value)));
+  const resizeFromPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!drag.current) return;
+    const delta = side === "left"
+      ? event.clientX - drag.current.pointerX
+      : drag.current.pointerX - event.clientX;
+    onResize(clamp(drag.current.width + delta));
+  };
+  return (
+    <div
+      className={`panel-resizer ${side}`}
+      role="separator"
+      aria-label={side === "left" ? "调整任务侧栏宽度" : "调整详情侧栏宽度"}
+      aria-orientation="vertical"
+      aria-valuemin={minimum}
+      aria-valuemax={maximum}
+      aria-valuenow={width}
+      tabIndex={0}
+      onDoubleClick={() => onResize(defaultWidth)}
+      onPointerDown={(event) => {
+        drag.current = { pointerX: event.clientX, width };
+        event.currentTarget.setPointerCapture(event.pointerId);
+      }}
+      onPointerMove={resizeFromPointer}
+      onPointerUp={(event) => {
+        drag.current = null;
+        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }
+      }}
+      onPointerCancel={() => {
+        drag.current = null;
+      }}
+      onLostPointerCapture={() => {
+        drag.current = null;
+      }}
+      onKeyDown={(event) => {
+        const direction = side === "left" ? 1 : -1;
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          onResize(clamp(width - 16 * direction));
+        } else if (event.key === "ArrowRight") {
+          event.preventDefault();
+          onResize(clamp(width + 16 * direction));
+        } else if (event.key === "Home") {
+          event.preventDefault();
+          onResize(minimum);
+        } else if (event.key === "End") {
+          event.preventDefault();
+          onResize(maximum);
+        }
+      }}
+    />
   );
 }
 
@@ -1011,6 +1211,7 @@ function RunStage({
   onResume,
   onRollback,
   onProof,
+  onOpenWorkspace,
   onFollowUp,
   followUpEnabled,
 }: {
@@ -1024,9 +1225,13 @@ function RunStage({
   onResume: () => void;
   onRollback: () => void;
   onProof: () => void;
+  onOpenWorkspace: () => Promise<unknown>;
   onFollowUp: (prompt: string, mode: InteractionMode) => Promise<void>;
 }) {
   const [confirmRollback, setConfirmRollback] = useState(false);
+  const [openingWorkspace, setOpeningWorkspace] = useState(false);
+  const answeredTaskHasEdits = run.state === "answered"
+    && run.turns.some((turn) => turn.changed_files.length > 0);
   return (
     <div className="run-stage">
       <div className="run-header">
@@ -1040,13 +1245,26 @@ function RunStage({
           <h2>{run.task}</h2>
         </div>
         <div className="button-row">
+          <button
+            className="button ghost"
+            type="button"
+            disabled={openingWorkspace}
+            onClick={() => {
+              setOpeningWorkspace(true);
+              void onOpenWorkspace().catch(() => undefined).finally(() => setOpeningWorkspace(false));
+            }}
+            title="在本地文件管理器中定位任务目录"
+          >
+            {openingWorkspace ? <LoaderCircle className="spin" size={14} /> : <FolderOpen size={14} />}
+            {openingWorkspace ? "正在打开" : "打开目录"}
+          </button>
           {isActiveState(run.state) && (
             <button className="button danger-ghost" type="button" onClick={onCancel}><Square size={14} /> 停止</button>
           )}
           {run.state === "interrupted" && (
             <button className="button" type="button" onClick={onResume}><Play size={14} /> 继续</button>
           )}
-          {["succeeded", "failed", "cancelled", "interrupted"].includes(run.state) && (
+          {(["succeeded", "failed", "cancelled", "interrupted"].includes(run.state) || answeredTaskHasEdits) && (
             <button className="button ghost" type="button" onClick={() => setConfirmRollback(true)}><RotateCcw size={14} /> 回滚</button>
           )}
         </div>
@@ -1080,7 +1298,7 @@ function RunStage({
           </Notice>
         )}
         {run.error && <Notice icon={<OctagonX size={18} />} title={run.state === "interrupted" ? "暂停原因" : "停止原因"} danger={run.state !== "interrupted"}>{systemMessageLabel(run.error)}</Notice>}
-        {run.state === "succeeded" && <EvidenceBoard run={run} onProof={onProof} />}
+        {run.state === "succeeded" && <CompletionSummary run={run} onProof={onProof} />}
         {followUpEnabled && ["answered", "succeeded", "failed", "cancelled"].includes(run.state) && (
           <FollowUpComposer onSubmit={onFollowUp} />
         )}
@@ -1108,11 +1326,11 @@ function RollbackDialog({ onClose, onConfirm }: { onClose: () => void; onConfirm
           <button className="icon-button" type="button" onClick={onClose} aria-label="关闭回滚确认"><X size={17} /></button>
         </div>
         <p className="modal-copy">
-          TraceForge 会恢复本次运行修改过的文件。用户之后的编辑会作为冲突保留；
+          TraceForge 会恢复本次任务记录过的文件修改。用户之后的编辑会作为冲突保留；
           回滚一旦完成，无法自动重做。
         </p>
         <div className="modal-actions">
-          <span>只处理本次运行记录的快照。</span>
+          <span>只处理本次任务记录的快照。</span>
           <div className="button-row">
             <button className="button ghost" type="button" onClick={onClose} data-dialog-initial-focus>取消</button>
             <button className="button warning" type="button" onClick={onConfirm}>
@@ -1157,7 +1375,19 @@ function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
           return <article className="conversation-turn user-turn" key={event.seq}><span>你 · 第 {String(event.payload.index ?? "?")} 轮</span><p>{String(event.payload.request ?? "")}</p></article>;
         }
         if (event.type === "turn.completed") {
-          return <article className={`conversation-turn assistant-turn ${String(event.payload.outcome ?? "")}`} key={event.seq}><span>TraceForge</span><ReactMarkdown>{String(event.payload.summary ?? "本轮已结束。")}</ReactMarkdown></article>;
+          const index = Number(event.payload.index ?? 0);
+          const eventFiles = Array.isArray(event.payload.changed_files)
+            ? event.payload.changed_files.filter((path): path is string => typeof path === "string")
+            : [];
+          const changedFiles = eventFiles.length > 0
+            ? eventFiles
+            : run.turns.find((turn) => turn.index === index)?.changed_files ?? [];
+          return (
+            <Fragment key={event.seq}>
+              <article className={`conversation-turn assistant-turn ${String(event.payload.outcome ?? "")}`}><span>TraceForge</span><ReactMarkdown>{String(event.payload.summary ?? "本轮已结束。")}</ReactMarkdown></article>
+              {changedFiles.length > 0 && <TurnChangedFiles index={index} paths={changedFiles} />}
+            </Fragment>
+          );
         }
         return <article className="conversation-turn assistant-turn" key={event.seq}><span>TraceForge</span><ReactMarkdown>{String(event.payload.content ?? "")}</ReactMarkdown></article>;
       })}
@@ -1176,6 +1406,22 @@ function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
       )}
       <div ref={end} />
     </div>
+  );
+}
+
+function TurnChangedFiles({ index, paths }: { index: number; paths: string[] }) {
+  return (
+    <section className="turn-changed-files" aria-label={`第 ${index} 轮由编辑工具更改的文件`}>
+      <div className="turn-files-heading">
+        <FileDiff size={14} />
+        <strong>本轮更改</strong>
+        <span>{paths.length} 个文件</span>
+      </div>
+      <div className="turn-file-list">
+        {paths.map((path) => <code title={path} key={path}>{path}</code>)}
+      </div>
+      <small>仅列出 TraceForge 编辑工具产生的实际内容变更；右侧“差异”是整个任务的累计净差异。</small>
+    </section>
   );
 }
 
@@ -1333,12 +1579,16 @@ function ApprovalPanel({ approval, onDecision }: { approval: NonNullable<Run["pe
   );
 }
 
-function EvidenceBoard({ run, onProof }: { run: Run; onProof: () => void }) {
+function CompletionSummary({ run, onProof }: { run: Run; onProof: () => void }) {
+  const passed = run.plan?.acceptance_checks.filter((check) => check.status === "passed").length ?? 0;
   return (
-    <div className="evidence-board">
-      <div className="evidence-seal"><CheckCircle2 size={24} /></div>
-      <div><p className="eyebrow">完成证据</p><h3>工作已被证明，而不只是宣称完成</h3><p>{run.verification?.summary}</p></div>
-      <div className="evidence-actions"><div className="evidence-stats"><div><strong>{run.plan?.acceptance_checks.filter((check) => check.status === "passed").length ?? 0}</strong><span>项检查通过</span></div><div><strong>{run.step_count}</strong><span>个工具步骤</span></div><div><strong>{run.repair_cycles}</strong><span>轮修复</span></div></div><button className="button" type="button" onClick={onProof}><Fingerprint size={14} /> 证据包</button></div>
+    <div className="completion-summary">
+      <CheckCircle2 size={17} />
+      <div>
+        <strong>本轮已完成</strong>
+        <span>{passed} 项检查通过{run.verification?.summary ? ` · ${run.verification.summary}` : ""}</span>
+      </div>
+      <button className="button ghost" type="button" onClick={onProof}><Fingerprint size={14} /> 查看证据</button>
     </div>
   );
 }
@@ -1402,6 +1652,10 @@ function Inspector({
   onTab,
   mobileOpen,
   onMobileClose,
+  collapsed,
+  width,
+  maximumWidth,
+  onResize,
 }: {
   run: Run | null;
   events: RunEvent[];
@@ -1410,6 +1664,10 @@ function Inspector({
   onTab: (tab: InspectorTab) => void;
   mobileOpen: boolean;
   onMobileClose: () => void;
+  collapsed: boolean;
+  width: number;
+  maximumWidth: number;
+  onResize: (width: number) => void;
 }) {
   const { drawerRef, onDrawerKeyDown } = useDrawerFocus(mobileOpen, onMobileClose);
   const tabs: Array<{ id: InspectorTab; label: string; icon: typeof History }> = [
@@ -1421,24 +1679,32 @@ function Inspector({
   return (
     <aside
       ref={drawerRef}
-      className={`inspector panel-edge ${mobileOpen ? "mobile-open" : ""}`}
+      className={`inspector panel-edge ${collapsed ? "collapsed" : ""} ${mobileOpen ? "mobile-open" : ""}`}
       role={mobileOpen ? "dialog" : undefined}
       aria-modal={mobileOpen || undefined}
-      aria-label={mobileOpen ? "运行证据" : undefined}
+      aria-label={mobileOpen ? "任务详情" : undefined}
       onKeyDown={onDrawerKeyDown}
     >
       <div className="drawer-mobile-heading inspector-drawer-heading">
-        <strong>运行证据</strong>
-        <button className="icon-button" type="button" onClick={onMobileClose} aria-label="关闭运行证据" data-drawer-initial-focus><X size={17} /></button>
+        <strong>任务详情</strong>
+        <button className="icon-button" type="button" onClick={onMobileClose} aria-label="关闭任务详情" data-drawer-initial-focus><X size={17} /></button>
       </div>
-      <nav className="inspector-tabs" aria-label="运行证据视图">{tabs.map(({ id, label, icon: Icon }) => <button type="button" className={tab === id ? "active" : ""} aria-label={label} title={label} onClick={() => onTab(id)} key={id}><Icon size={14} /><span>{label}</span></button>)}</nav>
+      <nav className="inspector-tabs" aria-label="任务详情视图">{tabs.map(({ id, label, icon: Icon }) => <button type="button" className={tab === id ? "active" : ""} aria-label={label} title={label} onClick={() => onTab(id)} key={id}><Icon size={14} /><span>{label}</span></button>)}</nav>
       <div className="inspector-content">
-        {!run && <div className="inspector-empty"><FileDiff size={26} /><p>请选择一条运行记录以查看证据。</p></div>}
+        {!run && <div className="inspector-empty"><FileDiff size={26} /><p>请选择一条任务查看详细记录。</p></div>}
         {run && tab === "timeline" && <Timeline events={events} />}
         {run && tab === "diff" && <DiffView diff={diff} />}
         {run && tab === "checks" && <ChecksView run={run} />}
         {run && tab === "verifier" && <VerifierView run={run} />}
       </div>
+      <PanelResizer
+        side="right"
+        width={width}
+        minimum={RIGHT_PANEL_MIN}
+        maximum={maximumWidth}
+        defaultWidth={RIGHT_PANEL_DEFAULT}
+        onResize={onResize}
+      />
     </aside>
   );
 }
@@ -1449,7 +1715,7 @@ function Timeline({ events }: { events: RunEvent[] }) {
 
 function DiffView({ diff }: { diff: string }) {
   const lines = useMemo(() => parseDiff(diff), [diff]);
-  if (!diff) return <div className="inspector-empty"><FileDiff size={26} /><p>智能体尚未修改文件。</p></div>;
+  if (!diff) return <div className="inspector-empty"><FileDiff size={26} /><p>任务当前没有累计净差异。</p></div>;
   return <pre className="diff-view">{lines.map((line, index) => <span className={`diff-${line.kind}`} key={`${index}-${line.text}`}><i>{index + 1}</i>{line.text || " "}</span>)}</pre>;
 }
 
@@ -1632,6 +1898,9 @@ function systemMessageLabel(message: string): string {
     "Pause, stop, or finish running work before changing model settings": "请先暂停、停止或完成当前任务，再修改模型设置",
     "This workspace already has an active or interrupted run": "此工作区已有正在执行或已中断的任务",
     "Approval is no longer pending": "该审批已不再处于等待状态",
+    "The local file manager could not be opened": "无法启动本地文件管理器",
+    "The local file manager could not open this workspace": "本地文件管理器无法打开此工作目录",
+    "The recorded workspace path no longer points to its original directory": "任务记录的工作目录已被替换，已拒绝打开",
   };
   if (exact[message]) return exact[message];
   const prefixes: Array<[string, string]> = [

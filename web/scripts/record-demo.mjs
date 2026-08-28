@@ -110,9 +110,9 @@ try {
   await page.getByRole("button", { name: "批准并执行" }).click();
   await caption(page, "Builder 通过受限工具修复真实的跨租户缓存串读");
 
-  await page.getByRole("heading", { name: "工作已被证明，而不只是宣称完成" })
-    .waitFor({ timeout: 20_000 });
+  await page.getByText("本轮已完成", { exact: true }).waitFor({ timeout: 20_000 });
   await page.waitForTimeout(3000);
+  await page.getByRole("button", { name: "任务详情" }).click();
   await page.getByRole("button", { name: "差异" }).click();
   await caption(page, "Diff 来自文件快照；回滚会保护用户后续修改");
   await page.waitForTimeout(5000);
@@ -128,7 +128,7 @@ try {
   await page.getByRole("button", { name: "时间线" }).click();
   await caption(page, "模型只提出动作；状态机、权限、恢复与终止逻辑全部自研");
   await page.waitForTimeout(6000);
-  await caption(page, "TraceForge —— 工作已被证明，而不只是宣称完成");
+  await caption(page, "TraceForge —— 对话优先，证据按需展开");
   await page.waitForTimeout(3500);
 } finally {
   await context?.close();

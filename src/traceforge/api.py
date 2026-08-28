@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import platform
 import re
+import shutil
 import subprocess
 from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
@@ -53,6 +54,7 @@ from traceforge.provider import ModelProvider
 from traceforge.runtime import AgentRuntime, resolve_workspace
 from traceforge.sandbox import sandbox_status
 from traceforge.storage import Storage
+from traceforge.tools import scrubbed_environment
 from traceforge.workspace import Workspace
 
 
@@ -138,6 +140,14 @@ class FollowUpRequest(BaseModel):
     mode: InteractionMode = InteractionMode.AGENT
 
 
+class OpenWorkspaceResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    supported: bool
+    opened: bool
+    application: Literal["Finder", "file_manager"] | None = None
+
+
 class RunView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -197,7 +207,18 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Any) -> Any:
-        response = await call_next(request)
+        response: Response
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = request.headers.get("origin")
+            fetch_site = request.headers.get("sec-fetch-site", "").lower()
+            if (origin and not _allowed_origin(origin)) or fetch_site == "cross-site":
+                response = JSONResponse(
+                    status_code=403, content={"detail": "Cross-site request denied"}
+                )
+            else:
+                response = await call_next(request)
+        else:
+            response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
@@ -412,13 +433,29 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         run = storage.get_run(run_id)
         return {"diff": Workspace(Path(run.workspace), storage).diff(run_id)}
 
+    @app.post(
+        "/api/runs/{run_id}/open-workspace",
+        response_model=OpenWorkspaceResponse,
+    )
+    async def open_workspace(run_id: str) -> OpenWorkspaceResponse:
+        run = storage.get_run(run_id)
+        recorded_workspace = Path(run.workspace)
+        workspace = resolve_workspace(recorded_workspace)
+        if workspace != recorded_workspace:
+            raise ValueError(
+                "The recorded workspace path no longer points to its original directory"
+            )
+        return OpenWorkspaceResponse.model_validate(
+            await asyncio.to_thread(_open_workspace_directory, workspace)
+        )
+
     @app.get("/api/runs/{run_id}/proof-pack", response_model=ProofPack)
     async def get_proof_pack(run_id: str) -> ProofPack:
         run = storage.get_run(run_id)
         if run.state is RunState.ANSWERED:
             raise HTTPException(
                 status_code=409,
-                detail="Answer-only turns have no completion Proof Pack",
+                detail="The latest answer-only turn has no completion Proof Pack",
             )
         return build_proof_pack(run, storage)
 
@@ -443,7 +480,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         if run.state is RunState.ANSWERED:
             raise HTTPException(
                 status_code=409,
-                detail="Answer-only turns have no completion Proof Pack",
+                detail="The latest answer-only turn has no completion Proof Pack",
             )
         pack = build_proof_pack(run, storage)
         return PlainTextResponse(
@@ -650,6 +687,42 @@ def _choose_macos_directory(initial_path: Path) -> str | None:
         raise ValueError("The macOS folder picker did not return a directory")
     selected = result.stdout.strip().rstrip("/") or "/"
     return str(resolve_workspace(selected))
+
+
+def _open_workspace_directory(workspace: Path) -> dict[str, Any]:
+    selected = resolve_workspace(workspace)
+    system = platform.system()
+    environment = scrubbed_environment()
+    if system == "Darwin":
+        executable = "/usr/bin/open"
+        arguments = [executable, "-R", str(selected)]
+        application: Literal["Finder", "file_manager"] = "Finder"
+    elif system == "Linux":
+        if not environment.get("DISPLAY") and not environment.get("WAYLAND_DISPLAY"):
+            return {"supported": False, "opened": False, "application": None}
+        discovered = shutil.which("xdg-open")
+        executable_path = Path(discovered).resolve(strict=False) if discovered else None
+        if executable_path is None or executable_path.is_relative_to(selected):
+            return {"supported": False, "opened": False, "application": None}
+        executable = str(executable_path)
+        arguments = [executable, str(selected)]
+        application = "file_manager"
+    else:
+        return {"supported": False, "opened": False, "application": None}
+    try:
+        result = subprocess.run(
+            arguments,
+            capture_output=True,
+            check=False,
+            env=environment,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("The local file manager could not be opened") from exc
+    if result.returncode != 0:
+        raise ValueError("The local file manager could not open this workspace")
+    return {"supported": True, "opened": True, "application": application}
 
 
 def _remove_empty_directory(path: Path) -> None:

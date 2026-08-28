@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from traceforge.api import _choose_macos_directory, create_app
+from traceforge.api import _choose_macos_directory, _open_workspace_directory, create_app
 from traceforge.config import Settings
 from traceforge.models import ToolCall
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
@@ -447,6 +448,165 @@ def test_macos_directory_picker_normalizes_success_and_cancel(
     )
     with pytest.raises(ValueError, match="did not return"):
         _choose_macos_directory(settings.workspace)
+
+
+def test_open_workspace_uses_fixed_argv_and_scrubbed_environment(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    monkeypatch.setattr("traceforge.api.platform.system", lambda: "Darwin")
+    monkeypatch.setenv("TRACEFORGE_TEST_API_KEY", "must-not-leak")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/must-not-leak.sock")
+    monkeypatch.setenv("TRACEFORGE_TEST_PLAIN", "visible")
+
+    def run(arguments: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((arguments, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("traceforge.api.subprocess.run", run)
+
+    result = _open_workspace_directory(settings.workspace)
+
+    assert result == {"supported": True, "opened": True, "application": "Finder"}
+    assert calls[0][0] == ["/usr/bin/open", "-R", str(settings.workspace.resolve())]
+    environment = calls[0][1]["env"]
+    assert isinstance(environment, dict)
+    assert "TRACEFORGE_TEST_API_KEY" not in environment
+    assert "SSH_AUTH_SOCK" not in environment
+    assert environment["TRACEFORGE_TEST_PLAIN"] == "visible"
+    assert calls[0][1]["timeout"] == 10
+
+
+def test_open_workspace_handles_linux_capability_and_failures(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr("traceforge.api.platform.system", lambda: "Linux")
+    monkeypatch.setattr("traceforge.api.shutil.which", lambda _name: "/usr/bin/xdg-open")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(
+        "traceforge.api.subprocess.run",
+        lambda arguments, **_kwargs: calls.append(arguments),
+    )
+
+    assert _open_workspace_directory(settings.workspace) == {
+        "supported": False,
+        "opened": False,
+        "application": None,
+    }
+    assert calls == []
+
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr("traceforge.api.shutil.which", lambda _name: None)
+    assert _open_workspace_directory(settings.workspace)["supported"] is False
+
+    workspace_launcher = settings.workspace / "xdg-open"
+    workspace_launcher.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(
+        "traceforge.api.shutil.which", lambda _name: str(workspace_launcher)
+    )
+    assert _open_workspace_directory(settings.workspace)["supported"] is False
+    assert calls == []
+
+    monkeypatch.setattr("traceforge.api.shutil.which", lambda _name: "/usr/bin/xdg-open")
+    monkeypatch.setattr(
+        "traceforge.api.subprocess.run",
+        lambda arguments, **_kwargs: (
+            calls.append(arguments)
+            or SimpleNamespace(returncode=0, stdout="", stderr="")
+        ),
+    )
+    assert _open_workspace_directory(settings.workspace) == {
+        "supported": True,
+        "opened": True,
+        "application": "file_manager",
+    }
+    assert calls[-1] == ["/usr/bin/xdg-open", str(settings.workspace.resolve())]
+
+    monkeypatch.setattr(
+        "traceforge.api.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout="", stderr="private"),
+    )
+    with pytest.raises(ValueError, match="could not open"):
+        _open_workspace_directory(settings.workspace)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("unavailable"), subprocess.TimeoutExpired("open", 10)],
+)
+def test_open_workspace_hides_launcher_exception_details(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    monkeypatch.setattr("traceforge.api.platform.system", lambda: "Darwin")
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr("traceforge.api.subprocess.run", fail)
+    with pytest.raises(ValueError, match="could not be opened") as captured:
+        _open_workspace_directory(settings.workspace)
+    assert "unavailable" not in str(captured.value)
+
+
+def test_open_workspace_endpoint_is_run_scoped_and_rejects_cross_site_or_retargeting(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(settings, provider=ScriptedProvider([_plan_response()]))
+    opened: list[Path] = []
+
+    def open_directory(path: Path) -> dict[str, object]:
+        opened.append(path)
+        return {"supported": True, "opened": True, "application": "Finder"}
+
+    monkeypatch.setattr("traceforge.api._open_workspace_directory", open_directory)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/runs",
+            json={
+                "task": "Observe",
+                "mode": "plan",
+                "workspace": str(settings.workspace),
+            },
+        )
+        run_id = created.json()["id"]
+        _wait_for_state(client, run_id, "awaiting_plan_approval")
+
+        response = client.post(f"/api/runs/{run_id}/open-workspace")
+        assert response.status_code == 200
+        assert response.json() == {
+            "supported": True,
+            "opened": True,
+            "application": "Finder",
+        }
+        assert opened == [settings.workspace.resolve()]
+        assert client.post("/api/runs/missing/open-workspace").status_code == 404
+
+        denied = client.post(
+            f"/api/runs/{run_id}/open-workspace",
+            headers={"Origin": "https://attacker.example", "Sec-Fetch-Site": "cross-site"},
+        )
+        assert denied.status_code == 403
+        assert len(opened) == 1
+
+        original = settings.workspace.with_name("workspace-original")
+        replacement = settings.workspace.with_name("workspace-replacement")
+        settings.workspace.rename(original)
+        replacement.mkdir()
+        settings.workspace.symlink_to(replacement, target_is_directory=True)
+        try:
+            retargeted = client.post(f"/api/runs/{run_id}/open-workspace")
+            assert retargeted.status_code == 422
+            assert "original directory" in retargeted.json()["detail"]
+            assert len(opened) == 1
+        finally:
+            settings.workspace.unlink()
+            original.rename(settings.workspace)
+            replacement.rmdir()
 
 
 def test_provider_config_uses_a_file_reference_without_returning_secret(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -478,6 +479,253 @@ async def test_follow_up_continues_the_same_task_with_prior_turn_context(
     event_types = [event.type for event in storage.get_events(first.id)]
     assert event_types.count(EventType.TURN_STARTED) == 2
     assert event_types.count(EventType.TURN_COMPLETED) == 2
+
+
+@pytest.mark.asyncio
+async def test_each_turn_persists_its_actual_native_edit_files(
+    settings: Settings, storage: Storage
+) -> None:
+    first_plan = {
+        "summary": "Create the first file",
+        "steps": [{"id": "create", "title": "Create a.txt"}],
+        "acceptance_checks": [{"id": "review", "label": "a.txt is ready"}],
+        "impacted_files": ["a.txt"],
+    }
+    second_plan = {
+        "summary": "Update the first file and create another",
+        "steps": [{"id": "update", "title": "Update both files"}],
+        "acceptance_checks": [{"id": "review", "label": "Both files are ready"}],
+        "impacted_files": ["a.txt", "b.txt"],
+    }
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan-1", name="submit_plan", arguments=first_plan)
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="create-a",
+                        name="create_file",
+                        arguments={"path": "a.txt", "content": "one\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-1",
+                        name="finish",
+                        arguments={"summary": "Created a.txt", "evidence": ["diff"]},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan-2", name="submit_plan", arguments=second_plan)
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="patch-a",
+                        name="apply_patch",
+                        arguments={
+                            "patch": (
+                                "--- a/a.txt\n+++ b/a.txt\n"
+                                "@@ -1 +1 @@\n-one\n+two\n"
+                            )
+                        },
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="create-b",
+                        name="create_file",
+                        arguments={"path": "b.txt", "content": "new\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish-2",
+                        name="finish",
+                        arguments={"summary": "Updated both files", "evidence": ["diff"]},
+                    )
+                ]
+            ),
+            _direct_response("前两轮共修改了 a.txt 和 b.txt。", call_id="answer-3"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Create a.txt", verifier_enabled=False)
+    await manager.wait(run.id)
+
+    await manager.follow_up(run.id, "Update a.txt and add b.txt")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    assert [turn.changed_files for turn in completed.turns] == [
+        ["a.txt"],
+        ["a.txt", "b.txt"],
+    ]
+    completion_events = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TURN_COMPLETED
+    ]
+    assert [event.payload["changed_files"] for event in completion_events] == [
+        ["a.txt"],
+        ["a.txt", "b.txt"],
+    ]
+    assert [turn.changed_files for turn in storage.get_run(run.id).turns] == [
+        ["a.txt"],
+        ["a.txt", "b.txt"],
+    ]
+
+    await manager.follow_up(run.id, "刚才改了哪些文件?")
+    answered = await manager.wait(run.id)
+    assert answered.state is RunState.ANSWERED
+    assert answered.turns[-1].changed_files == []
+
+    rollback = await manager.rollback(run.id)
+    assert rollback.removed == ["a.txt", "b.txt"]
+    assert storage.get_run(run.id).state is RunState.ROLLED_BACK
+
+
+@pytest.mark.asyncio
+async def test_partial_edit_files_survive_terminal_builder_failure(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = settings.workspace / "first.txt"
+    second = settings.workspace / "second.txt"
+    first.write_text("before one\n")
+    second.write_text("before two\n")
+    plan = {
+        "summary": "Update two files",
+        "steps": [{"id": "update", "title": "Update both files"}],
+        "acceptance_checks": [{"id": "review", "label": "Both files are ready"}],
+        "impacted_files": ["first.txt", "second.txt"],
+    }
+    partial_patch = ToolCall(
+        id="partial",
+        name="apply_patch",
+        arguments={
+            "patch": (
+                "--- a/first.txt\n+++ b/first.txt\n"
+                "@@ -1 +1 @@\n-before one\n+after one\n"
+                "--- a/second.txt\n+++ b/second.txt\n"
+                "@@ -1 +1 @@\n-before two\n+after two\n"
+            )
+        },
+    )
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall(id="plan", name="submit_plan", arguments=plan)]
+            ),
+            ModelResponse(tool_calls=[partial_patch]),
+            ModelResponse(tool_calls=[partial_patch.model_copy(update={"id": "retry-1"})]),
+            ModelResponse(tool_calls=[partial_patch.model_copy(update={"id": "retry-2"})]),
+        ]
+    )
+    original_write_text = Path.write_text
+
+    def fail_second_write(path: Path, content: str, **kwargs: object) -> int:
+        if path.resolve() == second.resolve():
+            raise OSError("simulated second-file write failure")
+        return original_write_text(path, content, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_second_write)
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Update both files", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.FAILED
+    assert completed.turns[-1].changed_files == ["first.txt"]
+    assert storage.get_run(run.id).turns[-1].changed_files == ["first.txt"]
+    completion = next(
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TURN_COMPLETED
+    )
+    assert completion.payload["changed_files"] == ["first.txt"]
+    assert EventType.DIFF_UPDATED in [
+        event.type for event in storage.get_events(run.id)
+    ]
+    assert first.read_text() == "after one\n"
+    assert second.read_text() == "before two\n"
+
+
+@pytest.mark.asyncio
+async def test_no_op_edit_keeps_passing_check_fresh_and_reports_no_changed_file(
+    settings: Settings, storage: Storage
+) -> None:
+    target = settings.workspace / "result.txt"
+    target.write_text("ready\n")
+    check = [
+        "python3",
+        "-c",
+        "from pathlib import Path; assert Path('result.txt').read_text() == 'ready\\n'",
+    ]
+    plan = _plan_arguments(check) | {"impacted_files": ["result.txt"]}
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall(id="plan", name="submit_plan", arguments=plan)]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="check", name="run_command", arguments={"argv": check})
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="no-op",
+                        name="apply_patch",
+                        arguments={
+                            "patch": (
+                                "--- a/result.txt\n+++ b/result.txt\n"
+                                "@@ -1 +1 @@\n-ready\n+ready\n"
+                            )
+                        },
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={
+                            "summary": "Confirmed the existing file",
+                            "evidence": ["check"],
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Confirm result.txt", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert completed.turns[-1].changed_files == []
+    assert completed.plan is not None
+    assert completed.plan.acceptance_checks[0].status.value == "passed"
+    assert EventType.DIFF_UPDATED not in [
+        event.type for event in storage.get_events(run.id)
+    ]
+    assert target.read_text() == "ready\n"
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,11 @@ scope. An unexpected path pauses for a one-time action decision before any bytes
 scope check remains an application policy even when an OS sandbox is active; it answers “was this
 planned?” while the sandbox answers “what can this process technically reach?”
 
+For user-facing per-turn attribution, those two native edit tools fingerprint canonical candidate
+paths before and after execution. Only actual changes are recorded, including a successful first
+write when a later file fails. The claim is intentionally limited: approved project commands can
+also mutate the workspace, and TraceForge does not yet perform a whole-tree command audit.
+
 Completion review is a third, separate concept. After fresh checks, the verifier receives evidence
 through a read-only tool surface and cannot mutate files or execute commands. Its pass/fail decision
 does not grant runtime permissions; a rejection only returns bounded findings to the builder.
@@ -102,7 +107,7 @@ its content must be exactly one non-empty line. Public status/configuration resp
 source and readiness flag, never the value. The connection check verifies native tool calling
 rather than only endpoint reachability.
 
-Before any model-proposed child command starts, TraceForge removes environment variables whose
+Before any model-proposed child command or local file-manager launcher starts, TraceForge removes environment variables whose
 names indicate keys, passwords, passphrases, secrets, tokens, or credentials, as well as common
 agent socket variables. Normal variables such as `PATH` remain available. Model and tool text are
 also redacted for the configured credential and token-shaped `sk-...` values before public events
@@ -129,8 +134,16 @@ rewrite the database can also recompute the hashes.
 ## Local web service
 
 The CLI binds to `127.0.0.1` by default. WebSocket origins must be `localhost` or `127.0.0.1`.
-Security headers deny framing, MIME sniffing, and outbound content by default. Binding to another
-interface expands the trust boundary and should only be done behind controls chosen by the user.
+State-changing HTTP requests reject a non-local `Origin` and `Sec-Fetch-Site: cross-site`, which is
+important because opening a local file manager is a host-side effect even though it does not edit
+files. That endpoint accepts only a run id, never a browser-supplied path; it re-resolves the
+persisted workspace and rejects a path replaced by a symlink before invoking fixed, shell-free
+Finder/`xdg-open` argv. A Linux launcher discovered through `PATH` is resolved first and rejected
+when it points inside the task workspace, preventing a project-local executable from impersonating
+the file manager. Linux headless sessions report the capability as unsupported instead of
+starting a hanging process. Security headers deny framing, MIME sniffing, and outbound content by
+default. Binding to another interface expands the trust boundary and should only be done behind
+controls chosen by the user.
 
 ## Residual risks
 

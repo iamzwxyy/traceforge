@@ -42,7 +42,11 @@ def build_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
         "workspace": run.workspace,
         "project_id": run.project_id,
         "mode": run.mode.value,
-        "turns": [turn.model_dump(mode="json") for turn in run.turns],
+        # v1 predates per-turn UI navigation hints. Keep its stable digest surface
+        # unchanged; cumulative snapshot paths remain covered by changed_files below.
+        "turns": [
+            turn.model_dump(mode="json", exclude={"changed_files"}) for turn in run.turns
+        ],
         "state": run.state.value,
         "proof_status": proof_status,
         "plan": run.plan.model_dump(mode="json") if run.plan else None,

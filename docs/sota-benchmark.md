@@ -16,9 +16,12 @@ TraceForge 自己的主线应保持鲜明：**每次改动都能给出“计划 
 
 - DeepSeek Harness：[`b150a55`](https://github.com/deepseek-ai/deepseek-harness/tree/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e)
 - OpenAI Codex：[`89650c6`](https://github.com/openai/codex/tree/89650c66f2f3ff0d028d3f5d6d0b187b2ed49be5)
+- 天枢交互：[`3e830de`](https://github.com/dmql98/tianshu/tree/3e830de4709f1b1336e97f7f1dd396630ee0beb9)
 - OpenAI 官方说明：[Codex App Server](https://developers.openai.com/codex/app-server)、[Sandbox](https://developers.openai.com/codex/sandboxing)
 
 对标只覆盖与本项目直接相关的六个维度：执行循环、工具协议、上下文、审批与隔离、项目/任务模型、可观测性与测试。不把商业协作、插件生态、云执行、多智能体和装饰性功能列入 v1。
+天枢只用于交互层补充：借鉴对话/轨迹同级与工具渐进披露，不复制固定多栏、默认展开 reasoning、
+启发式文件清单或角色中心导航；具体取舍见 [UI benchmark](ui-benchmark.md)。
 
 ## 六维对标
 

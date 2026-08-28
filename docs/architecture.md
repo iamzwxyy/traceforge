@@ -153,6 +153,14 @@ Tool output has two limits: at most 1 MiB is persisted and at most 16 KiB (head 
 back to the model. The complete public status still includes exit code, timeout, truncation, argv,
 working directory, and per-command sandbox metadata.
 
+Native mutation tools fingerprint every canonical candidate path immediately before and after an
+attempt. Their `ToolResult.metadata.changed_files` therefore contains only files whose bytes or
+existence actually changed, including the successful prefix of a multi-file patch that later
+fails. `AgentManager` merges that list into the active `ConversationTurn` and persists it before
+diff events or repeated-failure termination. This is deliberately narrower than a full workspace
+audit: `run_command` can mutate files, so the UI labels the list as native-edit-tool changes rather
+than claiming it captures every command side effect.
+
 ## Proof Pack projection
 
 `GET /api/runs/{id}/proof-pack` assembles a versioned evidence projection from the run, snapshots,
@@ -170,6 +178,12 @@ and one for the assembled evidence. The Markdown route renders the same projecti
 These hashes detect accidental or post-export changes; they are not signatures or a defense
 against a local user deliberately rewriting both SQLite and the artifact.
 
+Per-turn `changed_files` was added after the `traceforge.proof-pack.v1` digest surface. It is a UI
+navigation hint rather than new signed evidence, so v1 turn serialization excludes the field;
+the cumulative snapshot paths remain covered by the existing top-level `changed_files`. A future
+artifact that signs per-turn attribution must use a new schema version instead of silently changing
+v1 hashes.
+
 ## Context management
 
 TraceForge resolves a context window for each route using a validated user override, an exact
@@ -180,7 +194,7 @@ window, and inserts a bounded evidence-oriented summary of the middle. Assistant
 paired with their following tool results; hidden reasoning is neither requested nor displayed.
 
 A run is also a durable conversation. `ConversationTurn` records the request, selected Agent/Plan
-mode, outcome, completion summary, and timestamps. A terminal answered, successful, failed, or
+mode, outcome, completion summary, native-edit files, and timestamps. A terminal answered, successful, failed, or
 cancelled run can transition back to `created` for a follow-up. The next planner receives the last six completed
 turn requests and summaries while keeping the same run id, project, workspace snapshots, event
 ledger, and rollback boundary. Model protocol messages reset per turn so stale tool-call state is
@@ -226,8 +240,12 @@ post-agent user change.
 
 The same-origin service defaults to `127.0.0.1`. REST manages direct-task directories, projects,
 provider references, connection probes, and run controls; it returns current state/diff/events,
-adds follow-up turns, downloads Markdown plans, and resolves plan or action decisions. JSON and
-Markdown Proof Pack routes expose the evidence projection. WebSocket pushes the persisted event stream. Origins are restricted to localhost, and
+adds follow-up turns, downloads Markdown plans, and resolves plan or action decisions. The
+run-scoped `POST /api/runs/{id}/open-workspace` accepts no path from the browser: it re-resolves the
+persisted canonical workspace, rejects symlink retargeting, and invokes Finder or `xdg-open` with a
+fixed argv and scrubbed environment. JSON and Markdown Proof Pack routes expose the evidence
+projection. WebSocket pushes the persisted event stream. Mutating HTTP requests reject untrusted
+origins and cross-site fetch metadata; WebSocket origins are restricted to localhost, and
 responses include CSP, frame denial, referrer, and MIME-sniffing headers. The React production
 build is part of the Python wheel.
 

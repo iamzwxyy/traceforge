@@ -3,6 +3,7 @@ from __future__ import annotations
 from traceforge.models import (
     AcceptanceCheck,
     CheckStatus,
+    ConversationTurn,
     EventType,
     PlanGate,
     PlanStep,
@@ -177,6 +178,34 @@ def test_proof_pack_marks_mixed_sandbox_execution(storage: Storage, workspace: W
     assert pack.command_sandbox.policy_only_commands == 0
     assert pack.command_sandbox.not_executed_commands == 1
     assert "Rejected or denied before execution: 1" in proof_pack_markdown(pack)
+
+
+def test_proof_v1_digest_excludes_per_turn_navigation_hints(
+    storage: Storage, workspace: Workspace
+) -> None:
+    run = RunRecord(
+        id="turn-hint-proof",
+        task="Create a file",
+        workspace=str(workspace.root),
+        state=RunState.SUCCEEDED,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Create a file",
+                outcome="succeeded",
+                summary="Created it",
+                changed_files=["created.txt"],
+            )
+        ],
+    )
+    storage.create_run(run)
+    without_hint = run.model_copy(deep=True)
+    without_hint.turns[0].changed_files = []
+
+    with_hint_pack = build_proof_pack(run, storage)
+    without_hint_pack = build_proof_pack(without_hint, storage)
+
+    assert with_hint_pack.evidence_sha256 == without_hint_pack.evidence_sha256
 
 
 def test_proof_pack_records_conflict_aware_rollback(

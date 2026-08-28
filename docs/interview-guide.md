@@ -20,7 +20,7 @@ read-only verifier instead of many parallel agents.
 | 0:10-0:25 | Clarification card, plan, and risk gate | Options prevent a silent compatibility assumption; the gate explains why approval is required. |
 | 0:25-1:05 | Accelerated tool timeline and diff | Bounded native tools, dynamic plan status, real test command, stale-check invalidation. |
 | 1:05-1:30 | Checks and verifier tabs | Exit code and output are evidence; verifier has no write/execute tools. |
-| 1:30-1:50 | Evidence board and Proof Pack | Final verdict, persisted diff source, command-sandbox evidence, integrity digest, and conflict-aware recovery. |
+| 1:30-1:50 | Compact completion footer and Proof Pack | The answer stays primary; drill down to persisted diff source, command-sandbox evidence, integrity digest, and conflict-aware recovery. |
 | 1:50-2:00 | Architecture diagram | Model proposes; TraceForge controls and proves. |
 
 ## Likely questions
@@ -91,8 +91,9 @@ recoverable view of the same source of truth rather than a best-effort stream.
 ### What would you build next?
 
 The fixed quality corpus and two low-frequency real-model scenarios now cover the main claims.
-Next: richer language-aware patch validation and a polished demo rehearsal. After that: optional
-stronger Linux profiles and signed evidence.
+Next: explicit approval profiles with defensible boundaries, followed by model reasoning-effort
+routing and richer language-aware patch validation. After that: optional stronger Linux profiles
+and signed evidence.
 Parallel writers and plugins come later because they complicate attribution and recovery more than
 they improve this v0.1 demo.
 
@@ -104,6 +105,6 @@ they improve this v0.1 demo.
 - `src/traceforge/workspace.py`: path boundary, snapshots, diff, rollback
 - `src/traceforge/storage.py`: WAL persistence and migrations
 - `src/traceforge/api.py`: public data boundary and sequenced WebSocket
-- `web/src/App.tsx`: evidence-oriented interaction surface
+- `web/src/App.tsx`: conversation-first interaction surface with on-demand evidence
 - `tests/test_demo.py` and `web/e2e/demo.spec.ts`: deterministic proof of the full story
 - `scripts/evaluate_real_model.py`: opt-in provider acceptance with hidden semantic checks

@@ -10,7 +10,7 @@ import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Literal
 
 from traceforge.config import Settings
@@ -18,7 +18,7 @@ from traceforge.models import TaskPlan, ToolCall, ToolResult
 from traceforge.patching import FilePatch, PatchError, apply_file_patch, parse_unified_diff
 from traceforge.planning import is_safe_routine_check_variant
 from traceforge.sandbox import CommandSandbox, SandboxStatus
-from traceforge.workspace import Workspace, WorkspaceViolation
+from traceforge.workspace import Workspace, WorkspaceViolation, digest
 
 OutputCallback = Callable[[str], Awaitable[None]]
 
@@ -135,8 +135,8 @@ class ToolRegistry:
     def assess(self, call: ToolCall, plan: TaskPlan | None) -> PermissionAssessment:
         if call.name in {"apply_patch", "create_file"} and plan and plan.impacted_files:
             try:
-                mutation_paths = _mutation_paths(call)
-            except PatchError as exc:
+                mutation_paths = self._mutation_paths(call)
+            except (PatchError, WorkspaceViolation) as exc:
                 return PermissionAssessment(PermissionDecision.DENY, str(exc), "dangerous")
             unexpected = sorted(set(mutation_paths) - set(plan.impacted_files))
             if unexpected:
@@ -206,7 +206,10 @@ class ToolRegistry:
         output_callback: OutputCallback | None = None,
         sandbox_bypass: bool = False,
     ) -> ToolResult:
+        mutation_baseline: dict[str, tuple[bool, str | None]] = {}
         try:
+            if call.name in {"apply_patch", "create_file"}:
+                mutation_baseline = self._mutation_baseline(call)
             if call.name == "list_files":
                 output = self._list_files(**call.arguments)
             elif call.name == "read_file":
@@ -232,14 +235,66 @@ class ToolRegistry:
                     ok=False,
                     error=f"Unknown or non-executable tool: {call.name}",
                 )
-            return ToolResult(tool_call_id=call.id, name=call.name, ok=True, output=output)
+            return ToolResult(
+                tool_call_id=call.id,
+                name=call.name,
+                ok=True,
+                output=output,
+                metadata=(
+                    {"changed_files": self._changed_mutation_paths(mutation_baseline)}
+                    if call.name in {"apply_patch", "create_file"}
+                    else {}
+                ),
+            )
         except (OSError, UnicodeError, ValueError, PatchError, WorkspaceViolation) as exc:
             return ToolResult(
                 tool_call_id=call.id,
                 name=call.name,
                 ok=False,
                 error=str(exc),
+                metadata=(
+                    {"changed_files": self._changed_mutation_paths(mutation_baseline)}
+                    if call.name in {"apply_patch", "create_file"}
+                    else {}
+                ),
             )
+
+    def _mutation_paths(self, call: ToolCall) -> list[str]:
+        if call.name == "create_file":
+            raw = call.arguments.get("path")
+            if not isinstance(raw, str) or not raw.strip():
+                raise PatchError("create_file path must be a non-empty string")
+            return [self.workspace.relative(self.workspace.resolve_write(raw, must_exist=False))]
+        raw_patch = call.arguments.get("patch")
+        if not isinstance(raw_patch, str):
+            raise PatchError("apply_patch patch must be a string")
+        paths: list[str] = []
+        for file_patch in parse_unified_diff(raw_patch):
+            path = self.workspace.resolve_write(file_patch.path)
+            if (
+                file_patch.new_path is not None
+                and file_patch.old_path is not None
+                and file_patch.new_path != file_patch.old_path
+            ):
+                raise PatchError("File renames are not supported in v1")
+            paths.append(self.workspace.relative(path))
+        return sorted(set(paths))
+
+    def _mutation_baseline(self, call: ToolCall) -> dict[str, tuple[bool, str | None]]:
+        baseline: dict[str, tuple[bool, str | None]] = {}
+        for relative_path in self._mutation_paths(call):
+            path = self.workspace.resolve_write(relative_path)
+            baseline[relative_path] = _file_fingerprint(path)
+        return baseline
+
+    def _changed_mutation_paths(
+        self, baseline: dict[str, tuple[bool, str | None]]
+    ) -> list[str]:
+        return [
+            relative_path
+            for relative_path, before in baseline.items()
+            if _file_fingerprint(self.workspace.resolve_write(relative_path)) != before
+        ]
 
     async def cancel(self, run_id: str) -> None:
         process = self._processes.get(run_id)
@@ -524,16 +579,10 @@ def _accepted_check_relation(
     return None
 
 
-def _mutation_paths(call: ToolCall) -> list[str]:
-    if call.name == "create_file":
-        raw = call.arguments.get("path")
-        if not isinstance(raw, str) or not raw.strip():
-            raise PatchError("create_file path must be a non-empty string")
-        return [PurePosixPath(raw).as_posix()]
-    raw_patch = call.arguments.get("patch")
-    if not isinstance(raw_patch, str):
-        raise PatchError("apply_patch patch must be a string")
-    return [PurePosixPath(patch.path).as_posix() for patch in parse_unified_diff(raw_patch)]
+def _file_fingerprint(path: Path) -> tuple[bool, str | None]:
+    if not path.exists():
+        return False, None
+    return True, digest(path.read_bytes())
 
 
 def _is_read_only(argv: list[str]) -> bool:
@@ -564,15 +613,21 @@ def _outside_workspace_argument(argv: list[str], workspace: Path) -> str | None:
     return None
 
 
-def _command_environment(
-    workspace: Path, *, home: Path, temp: Path, cache: Path
-) -> dict[str, str]:
-    environment = {
+def scrubbed_environment() -> dict[str, str]:
+    """Return the process environment without credential-like variables."""
+
+    return {
         key: value
         for key, value in os.environ.items()
         if key.upper() not in SENSITIVE_ENV_EXACT
         and SENSITIVE_ENV_NAME_PATTERN.search(key) is None
     }
+
+
+def _command_environment(
+    workspace: Path, *, home: Path, temp: Path, cache: Path
+) -> dict[str, str]:
+    environment = scrubbed_environment()
     runtime_dirs = [
         workspace / ".venv" / "bin",
         workspace / "venv" / "bin",

@@ -31,11 +31,18 @@ Its differentiator is a defensible engineering loop with useful human control.
   integrity fingerprints.
 - **Conversation without losing the Trace.** Follow-up prompts continue the same task and preserve
   prior turn summaries, workspace, and evidence. The main feed reads like a coding conversation;
-  the exact plan, tools, checks, and review stay one click away in a collapsed Trace and inspector.
+  each final answer names the files actually changed by native edit tools in that turn, while the
+  cumulative task diff, exact plan, tools, checks, and review stay one click away.
+- **Conversation-first completion.** A compact completion footer reports passed checks and keeps
+  Proof Pack one click away without letting a large evidence dashboard bury the delivered answer.
+  The left history panel and default-collapsed right details panel are resizable, keyboard
+  operable, responsive, and locally persistent.
 - **Low-friction workspaces.** The app starts without a workspace argument. A direct task
   automatically receives an isolated folder under the visible `Documents/TraceForge` root;
   existing code is selected inside the UI. Projects use macOS's native folder picker when
   available and keep their runs nested under a collapsible folder. Neither mode uploads files.
+  A run-scoped **Open directory** action reveals the exact task workspace in Finder, or the local
+  Linux file manager when a graphical session is available.
 - **Layered, inspectable command isolation.** Routine and planned commands run under macOS
   Seatbelt or Linux Bubblewrap when available; the UI and Proof Pack distinguish enforced,
   user-approved bypass, and policy-only execution instead of presenting approval as a sandbox.
@@ -62,9 +69,9 @@ uv run traceforge demo
 Open <http://127.0.0.1:8765>. The task is prefilled. Start it, choose the recommended API
 compatibility option, approve the plan, and watch TraceForge repair a real cross-tenant cache
 isolation bug. The demo changes a disposable copy, executes four real Pytest tests, and produces
-a read-only verifier verdict. Open **Proof Pack** on the evidence board to inspect or download the
-complete delivery record. This command is intentionally a fixed tour: the prefilled task is
-read-only and unrelated prompts are rejected instead of being silently mapped onto the demo.
+a read-only verifier verdict. Open **查看证据** in the compact completion footer to inspect or
+download the complete Proof Pack. This command is intentionally a fixed tour: the prefilled task
+is read-only and unrelated prompts are rejected instead of being silently mapped onto the demo.
 
 ## Run against your own workspaces
 
@@ -108,6 +115,11 @@ turn finishes, use the bottom composer to continue in the same task; each follow
 own Agent or Plan mode. In either mode, conversational or read-only requests can answer directly;
 the UI labels that terminal state separately from evidence-backed completion.
 
+The right **任务详情** panel starts collapsed so the conversation stays primary. Use the header
+buttons to toggle either side panel, drag their separators (or use arrow/Home/End keys) to resize,
+and click **打开目录** in a task header to reveal its local workspace. Panel preferences persist
+on desktop; narrow windows use temporary drawers without overwriting those preferences.
+
 Environment variables remain available as a non-persisted fallback:
 
 | Variable | Required | Purpose |
@@ -134,7 +146,7 @@ flowchart LR
     H --> D
     D --> E[Acceptance checks]
     E --> F[Read-only completion review]
-    F -->|pass| G[Evidence board + Proof Pack]
+    F -->|pass| G[Compact completion + Proof Pack]
     F -->|findings, max 2| D
     G -->|follow-up| B
     J -->|follow-up| B
@@ -180,7 +192,7 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
 ```
 
-The current suite has 127 backend tests at 86.90% coverage (with a hard 85% gate), eight frontend
+The current suite has 170 backend tests at 87.71% coverage (with a hard 85% gate), eight frontend
 unit tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.

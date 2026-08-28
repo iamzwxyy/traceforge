@@ -14,7 +14,7 @@ visual identity.
 | One dominant **New task** action beside persistent history | The next action and the way back are both obvious | Put rectangular New Task/Add Project actions above history; choose scope from the sidebar rather than inside the composer |
 | A large, centered task composer with model/context controls nearby | Configuration is available without competing with the request | Keep the focused composer and provider readiness callout |
 | Long executions keep detail behind progressive disclosure | Hundreds of tool rows do not bury the outcome | Keep the conversation primary and place plan/tool/review evidence in one collapsed Trace |
-| Rich final response followed by artifact actions | Result and handoff are adjacent | Keep the evidence board and make Proof Pack the delivery action |
+| Rich final response followed by artifact actions | Result and handoff are adjacent | Keep the final answer primary, then attach a compact check summary and Proof Pack action |
 | Sticky “waiting for your next instruction” context | The system's current mode remains legible | Use explicit state, approval, and connection badges rather than a chat composer during execution |
 
 ## Measured typography baseline
@@ -40,6 +40,32 @@ general-purpose product navigation.
   mission-control identity so model narrative, machine evidence, and human decisions remain
   visually distinct.
 
+## Tianshu source and runtime comparison
+
+The second read-only comparison was fixed to Tianshu commit
+[`3e830de`](https://github.com/dmql98/tianshu/tree/3e830de4709f1b1336e97f7f1dd396630ee0beb9)
+on 2026-08-28 and checked both source and a locally started UI. Its useful product hierarchy is
+global navigation → workspace-path session groups → sibling Chat/Trajectory views → optional
+role/project/goal detail. In particular, Chat and Trajectory stay mounted when switching tabs, and
+tool calls start as compact expandable rows ([ChatArea](https://github.com/dmql98/tianshu/blob/3e830de4709f1b1336e97f7f1dd396630ee0beb9/dev/web/client/src/components/Chat/ChatArea.tsx),
+[ToolCall](https://github.com/dmql98/tianshu/blob/3e830de4709f1b1336e97f7f1dd396630ee0beb9/dev/web/client/src/components/Chat/ToolCall.tsx)).
+
+TraceForge adopts the underlying principle—conversation and compact outcomes first, exact
+trajectory and evidence on demand—but not the literal layout:
+
+- Tianshu's side panels use fixed widths and transient Boolean state. TraceForge makes both panels
+  resizable and keyboard operable, persists desktop preferences, defaults the right panel closed,
+  and turns panels into temporary drawers at narrow breakpoints.
+- Tianshu's file panel infers paths from current messages and fixed read/write tool names
+  ([FilePanel](https://github.com/dmql98/tianshu/blob/3e830de4709f1b1336e97f7f1dd396630ee0beb9/dev/web/client/src/components/Chat/FilePanel.tsx)).
+  TraceForge fingerprints canonical paths around native edits, binds the result to a specific turn,
+  and keeps it explicitly separate from the task-wide cumulative Diff.
+- Tianshu can expose reasoning, raw prompts, and raw trajectory objects. TraceForge never exposes
+  hidden chain-of-thought or treats model-authored evidence text as equivalent to tool results.
+- Tianshu's current source has moved model, reasoning, execution, and approval controls into the
+  composer even though its README screenshot still describes some of them in the right panel.
+  TraceForge bases decisions on the pinned source/runtime rather than copying an outdated image.
+
 ## Chosen changes
 
 The initial chapter UI improved scan cost, but still made the internal pipeline feel like the
@@ -53,6 +79,12 @@ the complete downloadable Markdown contract. This reduces process ceremony witho
 evidence or inventing a second source of truth. A terminal task exposes a follow-up composer that
 keeps the same run, workspace, and evidence history; Plan mode remains an optional per-turn switch.
 
+Successful work now ends with the Agent's final answer, a turn-local native-edit file list, and a
+single compact completion footer. The former full-width evidence board was removed; Proof Pack is
+still reachable from the footer when the right details panel is closed. The right panel defaults
+closed, while both desktop panels can be toggled, pointer-dragged, keyboard resized, reset, and
+restored after reload without allowing their combined widths to erase the conversation.
+
 The task-entry surface now follows the same principle: direct runs remain top-level, projects are
 collapsible folders, and the project plus button determines the composer workspace. At narrow
-breakpoints, history and evidence become focus-trapped drawers instead of disappearing.
+breakpoints, history and task details become focus-trapped drawers instead of disappearing.

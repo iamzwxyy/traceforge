@@ -4,6 +4,7 @@ import type {
   DirectoryChoice,
   DirectoryListing,
   InteractionMode,
+  OpenWorkspaceResult,
   Project,
   ProofPack,
   ProviderConfig,
@@ -38,6 +39,8 @@ export const api = {
   getEvents: (runId: string, afterSeq = 0) =>
     request<RunEvent[]>(`/api/runs/${runId}/events?after_seq=${afterSeq}`),
   getDiff: (runId: string) => request<{ diff: string }>(`/api/runs/${runId}/diff`),
+  openWorkspace: (runId: string) =>
+    request<OpenWorkspaceResult>(`/api/runs/${runId}/open-workspace`, { method: "POST" }),
   getProofPack: (runId: string) => request<ProofPack>(`/api/runs/${runId}/proof-pack`),
   createRun: (task: string, mode: InteractionMode, target: RunTarget) =>
     request<Run>("/api/runs", {

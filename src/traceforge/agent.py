@@ -130,7 +130,7 @@ _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
         RunState.CANCELLED,
         RunState.ROLLED_BACK,
     },
-    RunState.ANSWERED: {RunState.CREATED},
+    RunState.ANSWERED: {RunState.CREATED, RunState.ROLLED_BACK},
     RunState.SUCCEEDED: {RunState.CREATED, RunState.ROLLED_BACK},
     RunState.FAILED: {RunState.CREATED, RunState.ROLLED_BACK},
     RunState.CANCELLED: {RunState.CREATED, RunState.ROLLED_BACK},
@@ -307,7 +307,7 @@ class AgentManager:
 
     async def rollback(self, run_id: str) -> RollbackResult:
         run = self.storage.get_run(run_id)
-        if run.state is RunState.ANSWERED:
+        if run.state is RunState.ANSWERED and not self.storage.list_snapshots(run_id):
             raise InvalidRunAction("Answer-only turns have no file changes to roll back")
         if not run.state.terminal and run.state is not RunState.INTERRUPTED:
             raise InvalidRunAction("Cancel the active run before rolling it back")
@@ -1333,17 +1333,26 @@ class AgentManager:
     async def _update_checks_and_diff(
         self, run: RunRecord, call: ToolCall, result: ToolResult
     ) -> None:
+        emit_diff = False
+        changed_files: list[str] = []
+        raw_changed_files = result.metadata.get("changed_files")
+        if isinstance(raw_changed_files, list) and all(
+            isinstance(path, str) for path in raw_changed_files
+        ):
+            changed_files = raw_changed_files
+            turn_changed_files = self._active_turn(run).changed_files
+            turn_changed_files.extend(changed_files)
+            self._active_turn(run).changed_files = sorted(set(turn_changed_files))
         if run.plan is None:
+            self.storage.save_run(run)
             return
-        if call.name in {"apply_patch", "create_file"} and result.ok:
+        if call.name in {"apply_patch", "create_file"} and changed_files:
             for check in run.plan.acceptance_checks:
                 if check.command:
                     check.status = CheckStatus.PENDING
                     check.exit_code = None
                     check.evidence = "Files changed after the previous check."
-            await self.broker.emit(
-                run.id, EventType.DIFF_UPDATED, {"diff": self.workspace.diff(run.id)}
-            )
+            emit_diff = True
         elif call.name == "run_command":
             argv = call.arguments.get("argv")
             for check in run.plan.acceptance_checks:
@@ -1351,6 +1360,11 @@ class AgentManager:
                     check.status = CheckStatus.PASSED if result.ok else CheckStatus.FAILED
                     check.exit_code = result.metadata.get("exit_code")
                     check.evidence = (result.output or result.error or "")[-1_000:]
+        self.storage.save_run(run)
+        if emit_diff:
+            await self.broker.emit(
+                run.id, EventType.DIFF_UPDATED, {"diff": self.workspace.diff(run.id)}
+            )
         await self.broker.emit(
             run.id, EventType.PLAN_UPDATED, run.plan.model_dump(mode="json")
         )
@@ -1460,6 +1474,7 @@ class AgentManager:
                 "index": turn.index,
                 "outcome": outcome,
                 "summary": turn.summary,
+                "changed_files": turn.changed_files,
             },
         )
 
