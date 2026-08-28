@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   availableProofTurnIndexes,
   buildActivityChapters,
+  effectiveAssistantOutputStatus,
   mergeEvents,
   parseDiff,
   preferNewerRun,
@@ -90,6 +91,23 @@ describe("mission control helpers", () => {
     expect(presentState("answered")).toEqual({ label: "已答复", tone: "success" });
   });
 
+  it("settles provisional output labels when the run terminates", () => {
+    expect(effectiveAssistantOutputStatus("retrying", "interrupted", true))
+      .toBe("interrupted");
+    expect(effectiveAssistantOutputStatus("provider_completed", "failed", true))
+      .toBe("failed");
+    expect(effectiveAssistantOutputStatus("retrying", "rolled_back", true))
+      .toBe("discarded");
+    expect(effectiveAssistantOutputStatus("streaming", "cancelled", false))
+      .toBe("cancelled");
+    expect(effectiveAssistantOutputStatus("retrying", "cancelled", true))
+      .toBe("cancelled");
+    expect(effectiveAssistantOutputStatus("streaming", "executing", false))
+      .toBe("reconnecting");
+    expect(effectiveAssistantOutputStatus("committed", "rolled_back", false))
+      .toBe("committed");
+  });
+
   it("submits prompts on Enter while preserving Shift+Enter and IME composition", () => {
     expect(shouldSubmitPrompt({ key: "Enter", shiftKey: false, isComposing: false })).toBe(true);
     expect(shouldSubmitPrompt({ key: "Enter", shiftKey: true, isComposing: false })).toBe(false);
@@ -134,6 +152,326 @@ describe("mission control helpers", () => {
     expect(projectConversationEvents(events).map((item) => item.seq))
       .toEqual([1, 3]);
     expect(projectProgressEvents(events).map((item) => item.seq)).toEqual([2, 3]);
+  });
+
+  it("commits a streamed answer into one stable canonical conversation item", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      {
+        ...event(2),
+        type: "assistant.output.started",
+        payload: { stream_id: "stream-1", turn_index: 1, surface: "conversation" },
+      },
+      {
+        ...event(3),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "stream-1", turn_index: 1, segment_index: 1, delta: "Hello ",
+        },
+      },
+      {
+        ...event(4),
+        type: "assistant.output.completed",
+        payload: { stream_id: "stream-1", turn_index: 1, content: "Hello world" },
+      },
+      {
+        ...event(5),
+        type: "turn.completed",
+        payload: {
+          index: 1,
+          outcome: "answered",
+          summary: "Hello world",
+          final_stream_id: "stream-1",
+        },
+      },
+    ]);
+
+    expect(projected.map((item) => item.type)).toEqual([
+      "turn.started",
+      "assistant.output",
+    ]);
+    expect(projected[1].payload).toMatchObject({
+      stream_id: "stream-1",
+      content: "Hello world",
+      status: "committed",
+      outcome: "answered",
+      terminal_seq: 5,
+    });
+  });
+
+  it("replays streamed segments by identity without duplicates or ordering drift", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      {
+        ...event(2),
+        type: "assistant.output.started",
+        payload: { stream_id: "stream-1", turn_index: 1, surface: "conversation" },
+      },
+      {
+        ...event(4),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "stream-1", turn_index: 1, segment_index: 2, delta: "world",
+        },
+      },
+      {
+        ...event(3),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "stream-1", turn_index: 1, segment_index: 1, delta: "Hello ",
+        },
+      },
+      {
+        ...event(5),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "stream-1", turn_index: 1, segment_index: 1, delta: "duplicate",
+        },
+      },
+    ]);
+
+    expect(projected.at(-1)?.payload).toMatchObject({
+      content: "Hello world",
+      status: "streaming",
+    });
+  });
+
+  it("replaces a retrying partial with the newer isolated stream attempt", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      {
+        ...event(2),
+        type: "assistant.output.started",
+        payload: { stream_id: "first", turn_index: 1, surface: "conversation" },
+      },
+      {
+        ...event(3),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "first", turn_index: 1, segment_index: 1, delta: "old partial",
+        },
+      },
+      {
+        ...event(4),
+        type: "assistant.output.aborted",
+        payload: {
+          stream_id: "first", turn_index: 1, status: "retrying", reason: "connection",
+        },
+      },
+      {
+        ...event(5),
+        type: "assistant.output.started",
+        payload: { stream_id: "second", turn_index: 1, surface: "conversation" },
+      },
+      {
+        ...event(6),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "second", turn_index: 1, segment_index: 1, delta: "new partial",
+        },
+      },
+    ]);
+
+    expect(projected).toHaveLength(2);
+    expect(projected[1].payload).toMatchObject({
+      stream_id: "second",
+      content: "new partial",
+      status: "streaming",
+    });
+  });
+
+  it("preserves an interrupted partial beside an accurate failed terminal result", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      {
+        ...event(2),
+        type: "assistant.output.started",
+        payload: { stream_id: "partial", turn_index: 1, surface: "conversation" },
+      },
+      {
+        ...event(3),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "partial", turn_index: 1, segment_index: 1, delta: "unfinished",
+        },
+      },
+      {
+        ...event(4),
+        type: "assistant.output.aborted",
+        payload: {
+          stream_id: "partial", turn_index: 1, status: "failed", reason: "protocol",
+        },
+      },
+      {
+        ...event(5),
+        type: "turn.completed",
+        payload: { index: 1, outcome: "failed", summary: "Provider protocol failed" },
+      },
+    ]);
+
+    expect(projected.map((item) => item.type)).toEqual([
+      "turn.started",
+      "assistant.output",
+      "turn.completed",
+    ]);
+    expect(projected[1].payload).toMatchObject({
+      content: "unfinished",
+      status: "failed",
+    });
+  });
+
+  it("ignores streamed events whose turn identity does not match the active bucket", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      {
+        ...event(2),
+        type: "assistant.output.started",
+        payload: { stream_id: "active-stream", turn_index: 1, surface: "conversation" },
+      },
+      {
+        ...event(3),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "active-stream", turn_index: 1, segment_index: 1, delta: "safe",
+        },
+      },
+      {
+        ...event(4),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "active-stream", turn_index: 2, segment_index: 2, delta: " leak",
+        },
+      },
+      {
+        ...event(5),
+        type: "assistant.output.completed",
+        payload: { stream_id: "active-stream", turn_index: 2, content: "leak complete" },
+      },
+      {
+        ...event(6),
+        type: "assistant.output.aborted",
+        payload: { stream_id: "active-stream", turn_index: 2, status: "failed" },
+      },
+    ]);
+
+    expect(projected.map((item) => item.type)).toEqual(["turn.started", "assistant.output"]);
+    expect(projected.at(-1)?.payload).toMatchObject({ content: "safe", status: "streaming" });
+  });
+
+  it("ignores a terminal event whose turn identity does not match the active bucket", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      {
+        ...event(2),
+        type: "assistant.output.started",
+        payload: { stream_id: "stream-1", turn_index: 1, surface: "conversation" },
+      },
+      {
+        ...event(3),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "stream-1", turn_index: 1, segment_index: 1, delta: "Canonical",
+        },
+      },
+      {
+        ...event(4),
+        type: "turn.completed",
+        payload: { index: 2, outcome: "answered", summary: "Wrong turn" },
+      },
+      {
+        ...event(5),
+        type: "turn.completed",
+        payload: {
+          index: 1,
+          outcome: "answered",
+          summary: "Canonical",
+          final_stream_id: "stream-1",
+        },
+      },
+    ]);
+
+    expect(projected.map((item) => item.seq)).toEqual([1, 2]);
+    expect(projected.at(-1)?.payload).toMatchObject({
+      content: "Canonical",
+      status: "committed",
+      terminal_seq: 5,
+    });
+  });
+
+  it("preserves the cancelled draft through terminal and rollback event ordering", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      {
+        ...event(2),
+        type: "assistant.output.started",
+        payload: { stream_id: "cancelled-draft", turn_index: 1, surface: "conversation" },
+      },
+      {
+        ...event(3),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "cancelled-draft", turn_index: 1, segment_index: 1, delta: "Draft",
+        },
+      },
+      {
+        ...event(4),
+        type: "assistant.output.completed",
+        payload: { stream_id: "cancelled-draft", turn_index: 1, content: "Draft" },
+      },
+      {
+        ...event(5),
+        type: "assistant.output.aborted",
+        payload: { stream_id: "cancelled-draft", turn_index: 1, status: "cancelled" },
+      },
+      { ...event(6), type: "state.changed", payload: { state: "cancelled" } },
+      {
+        ...event(7),
+        type: "turn.completed",
+        payload: { index: 1, outcome: "cancelled", summary: "The user stopped this turn." },
+      },
+      { ...event(8), type: "rollback.completed", payload: { removed: [], restored: [] } },
+    ]);
+
+    expect(projected.map((item) => item.type)).toEqual([
+      "turn.started",
+      "assistant.output",
+      "turn.completed",
+    ]);
+    expect(projected[1].payload).toMatchObject({ content: "Draft", status: "cancelled" });
+  });
+
+  it("settles a retry-backoff draft when cancellation closes the turn", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      {
+        ...event(2),
+        type: "assistant.output.started",
+        payload: { stream_id: "retry-draft", turn_index: 1, surface: "conversation" },
+      },
+      {
+        ...event(3),
+        type: "assistant.output.delta",
+        payload: {
+          stream_id: "retry-draft", turn_index: 1, segment_index: 1, delta: "Partial",
+        },
+      },
+      {
+        ...event(4),
+        type: "assistant.output.aborted",
+        payload: { stream_id: "retry-draft", turn_index: 1, status: "retrying" },
+      },
+      { ...event(5), type: "state.changed", payload: { state: "cancelled" } },
+      {
+        ...event(6),
+        type: "turn.completed",
+        payload: { index: 1, outcome: "cancelled", summary: "The user stopped this turn." },
+      },
+    ]);
+    const draft = projected.find((item) => item.type === "assistant.output");
+
+    expect(draft?.payload).toMatchObject({ content: "Partial", status: "retrying" });
+    expect(effectiveAssistantOutputStatus(String(draft?.payload.status), "cancelled", true))
+      .toBe("cancelled");
   });
 
   it("keeps one canonical response per completed turn without cross-turn folding", () => {

@@ -239,4 +239,5 @@ def scripted_demo_provider() -> ScriptedProvider:
         ],
         delay_seconds=0.45,
         repeat=True,
+        streaming=True,
     )

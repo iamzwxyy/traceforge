@@ -19,6 +19,7 @@ def test_quality_evaluator_lists_fixed_corpus() -> None:
         "truthful-repair\tTruthful repair and termination",
         "recovery-rollback\tRecovery without duplicated side effects",
         "command-isolation\tCommand isolation with auditable escape",
+        "streaming-integrity\tDurable and redacted streaming",
     ]
 
 

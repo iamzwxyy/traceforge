@@ -147,6 +147,7 @@ export interface ConversationTurn {
   reasoning_effort: ReasoningEffort;
   outcome: "in_progress" | "answered" | "succeeded" | "failed" | "cancelled";
   summary: string;
+  summary_stream_id: string | null;
   changed_files: string[];
   started_at: string;
   completed_at: string | null;

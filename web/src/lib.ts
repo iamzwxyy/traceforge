@@ -96,6 +96,21 @@ export function isActiveState(state: RunState): boolean {
   ].includes(state);
 }
 
+export function effectiveAssistantOutputStatus(
+  status: string,
+  runState: RunState,
+  connected: boolean,
+): string {
+  if (["streaming", "provider_completed", "retrying", "reconnecting"].includes(status)) {
+    if (runState === "interrupted") return "interrupted";
+    if (runState === "cancelled") return "cancelled";
+    if (runState === "failed") return "failed";
+    if (runState === "rolled_back") return "discarded";
+  }
+  if (status === "streaming") return connected ? "streaming" : "reconnecting";
+  return status;
+}
+
 export function shouldSubmitPrompt(event: {
   key: string;
   shiftKey: boolean;
@@ -114,39 +129,169 @@ export function supportedReasoningEffort(
 }
 
 export function projectConversationEvents(events: RunEvent[]): RunEvent[] {
-  const conversation = events.filter((event) =>
-    ["turn.started", "turn.completed", "message"].includes(event.type)
-  );
   const projected: RunEvent[] = [];
-  let started: RunEvent | null = null;
-  let messages: RunEvent[] = [];
-  const flushIncomplete = () => {
-    if (started) projected.push(started);
-    if (messages.length > 0) {
-      projected.push(messages.at(-1)!);
+  let turn = emptyConversationTurn();
+  const flush = () => {
+    if (turn.started) projected.push(turn.started);
+    const finalStreamId = typeof turn.completed?.payload.final_stream_id === "string"
+      ? turn.completed.payload.final_stream_id
+      : null;
+    const linked = finalStreamId ? turn.streams.get(finalStreamId) : undefined;
+    if (turn.completed && linked) {
+      projected.push(projectStream(linked, turn.completed));
+    } else if (turn.completed) {
+      const latest = latestStream(turn);
+      if (latest && ["failed", "cancelled"].includes(
+        String(turn.completed.payload.outcome ?? ""),
+      )) {
+        projected.push(projectStream(latest));
+      }
+      projected.push(turn.completed);
+    } else {
+      const latest = latestStream(turn);
+      if (latest) projected.push(projectStream(latest));
+      else if (turn.messages.length > 0) projected.push(turn.messages.at(-1)!);
     }
-    started = null;
-    messages = [];
+    turn = emptyConversationTurn();
   };
 
-  for (const event of conversation) {
+  for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
     if (event.type === "turn.started") {
-      flushIncomplete();
-      started = event;
+      flush();
+      turn.started = event;
+      const turnIndex = Number(event.payload.index ?? 0);
+      turn.index = Number.isInteger(turnIndex) && turnIndex > 0 ? turnIndex : null;
       continue;
     }
     if (event.type === "message") {
-      messages.push(event);
+      turn.messages.push(event);
       continue;
     }
-    if (started) projected.push(started);
-    projected.push(event);
-    started = null;
-    messages = [];
+    if (event.type === "assistant.output.started") {
+      if (event.payload.surface !== "conversation") continue;
+      if (!streamEventBelongsToTurn(event, turn)) continue;
+      const streamId = String(event.payload.stream_id ?? "");
+      if (!streamId || turn.streams.has(streamId)) continue;
+      turn.streams.set(streamId, {
+        started: event,
+        segments: new Map(),
+        status: "streaming",
+        lastSeq: event.seq,
+      });
+      turn.streamOrder.push(streamId);
+      continue;
+    }
+    if (event.type === "assistant.output.delta") {
+      if (!streamEventBelongsToTurn(event, turn)) continue;
+      const stream = turn.streams.get(String(event.payload.stream_id ?? ""));
+      const segmentIndex = Number(event.payload.segment_index ?? 0);
+      const delta = event.payload.delta;
+      if (!stream || !Number.isInteger(segmentIndex) || segmentIndex < 1) continue;
+      if (typeof delta === "string" && !stream.segments.has(segmentIndex)) {
+        stream.segments.set(segmentIndex, delta);
+      }
+      stream.lastSeq = Math.max(stream.lastSeq, event.seq);
+      continue;
+    }
+    if (event.type === "assistant.output.completed") {
+      if (!streamEventBelongsToTurn(event, turn)) continue;
+      const stream = turn.streams.get(String(event.payload.stream_id ?? ""));
+      if (!stream) continue;
+      if (typeof event.payload.content === "string") {
+        stream.completedContent = event.payload.content;
+      }
+      stream.status = "provider_completed";
+      stream.lastSeq = Math.max(stream.lastSeq, event.seq);
+      continue;
+    }
+    if (event.type === "assistant.output.aborted") {
+      if (!streamEventBelongsToTurn(event, turn)) continue;
+      const stream = turn.streams.get(String(event.payload.stream_id ?? ""));
+      if (!stream) continue;
+      stream.status = String(event.payload.status ?? "failed");
+      stream.reason = String(event.payload.reason ?? "stream_aborted");
+      stream.lastSeq = Math.max(stream.lastSeq, event.seq);
+      continue;
+    }
+    if (event.type !== "turn.completed") continue;
+    const completedIndex = Number(event.payload.index ?? 0);
+    if (
+      turn.index === null
+      || !Number.isInteger(completedIndex)
+      || completedIndex !== turn.index
+    ) continue;
+    turn.completed = event;
+    flush();
   }
-  flushIncomplete();
+  flush();
 
   return projected;
+}
+
+interface ConversationStream {
+  started: RunEvent;
+  segments: Map<number, string>;
+  completedContent?: string;
+  status: string;
+  reason?: string;
+  lastSeq: number;
+}
+
+interface ConversationTurnProjection {
+  index: number | null;
+  started: RunEvent | null;
+  messages: RunEvent[];
+  streams: Map<string, ConversationStream>;
+  streamOrder: string[];
+  completed: RunEvent | null;
+}
+
+function emptyConversationTurn(): ConversationTurnProjection {
+  return {
+    index: null,
+    started: null,
+    messages: [],
+    streams: new Map(),
+    streamOrder: [],
+    completed: null,
+  };
+}
+
+function streamEventBelongsToTurn(
+  event: RunEvent,
+  turn: ConversationTurnProjection,
+): boolean {
+  const eventTurnIndex = Number(event.payload.turn_index ?? 0);
+  return turn.index !== null
+    && Number.isInteger(eventTurnIndex)
+    && eventTurnIndex === turn.index;
+}
+
+function latestStream(turn: ConversationTurnProjection): ConversationStream | undefined {
+  const streamId = turn.streamOrder.at(-1);
+  return streamId ? turn.streams.get(streamId) : undefined;
+}
+
+function projectStream(stream: ConversationStream, terminal?: RunEvent): RunEvent {
+  const content = terminal
+    ? String(terminal.payload.summary ?? "")
+    : stream.completedContent ?? [...stream.segments.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, delta]) => delta)
+      .join("");
+  return {
+    ...stream.started,
+    type: "assistant.output",
+    payload: {
+      ...stream.started.payload,
+      content,
+      status: terminal ? "committed" : stream.status,
+      reason: stream.reason,
+      ...(terminal?.payload ?? {}),
+      terminal_seq: terminal?.seq,
+      stream_last_seq: stream.lastSeq,
+    },
+  };
 }
 
 export function projectProgressEvents(events: RunEvent[]): RunEvent[] {

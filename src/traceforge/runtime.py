@@ -25,8 +25,14 @@ from traceforge.models import (
     RunState,
     utc_now,
 )
-from traceforge.provider import ModelProvider, OpenAICompatibleProvider, ProviderError
+from traceforge.provider import (
+    ModelProvider,
+    OpenAICompatibleProvider,
+    ProviderError,
+    close_model_provider,
+)
 from traceforge.storage import Storage
+from traceforge.streaming import redact_text
 
 _CREDENTIAL_MAX_BYTES = 16 * 1024
 _MANAGED_CREDENTIAL_DIRECTORY = "provider-credentials"
@@ -578,29 +584,30 @@ class AgentRuntime:
         provider = OpenAICompatibleProvider(probe_settings)
         started = monotonic()
         try:
-            response = await provider.complete(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "This is a connection probe. Call report_connection exactly once "
-                            "with status=ok and do not answer in prose."
-                        ),
-                    },
-                    {"role": "user", "content": "Verify native tool calling now."},
-                ],
-                [_PROBE_TOOL],
-            )
-        except ProviderError as exc:
-            detail = str(exc)
-            if api_key:
-                detail = detail.replace(api_key, "[REDACTED]")
-            return {
-                "ok": False,
-                "model": config.model,
-                "latency_ms": round((monotonic() - started) * 1_000),
-                "detail": detail,
-            }
+            try:
+                response = await provider.complete(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "This is a connection probe. Call report_connection exactly once "
+                                "with status=ok and do not answer in prose."
+                            ),
+                        },
+                        {"role": "user", "content": "Verify native tool calling now."},
+                    ],
+                    [_PROBE_TOOL],
+                )
+            except ProviderError as exc:
+                detail = redact_text(str(exc), api_key=api_key)
+                return {
+                    "ok": False,
+                    "model": config.model,
+                    "latency_ms": round((monotonic() - started) * 1_000),
+                    "detail": detail,
+                }
+        finally:
+            await close_model_provider(provider)
         valid = any(
             call.name == "report_connection" and call.arguments.get("status") == "ok"
             for call in response.tool_calls

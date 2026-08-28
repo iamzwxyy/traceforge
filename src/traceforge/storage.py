@@ -383,6 +383,12 @@ class Storage:
                 (*parameters, *active),
             ).fetchall()
             for row in rows:
+                self._abort_open_assistant_output_streams_locked(
+                    str(row["id"]),
+                    status="interrupted",
+                    reason="process_restart",
+                    created_at=now,
+                )
                 self._connection.execute(
                     """
                     UPDATE runs
@@ -396,10 +402,7 @@ class Storage:
                         row["id"],
                     ),
                 )
-                sequence = self._connection.execute(
-                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE run_id = ?",
-                    (row["id"],),
-                ).fetchone()[0]
+                sequence = self._next_event_seq_locked(str(row["id"]))
                 self._connection.execute(
                     """
                     INSERT INTO events(run_id, seq, type, payload_json, created_at)
@@ -1105,6 +1108,160 @@ class Storage:
             )
         return event
 
+    def list_open_assistant_output_streams(self, run_id: str) -> list[dict[str, Any]]:
+        """Return durable stream generations that were neither committed nor aborted."""
+
+        with self._lock:
+            return list(self._open_assistant_output_streams_locked(run_id).values())
+
+    def abort_open_assistant_output_streams(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        reason: str,
+        stream_id: str | None = None,
+    ) -> list[RunEvent]:
+        """Atomically close still-provisional stream generations, if any."""
+
+        with self._lock, self._connection:
+            return self._abort_open_assistant_output_streams_locked(
+                run_id,
+                status=status,
+                reason=reason,
+                stream_id=stream_id,
+            )
+
+    def commit_interruption(
+        self,
+        run: RunRecord,
+        *,
+        previous_state: RunState,
+        stream_status: str,
+        stream_reason: str,
+        state_payload: dict[str, Any] | None = None,
+        error_payload: dict[str, Any] | None = None,
+    ) -> list[RunEvent]:
+        """Atomically close provisional output and publish a recoverable interruption."""
+
+        if run.state is not RunState.INTERRUPTED:
+            raise ValueError("Atomic interruption commit requires an interrupted RunRecord")
+        persisted_state_payload = state_payload or {
+            "state": RunState.INTERRUPTED.value,
+            "previous": previous_state.value,
+        }
+        if persisted_state_payload.get("state") != RunState.INTERRUPTED.value:
+            raise ValueError("Interruption state payload does not match the RunRecord")
+        if persisted_state_payload.get("previous") != previous_state.value:
+            raise ValueError("Interruption previous state payload does not match the state guard")
+
+        now = utc_now()
+        with self._lock, self._connection:
+            current = self._connection.execute(
+                "SELECT state FROM runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Run not found: {run.id}")
+            if current["state"] != previous_state.value:
+                raise RuntimeError("Run state changed before its atomic interruption commit")
+            events = self._abort_open_assistant_output_streams_locked(
+                run.id,
+                status=stream_status,
+                reason=stream_reason,
+                created_at=now,
+            )
+            run.updated_at = now
+            self._update_run_locked(run, expected_state=previous_state)
+            sequence = self._next_event_seq_locked(run.id)
+            if error_payload is not None:
+                error_event = RunEvent(
+                    run_id=run.id,
+                    seq=sequence,
+                    type=EventType.ERROR,
+                    payload=error_payload,
+                    created_at=now,
+                )
+                self._insert_event_locked(error_event)
+                events.append(error_event)
+                sequence += 1
+            state_event = RunEvent(
+                run_id=run.id,
+                seq=sequence,
+                type=EventType.STATE_CHANGED,
+                payload=persisted_state_payload,
+                created_at=now,
+            )
+            self._insert_event_locked(state_event)
+            events.append(state_event)
+        return events
+
+    def commit_terminal_turn(
+        self,
+        run: RunRecord,
+        *,
+        previous_state: RunState,
+        turn_payload: dict[str, Any],
+        completion_payload: dict[str, Any],
+    ) -> list[RunEvent]:
+        """Atomically publish an answered, failed, or cancelled terminal turn."""
+
+        expected_outcomes = {
+            RunState.ANSWERED: "answered",
+            RunState.FAILED: "failed",
+            RunState.CANCELLED: "cancelled",
+        }
+        expected_outcome = expected_outcomes.get(run.state)
+        if expected_outcome is None:
+            raise ValueError("Atomic terminal commit requires answered, failed, or cancelled")
+        if not run.turns or run.turns[-1].outcome != expected_outcome:
+            raise ValueError("Atomic terminal commit requires a matching closed turn")
+        if turn_payload.get("outcome") != expected_outcome:
+            raise ValueError("Terminal turn payload does not match the RunRecord")
+        if completion_payload.get("state") != run.state.value:
+            raise ValueError("Terminal completion payload does not match the RunRecord")
+
+        with self._lock, self._connection:
+            current = self._connection.execute(
+                "SELECT state FROM runs WHERE id = ?", (run.id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"Run not found: {run.id}")
+            if current["state"] != previous_state.value:
+                raise RuntimeError("Run state changed before its atomic terminal commit")
+            now = utc_now()
+            first_seq = self._next_event_seq_locked(run.id)
+            terminal_events = [
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq,
+                    type=EventType.STATE_CHANGED,
+                    payload={
+                        "state": run.state.value,
+                        "previous": previous_state.value,
+                    },
+                    created_at=now,
+                ),
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq + 1,
+                    type=EventType.TURN_COMPLETED,
+                    payload=turn_payload,
+                    created_at=now,
+                ),
+                RunEvent(
+                    run_id=run.id,
+                    seq=first_seq + 2,
+                    type=EventType.RUN_COMPLETED,
+                    payload=completion_payload,
+                    created_at=now,
+                ),
+            ]
+            run.updated_at = now
+            self._update_run_locked(run, expected_state=previous_state)
+            for event in terminal_events:
+                self._insert_event_locked(event)
+        return terminal_events
+
     def commit_success(
         self,
         run: RunRecord,
@@ -1188,6 +1345,7 @@ class Storage:
         *,
         previous_state: RunState,
         rollback_payload: dict[str, Any],
+        turn_payload: dict[str, Any] | None = None,
     ) -> list[RunEvent]:
         """Atomically publish the rolled-back state and its replayable result."""
 
@@ -1214,14 +1372,26 @@ class Storage:
                     },
                     created_at=now,
                 ),
+            ]
+            if turn_payload is not None:
+                events.append(
+                    RunEvent(
+                        run_id=run.id,
+                        seq=first_seq + 1,
+                        type=EventType.TURN_COMPLETED,
+                        payload=turn_payload,
+                        created_at=now,
+                    )
+                )
+            events.append(
                 RunEvent(
                     run_id=run.id,
-                    seq=first_seq + 1,
+                    seq=first_seq + len(events),
                     type=EventType.ROLLBACK_COMPLETED,
                     payload=rollback_payload,
                     created_at=now,
-                ),
-            ]
+                )
+            )
             run.updated_at = now
             self._update_run_locked(run, expected_state=previous_state)
             for event in events:
@@ -1471,6 +1641,77 @@ class Storage:
             if expected_state is None:
                 raise KeyError(f"Run not found: {run.id}")
             raise RuntimeError(f"Run update lost its state guard: {run.id}")
+
+    def _open_assistant_output_streams_locked(
+        self, run_id: str
+    ) -> dict[str, dict[str, Any]]:
+        rows = self._connection.execute(
+            """
+            SELECT type, payload_json FROM events
+            WHERE run_id = ? AND type IN (?, ?, ?)
+            ORDER BY seq
+            """,
+            (
+                run_id,
+                EventType.ASSISTANT_OUTPUT_STARTED.value,
+                EventType.ASSISTANT_OUTPUT_ABORTED.value,
+                EventType.TURN_COMPLETED.value,
+            ),
+        ).fetchall()
+        open_streams: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if not isinstance(payload, dict):
+                continue
+            event_type = EventType(row["type"])
+            if event_type is EventType.ASSISTANT_OUTPUT_STARTED:
+                candidate = payload.get("stream_id")
+                if isinstance(candidate, str) and candidate:
+                    open_streams[candidate] = payload
+            elif event_type is EventType.ASSISTANT_OUTPUT_ABORTED:
+                candidate = payload.get("stream_id")
+                if isinstance(candidate, str):
+                    open_streams.pop(candidate, None)
+            else:
+                committed = payload.get("final_stream_id")
+                if isinstance(committed, str):
+                    open_streams.pop(committed, None)
+        return open_streams
+
+    def _abort_open_assistant_output_streams_locked(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        reason: str,
+        stream_id: str | None = None,
+        created_at: datetime | None = None,
+    ) -> list[RunEvent]:
+        open_streams = self._open_assistant_output_streams_locked(run_id)
+        if stream_id is not None:
+            payload = open_streams.get(stream_id)
+            open_streams = {stream_id: payload} if payload is not None else {}
+        if not open_streams:
+            return []
+        now = created_at or utc_now()
+        first_seq = self._next_event_seq_locked(run_id)
+        events = [
+            RunEvent(
+                run_id=run_id,
+                seq=first_seq + offset,
+                type=EventType.ASSISTANT_OUTPUT_ABORTED,
+                payload={
+                    **payload,
+                    "status": status,
+                    "reason": reason,
+                },
+                created_at=now,
+            )
+            for offset, payload in enumerate(open_streams.values())
+        ]
+        for event in events:
+            self._insert_event_locked(event)
+        return events
 
     def _insert_event_locked(self, event: RunEvent) -> None:
         self._connection.execute(

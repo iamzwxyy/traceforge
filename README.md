@@ -40,6 +40,12 @@ Its differentiator is a defensible engineering loop with useful human control.
   each terminal answer has one canonical conversation event and names the files actually changed
   by native edit tools in that turn, while the
   cumulative task diff, exact plan, tools, checks, and review stay one click away.
+- **Truthful streaming output.** Direct answers and implementation summaries grow in one stable
+  bubble while their redacted deltas are persisted. A provider-complete draft stays visibly
+  provisional until the turn commits it; retry, cancellation, truncation, and verifier rejection
+  keep partial attempts separate and never duplicate the canonical result. Restart recovery closes
+  every uncommitted stream generation, while answer/failure/cancellation commits cannot expose a
+  terminal run with an unfinished turn.
 - **Durable human decisions.** Clarification, plan review, and action approval are bound to stable
   request IDs and persisted before HTTP acknowledgement. Exact retries are idempotent; stale or
   conflicting replies cannot answer a later prompt, and resumed replies pair with the exact source
@@ -240,7 +246,7 @@ pnpm --filter traceforge-web test --run
 pnpm --filter traceforge-web build
 pnpm --filter traceforge-web e2e
 
-# Five user-risk scenarios with a readable scorecard
+# Six user-risk scenarios with a readable scorecard
 uv run python scripts/evaluate_quality.py
 
 # Stricter release-host check: fail when no OS sandbox is enforced
@@ -252,8 +258,8 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 326 backend tests at 88.35% coverage (with a hard 85% gate), 19 frontend
-unit tests, and 25 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 408 backend tests at 87.46% coverage (with a hard 85% gate), 28 frontend
+unit tests, and 29 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 

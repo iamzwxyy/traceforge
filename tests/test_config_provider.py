@@ -117,6 +117,30 @@ class _FakeCompletions:
         return outcome
 
 
+@pytest.mark.asyncio
+async def test_openai_provider_close_is_idempotent_and_closes_the_http_pool(
+    settings,
+    monkeypatch,
+) -> None:
+    class ClosableClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=_FakeCompletions([]))
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    client = ClosableClient()
+    monkeypatch.setattr(provider_module, "AsyncOpenAI", lambda **_kwargs: client)
+    provider = OpenAICompatibleProvider(settings)
+
+    await provider.close()
+    await provider.close()
+
+    assert client.close_calls == 1
+    assert provider._http_client.is_closed is True
+
+
 def _response(*, arguments: str = '{"path":"a.py"}'):
     function = SimpleNamespace(name="read_file", arguments=arguments)
     call = SimpleNamespace(id="call-1", function=function)

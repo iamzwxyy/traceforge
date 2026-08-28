@@ -39,6 +39,26 @@ class EventBroker:
                     pass
                 queue.put_nowait(event)
 
+    async def abort_open_assistant_outputs(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        reason: str,
+        stream_id: str | None = None,
+    ) -> list[RunEvent]:
+        """Persist idempotent stream closure before notifying subscribers."""
+
+        events = self.storage.abort_open_assistant_output_streams(
+            run_id,
+            status=status,
+            reason=reason,
+            stream_id=stream_id,
+        )
+        for event in events:
+            await self.publish(event)
+        return events
+
     def subscribe(self, run_id: str) -> asyncio.Queue[RunEvent]:
         queue: asyncio.Queue[RunEvent] = asyncio.Queue(maxsize=500)
         self._subscribers[run_id].add(queue)

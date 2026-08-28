@@ -28,8 +28,9 @@ flowchart TB
     DB --> Proof[Proof Pack projection]
 ```
 
-- `ModelProvider` only translates OpenAI-compatible tool calls and the selected route's reasoning
-  controls. It does not own the loop or choose an effort level.
+- `ModelProvider` translates OpenAI-compatible tool calls, streamed Chat Completion chunks, and the
+  selected route's reasoning controls. It does not own the loop, public-output policy, or effort
+  selection; providers without streaming retain the complete-response protocol.
 - `resolve_reasoning_capability` matches the official HTTPS endpoint and exact model ID before it
   advertises any non-default effort. Unknown compatible routes omit the field instead of guessing.
 - `AgentRuntime` resolves canonical workspace roots and lazily creates one manager per directory,
@@ -115,10 +116,33 @@ with each other in one model response.
 
 Model prose is public only after the runtime accepts a non-terminal inspection/tool round. Prose-only
 contract violations, mixed terminal responses, and prose attached to `respond_to_user`, `finish`, or
-`submit_verification` remain internal protocol history; the canonical user result is emitted once in
-`turn.completed`. The UI keeps the append-only event ledger intact and applies a narrow compatibility
-projection for older same-turn planning/building/verifying messages whose content exactly equals an
-answered or succeeded summary.
+`submit_verification` remain internal protocol history. For a streaming provider, only the string
+field inside `respond_to_user.content` or `finish.summary` is eligible for the conversation surface.
+The manager incrementally decodes that JSON string and persists `assistant.output.started`, numbered
+`delta`, `completed`, and `aborted` lifecycle events. Each provider attempt has a fresh `stream_id`;
+retry, cancellation, protocol rejection, missing checks, and verifier rejection can therefore never
+merge a discarded draft into its successor. `completed` means the provider response was structurally
+accepted but is still provisional. Only `turn.completed.final_stream_id` commits that same bubble as
+the canonical answer or verified summary. A truncated stream has no terminal finish reason and fails
+closed; there is no complete-response fallback after a partial attempt.
+
+The persisted `started` event is also the durable owner record for a stream generation. Until a
+matching `aborted` event or a terminal turn links that ID, storage treats the generation as open—even
+after `assistant.output.completed`. Startup aborts all such generations in the same transaction that
+marks an unfinished run `interrupted`; failure, cancellation, resume, and rollback use the same
+idempotent ledger scan. A validation error after provider completion therefore cannot strand a draft.
+Provider-triggered and cleanup-triggered interruptions likewise commit owner aborts, the guarded run
+update, optional error, and state event together. The provider enforces one wall-clock deadline across
+stream creation and iteration, rejects compressed bodies, bounds HTTP bytes before JSON decoding,
+closes the SDK transport on timeout/cancellation/boundary failure, honors bounded server retry hints,
+surfaces refusal text, validates chunk types and finish reasons, and applies both per-field and
+whole-stream budgets.
+
+The UI rebuilds each stream from persisted `(stream_id, segment_index)` identities, uses the full
+completed content as a convergence record, and projects the linked terminal event into one stable
+conversation item. Reconnect replay and duplicate events are idempotent. Older non-streaming runs
+continue to use `turn.completed`, with a narrow compatibility projection for older same-turn
+planning/building/verifying messages whose content exactly equals the terminal summary.
 
 A validated `TaskPlan` contains steps, an explicit relative file scope, acceptance checks,
 optional argv commands, and risks.
@@ -311,6 +335,11 @@ turn requests and summaries while keeping the same run id, project, workspace sn
 ledger, and rollback boundary. Model protocol messages reset per turn so stale tool-call state is
 not mixed into a new request.
 
+Answer, failure, and cancellation close the active turn and publish `state.changed`,
+`turn.completed`, and `run.completed` with the RunRecord in one guarded SQLite transaction. Success
+adds its Proof Pack to that same boundary. A write fault therefore rolls every terminal projection
+back to the prior non-terminal state instead of leaving a terminal run with an in-progress turn.
+
 Rollback intentionally ends that snapshot lineage. A follow-up from `rolled_back` creates one
 successor run UUID recorded in `run_lineage`; exact retries return the same successor and a
 different branch request conflicts. The successor keeps the project/workspace association but
@@ -375,7 +404,8 @@ This is deliberately safer than `git reset`: it works in non-Git folders and nev
 post-agent user change. Recognizing an already-restored target makes a full retry—or a retry after a
 mid-batch filesystem failure—result-idempotent. The filesystem is not part of the SQLite
 transaction: rollback first abandons any active human decision, then processes files, then commits
-the `rolled_back` state and complete `rollback.completed` result atomically. Resume and rollback
+the `rolled_back` state, any interrupted turn closure, and complete `rollback.completed` result
+atomically. Resume and rollback
 share the per-run lifecycle lock, so a newly registered worker and a rollback cannot cross.
 
 After rollback, the parent snapshot set is never reused. Its single successor takes a fresh first

@@ -6,7 +6,7 @@ TraceForge's main claims are behavioral: it should not guess past ambiguity, cla
 stale evidence, replay an interrupted side effect, overwrite a later user edit, or call an approval
 a sandbox. A large undifferentiated test count does not make those claims easy to audit.
 
-The fixed corpus selects five representative product risks and maps each one to real core tests.
+The fixed corpus selects six representative product risks and maps each one to real core tests.
 It adds no user-facing feature and uses no model credential. The command runs each scenario in a
 fresh Pytest process, then produces a concise Markdown or JSON scorecard.
 
@@ -25,6 +25,7 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 | Truthful repair and termination | edits invalidate old checks; repair-budget exhaustion ends failed | stale-check repair and repair-limit tests |
 | Recovery and rollback | transient model failure pauses with bounded retry evidence; request-bound human decisions resume and pair with the exact source call; started actions are uncertain and never replayed; conflicts stay preserved; post-rollback continuation gets a fresh snapshot lineage | provider-outage, protocol-repair, durable-clarification, atomic action-start, partial rollback, and rollback-successor tests |
 | Command isolation | enforced backend blocks workspace escape and credential reads; an explicit escape is one-shot and labeled | real Seatbelt/Bubblewrap adversarial tests plus bypass evidence test |
+| Durable and redacted streaming | only accepted public result fields stream; every delta is redacted before persistence; retry/cancel/restart/truncation cannot merge attempts; terminal DB faults cannot manufacture a canonical run/turn pair | adjacent/every-prefix secret tests, malformed-provider cases, direct/verified completion, retry isolation, restart recovery, private-state rejection, cancellation, and atomic terminal fault injection |
 
 `passed` means every selected invariant executed and passed. `degraded` means Pytest skipped an
 environment-dependent invariant—normally because the host honestly reports `policy_only` instead

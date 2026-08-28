@@ -39,6 +39,7 @@ from traceforge.proof import build_proof_pack, proof_pack_markdown
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
 from traceforge.sandbox import SandboxStatus
 from traceforge.storage import SecureCheckpointError, Storage
+from traceforge.streaming import redact_text
 
 
 async def _wait_for_state(
@@ -288,7 +289,9 @@ async def test_answered_turn_supports_follow_up_and_redacts_credentials(
     first = await manager.wait(run.id)
     assert first.state is RunState.ANSWERED
     assert settings.api_key not in first.model_dump_json()
-    assert "[REDACTED]" in first.turns[-1].summary
+    assert first.turns[-1].summary == redact_text(
+        f"不会泄露 {settings.api_key}", api_key=settings.api_key
+    )
 
     await manager.follow_up(run.id, "继续聊聊", mode=InteractionMode.AGENT)
     second = await manager.wait(run.id)
@@ -4385,6 +4388,59 @@ async def test_transient_model_outage_pauses_and_resumes_without_losing_run(
 
 
 @pytest.mark.asyncio
+async def test_cancel_reloads_run_after_provider_interrupts_during_tool_cleanup(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ControlledOutageProvider:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def complete(self, _messages, _tools=None) -> ModelResponse:
+            self.started.set()
+            await self.release.wait()
+            raise ProviderError(
+                "transport became unavailable",
+                retryable=True,
+                category="connection",
+            )
+
+    provider = ControlledOutageProvider()
+    manager = AgentManager(
+        replace(settings, model_retry_attempts=1, model_retry_delay=0),
+        storage,
+        provider,
+    )
+    run = await manager.start_run("cancel while the provider interruption wins")
+    await asyncio.wait_for(provider.started.wait(), timeout=2)
+    tool_cancel_started = asyncio.Event()
+    release_tool_cancel = asyncio.Event()
+
+    async def delayed_tool_cancel(_run_id: str) -> None:
+        tool_cancel_started.set()
+        await release_tool_cancel.wait()
+
+    monkeypatch.setattr(manager.tools, "cancel", delayed_tool_cancel)
+    cancel_task = asyncio.create_task(manager.cancel(run.id))
+    await asyncio.wait_for(tool_cancel_started.wait(), timeout=2)
+    provider.release.set()
+    await _wait_for_state(storage, run.id, RunState.INTERRUPTED)
+    await manager.wait(run.id)
+    release_tool_cancel.set()
+
+    cancelled = await asyncio.wait_for(cancel_task, timeout=2)
+    events = storage.get_events(run.id)
+    completed = [event for event in events if event.type is EventType.RUN_COMPLETED]
+
+    assert cancelled.state is RunState.CANCELLED
+    assert cancelled.turns[-1].outcome == "cancelled"
+    assert len(completed) == 1
+    assert completed[0].payload["state"] == RunState.CANCELLED.value
+
+
+@pytest.mark.asyncio
 async def test_unexpected_provider_exception_never_leaves_a_ghost_run(
     settings: Settings, storage: Storage
 ) -> None:
@@ -4588,9 +4644,11 @@ async def test_planner_prose_only_fails_and_redacts_secret(
         if event.type is EventType.MESSAGE
     ]
     assert messages == []
-    persisted = json.dumps(storage.get_run(run.id).model_dump(mode="json"))
+    persisted = json.dumps(
+        storage.get_run(run.id).model_dump(mode="json"), ensure_ascii=False
+    )
     assert settings.api_key not in persisted
-    assert "[REDACTED]" in persisted
+    assert redact_text(settings.api_key, api_key=settings.api_key) in persisted
 
 
 @pytest.mark.asyncio

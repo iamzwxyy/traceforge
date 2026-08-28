@@ -176,6 +176,31 @@ also redacted for the configured credential and token-shaped `sk-...` values bef
 are emitted. The CI scanner examines Git-tracked UTF-8 files for private-key headers and common
 credential literals.
 
+Streaming does not expose raw provider chunks. The public path incrementally decodes only the
+schema-declared string in `respond_to_user.content` or `finish.summary`; ordinary model content,
+other tool arguments, and private reasoning are excluded. A stateful redactor withholds every
+suffix that could still grow into the configured credential or an `sk-...` token, then persists
+only stable redacted deltas. The completed record is checked to extend the already-published prefix
+and to equal the validated tool argument. Malformed JSON, unsupported finish reasons, output after
+a terminal chunk, size-limit violations, missing terminal metadata, retry, or cancellation abort the
+attempt under its own stream ID. Token matching is boundary-independent and happens before exact-key
+replacement, so adjacent credentials and token values ending in `-` cannot create a newly exposed
+prefix. The replacement glyph is selected outside the configured key's alphabet, so even a key equal
+to a legacy marker—or text on either side of a removed interval—cannot synthesize the key again.
+Provider messages and nested tool arguments are recursively redacted before JSON escaping; private
+reasoning is rejected by source-interval detection rather than marker comparison. There is no
+unredacted or non-stream fallback after public partial output. Adversarial tests split exact,
+adjacent, token-shaped, marker-collision, and JSON-escaped secrets at every relevant boundary and
+scan the resulting SQLite files.
+
+An `assistant.output.started` row remains a durable provisional owner until an abort or
+`turn.completed.final_stream_id` closes it. Startup aborts every open owner in the same transaction
+that interrupts unfinished runs; post-provider validation failure, cancellation, resume, and
+rollback use an idempotent ledger closure. Stream creation plus iteration has one wall-clock timeout;
+compressed responses are rejected, HTTP bodies are byte-bounded before JSON parsing, transport
+cancellation or boundary failure closes the async response, and aggregate limits prevent many
+individually valid tool calls from bypassing resource bounds.
+
 Provider exceptions are converted to bounded categories such as timeout, connection, rate limit,
 request rejection, and contract failure. Raw SDK exception text is not copied into run errors,
 because it may contain request bodies, credentials, or hidden provider fields.
@@ -251,6 +276,11 @@ and Diff SHA-256 fingerprints provide integrity and comparison, not authenticity
 not sign the artifact, and a local actor who can rewrite the database can also recompute the hashes.
 Proof responses disable HTTP caching; historical gaps from older versions are not reconstructed
 from a newer workspace state.
+
+Answered, failed, and cancelled runs use the same guarded transaction boundary for the RunRecord,
+closed turn, and three terminal events (without a Proof Pack). Rollback includes an interrupted turn
+closure when needed. Fault injection after the state update or turn event proves SQLite rolls the
+entire boundary back, preventing terminal-state/turn divergence.
 
 ## Local web service
 

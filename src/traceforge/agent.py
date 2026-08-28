@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
-import re
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -41,18 +41,36 @@ from traceforge.models import (
     utc_now,
 )
 from traceforge.planning import assess_plan_gate
-from traceforge.prompts import BUILDER_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT
+from traceforge.prompts import (
+    BUILDER_SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT,
+    VERIFIER_SYSTEM_PROMPT,
+)
 from traceforge.proof import (
     ProofNotReadyError,
     build_success_proof_pack,
     freeze_success_proof_pack,
 )
-from traceforge.provider import ModelProvider, ModelResponse, ProviderError
+from traceforge.provider import (
+    ModelProvider,
+    ModelResponse,
+    ModelStreamDelta,
+    ProviderError,
+    StreamingModelProvider,
+    close_model_provider,
+)
 from traceforge.storage import (
     DecisionConflictError,
     SecureCheckpointError,
     Storage,
     decision_payload_sha256,
+)
+from traceforge.streaming import (
+    StableStreamingRedactor,
+    contains_redactable_secret,
+    json_string_field_prefix,
+    redact_json_value,
+    redact_text,
 )
 from traceforge.tools import PermissionDecision, PermissionResolution, ToolRegistry
 from traceforge.workspace import RollbackResult, Workspace
@@ -93,6 +111,220 @@ class _Control:
     approval_future: asyncio.Future[bool] | None = None
     decision_request_id: str | None = None
     decision_kind: DecisionKind | None = None
+
+
+@dataclass(slots=True)
+class _StreamTarget:
+    tool_name: str
+    field_name: str
+
+
+class _AssistantOutputStream:
+    _BATCH_CHARACTERS = 64
+    _PARSE_CHARACTERS = 32
+    _MAX_ARGUMENT_CHARACTERS = 300_000
+    _MAX_NAME_CHARACTERS = 2_000
+    _MAX_VISIBLE_CHARACTERS: ClassVar[dict[str, int]] = {
+        "respond_to_user": 20_000,
+        "finish": 4_000,
+    }
+
+    def __init__(
+        self,
+        broker: EventBroker,
+        *,
+        run_id: str,
+        turn_index: int,
+        phase: str,
+        attempt: int,
+        target: _StreamTarget,
+        api_key: str,
+    ) -> None:
+        self._broker = broker
+        self._run_id = run_id
+        self._turn_index = turn_index
+        self._phase = phase
+        self._attempt = attempt
+        self._target = target
+        self._stream_id = uuid4().hex
+        self._redactor = StableStreamingRedactor(api_key=api_key)
+        self._names: dict[int, str] = {}
+        self._argument_parts: dict[int, list[str]] = {}
+        self._argument_lengths: dict[int, int] = {}
+        self._target_index: int | None = None
+        self._last_parsed_length = 0
+        self._decoded = ""
+        self._stable = ""
+        self._published = ""
+        self._segment_index = 0
+        self._started = False
+        self._completed = False
+        self._accepted = False
+        self._invalid = False
+
+    async def on_delta(self, delta: ModelStreamDelta) -> None:
+        if self._completed or self._invalid:
+            return
+        for call in delta.tool_calls:
+            name = _append_stream_fragment(self._names.get(call.index, ""), call.name)
+            argument_length = self._argument_lengths.get(call.index, 0) + len(call.arguments)
+            if (
+                len(name) > self._MAX_NAME_CHARACTERS
+                or argument_length > self._MAX_ARGUMENT_CHARACTERS
+            ):
+                self._invalid = True
+                await self.abort(status="discarded", reason="visible_output_size_limit")
+                return
+            self._names[call.index] = name
+            if call.arguments:
+                self._argument_parts.setdefault(call.index, []).append(call.arguments)
+            self._argument_lengths[call.index] = argument_length
+            if self._target_index is None and name == self._target.tool_name:
+                self._target_index = call.index
+            if (
+                call.index == self._target_index
+                and argument_length - self._last_parsed_length
+                >= self._parse_interval(argument_length)
+            ):
+                self._last_parsed_length = argument_length
+                arguments = "".join(self._argument_parts.get(call.index, []))
+                await self._consume_arguments(arguments)
+
+    async def resolve(self, response: ModelResponse) -> str | None:
+        if self._completed:
+            return self._stream_id if self._accepted else None
+        if self._invalid:
+            await self.abort(status="discarded", reason="invalid_streamed_output")
+            return None
+        if len(response.tool_calls) != 1 or response.tool_calls[0].name != self._target.tool_name:
+            await self.abort(status="discarded", reason="response_structure_changed")
+            return None
+        call = response.tool_calls[0]
+        if self._target_index is not None:
+            arguments = "".join(self._argument_parts.get(self._target_index, []))
+            prefix = json_string_field_prefix(arguments, self._target.field_name)
+            raw_content = call.arguments.get(self._target.field_name)
+            if not prefix.valid or prefix.value != raw_content or not prefix.complete:
+                await self.abort(status="discarded", reason="stream_content_mismatch")
+                return None
+            maximum = self._MAX_VISIBLE_CHARACTERS[self._target.tool_name]
+            if prefix.value is not None and len(prefix.value) > maximum:
+                self._invalid = True
+                await self.abort(status="discarded", reason="visible_output_size_limit")
+                return None
+        try:
+            if self._target.tool_name == "respond_to_user":
+                content = DirectResponse.model_validate(call.arguments).content
+            elif self._target.tool_name == "finish":
+                content = FinishRequest.model_validate(call.arguments).summary
+            else:
+                raise ValueError("Unsupported public output target")
+        except (ValidationError, ValueError):
+            await self.abort(status="discarded", reason="invalid_visible_output")
+            return None
+        try:
+            self._stable = self._redactor.finish(content)
+        except ValueError:
+            await self.abort(status="discarded", reason="stream_redaction_mismatch")
+            return None
+        await self._publish_available(force=True)
+        await self._broker.emit(
+            self._run_id,
+            EventType.ASSISTANT_OUTPUT_COMPLETED,
+            {
+                **self._base_payload(),
+                "content": self._stable,
+                "character_count": len(self._stable),
+                "sha256": hashlib.sha256(self._stable.encode()).hexdigest(),
+                "status": "provider_completed",
+            },
+        )
+        self._accepted = True
+        self._completed = True
+        return self._stream_id
+
+    async def abort(self, *, status: str, reason: str) -> None:
+        if not self._started or self._completed:
+            return
+        await self._broker.abort_open_assistant_outputs(
+            self._run_id,
+            status=status,
+            reason=reason,
+            stream_id=self._stream_id,
+        )
+        self._completed = True
+
+    async def _consume_arguments(self, arguments: str) -> None:
+        prefix = json_string_field_prefix(arguments, self._target.field_name)
+        if not prefix.valid:
+            self._invalid = True
+            await self.abort(status="discarded", reason="invalid_streamed_json_string")
+            return
+        if prefix.value is None:
+            return
+        maximum = self._MAX_VISIBLE_CHARACTERS[self._target.tool_name]
+        if len(prefix.value) > maximum:
+            self._invalid = True
+            await self.abort(status="discarded", reason="visible_output_size_limit")
+            return
+        if not prefix.value.startswith(self._decoded):
+            self._invalid = True
+            await self.abort(status="discarded", reason="non_monotonic_stream_content")
+            return
+        self._decoded = prefix.value
+        try:
+            visible = self._decoded.strip() if self._target.tool_name == "finish" else self._decoded
+            self._stable = self._redactor.update(visible)
+        except ValueError:
+            self._invalid = True
+            await self.abort(status="discarded", reason="stream_redaction_mismatch")
+            return
+        await self._publish_available(force=False)
+
+    async def _publish_available(self, *, force: bool) -> None:
+        delta = self._stable[len(self._published) :]
+        if not delta:
+            return
+        if not force and len(delta) < self._BATCH_CHARACTERS and "\n" not in delta:
+            return
+        if not self._started:
+            await self._broker.emit(
+                self._run_id,
+                EventType.ASSISTANT_OUTPUT_STARTED,
+                {**self._base_payload(), "status": "streaming"},
+            )
+            self._started = True
+        next_segment = self._segment_index + 1
+        await self._broker.emit(
+            self._run_id,
+            EventType.ASSISTANT_OUTPUT_DELTA,
+            {
+                **self._base_payload(),
+                "segment_index": next_segment,
+                "delta": delta,
+            },
+        )
+        self._segment_index = next_segment
+        self._published = self._stable
+
+    @classmethod
+    def _parse_interval(cls, argument_length: int) -> int:
+        if argument_length < 4_096:
+            return cls._PARSE_CHARACTERS
+        if argument_length < 32_768:
+            return 256
+        return 2_048
+
+    def _base_payload(self) -> dict[str, Any]:
+        return {
+            "turn_index": self._turn_index,
+            "stream_id": self._stream_id,
+            "phase": self._phase,
+            "attempt": self._attempt,
+            "surface": "conversation",
+            "provisional": True,
+            "source_tool": self._target.tool_name,
+        }
 
 
 _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
@@ -180,6 +412,7 @@ class AgentManager:
         self._controls: dict[str, _Control] = {}
         self._lifecycle_locks: dict[str, asyncio.Lock] = {}
         self._shutting_down = False
+        self._provider_closed = False
         self.storage.mark_active_runs_interrupted(settings.workspace)
 
     async def start_run(
@@ -302,9 +535,7 @@ class AgentManager:
                     and first_turn.reasoning_effort is reasoning_effort
                 ):
                     return successor
-                raise InvalidRunAction(
-                    f"This rolled-back task already continued as {successor.id}"
-                )
+                raise InvalidRunAction(f"This rolled-back task already continued as {successor.id}")
             return await self.start_run(
                 clean_prompt,
                 verifier_enabled=parent.verifier_enabled,
@@ -390,9 +621,7 @@ class AgentManager:
         *,
         request_id: str | None = None,
     ) -> None:
-        request_id = request_id or self._active_decision_id(
-            run_id, DecisionKind.CLARIFICATION
-        )
+        request_id = request_id or self._active_decision_id(run_id, DecisionKind.CLARIFICATION)
         payload = {"answers": [answer.model_dump(mode="json") for answer in answers]}
         receipt = self._decision_or_reject(run_id, request_id)
         if receipt.status is DecisionStatus.PENDING:
@@ -407,9 +636,7 @@ class AgentManager:
                 if answer.option_id and answer.option_id not in {
                     option.id for option in expected[question_id].options
                 }:
-                    raise InvalidRunAction(
-                        f"Unknown option for {question_id}: {answer.option_id}"
-                    )
+                    raise InvalidRunAction(f"Unknown option for {question_id}: {answer.option_id}")
             self._require_decision_subject(receipt, run.clarification.model_dump(mode="json"))
         accepted = self._accept_decision_or_reject(
             run_id, request_id, DecisionKind.CLARIFICATION, payload
@@ -438,9 +665,7 @@ class AgentManager:
         )
         self._signal_decision(accepted)
 
-    async def decide_action(
-        self, run_id: str, approval_id: str, *, approved: bool
-    ) -> None:
+    async def decide_action(self, run_id: str, approval_id: str, *, approved: bool) -> None:
         try:
             receipt = self._decision_or_reject(run_id, approval_id)
         except InvalidRunAction as exc:
@@ -449,9 +674,7 @@ class AgentManager:
             run = self.storage.get_run(run_id)
             if run.pending_approval is None or run.pending_approval.id != approval_id:
                 raise InvalidRunAction("Approval is no longer pending")
-            self._require_decision_subject(
-                receipt, run.pending_approval.model_dump(mode="json")
-            )
+            self._require_decision_subject(receipt, run.pending_approval.model_dump(mode="json"))
         accepted = self._accept_decision_or_reject(
             run_id,
             approval_id,
@@ -461,10 +684,17 @@ class AgentManager:
         self._signal_decision(accepted)
 
     async def cancel(self, run_id: str) -> RunRecord:
+        async with self._lifecycle_lock(run_id):
+            return await self._cancel_locked(run_id)
+
+    async def _cancel_locked(self, run_id: str) -> RunRecord:
         run = self.storage.get_run(run_id)
         if run.state.terminal:
             return run
         await self.tools.cancel(run_id)
+        run = self.storage.get_run(run_id)
+        if run.state.terminal:
+            return run
         task = self._tasks.get(run_id)
         if task and not task.done():
             task.cancel()
@@ -472,10 +702,23 @@ class AgentManager:
                 await task
             except asyncio.CancelledError:
                 pass
-        elif run.state is RunState.INTERRUPTED:
+            run = self.storage.get_run(run_id)
+        if run.state.terminal:
+            return run
+        if run.state is RunState.INTERRUPTED:
+            await self._abandon_open_output_streams(
+                run,
+                status="cancelled",
+                reason="user_cancelled",
+            )
             await self._abandon_active_decision(run, cause="user_cancelled")
-            if await self._transition(run, RunState.CANCELLED):
-                await self._close_turn(run, "cancelled", "The user stopped this turn.")
+            await self._commit_terminal_turn(
+                run,
+                RunState.CANCELLED,
+                "cancelled",
+                "The user stopped this turn.",
+                completion_payload={"state": RunState.CANCELLED.value},
+            )
         return self.storage.get_run(run_id)
 
     async def resume(self, run_id: str) -> RunRecord:
@@ -534,6 +777,11 @@ class AgentManager:
             run = self.storage.get_run(run_id)
         if run.state is RunState.SUCCEEDED:
             self._freeze_success_or_reject(run)
+        await self._abandon_open_output_streams(
+            run,
+            status="discarded",
+            reason="run_rolled_back",
+        )
         await self._abandon_active_decision(run, cause="run_rolled_back")
         previous = run.state
         self._validate_transition(run, RunState.ROLLED_BACK)
@@ -543,11 +791,19 @@ class AgentManager:
                 "readers and retry"
             )
         result = self.workspace.rollback(run_id)
+        turn_payload = None
+        if self._active_turn(run).outcome == "in_progress":
+            turn_payload = self._close_turn_in_memory(
+                run,
+                "cancelled",
+                "The interrupted turn was rolled back.",
+            )
         run.state = RunState.ROLLED_BACK
         events = self.storage.commit_rollback(
             run,
             previous_state=previous,
             rollback_payload=_rollback_payload(result),
+            turn_payload=turn_payload,
         )
         await self._publish_persisted(events)
         return result
@@ -604,6 +860,9 @@ class AgentManager:
             task.cancel()
         if active:
             await asyncio.gather(*(task for _, task in active), return_exceptions=True)
+        if not self._provider_closed:
+            await close_model_provider(self.provider)
+            self._provider_closed = True
 
     def _spawn(self, run_id: str, *, resume: bool) -> None:
         task = asyncio.create_task(self._run(run_id, resume=resume), name=f"traceforge:{run_id}")
@@ -677,6 +936,11 @@ class AgentManager:
                     }
                 )
                 self.storage.save_run(run)
+                await self._abandon_open_output_streams(
+                    run,
+                    status="discarded",
+                    reason="verification_rejected",
+                )
                 await self.broker.emit(
                     run.id,
                     EventType.REPAIR_STARTED,
@@ -695,22 +959,26 @@ class AgentManager:
             current = self.storage.get_run(run_id)
             if not current.state.terminal:
                 if self._shutting_down:
-                    current.interrupted_from = current.state
-                    await self._transition(current, RunState.INTERRUPTED)
+                    await self._transition(
+                        current,
+                        RunState.INTERRUPTED,
+                        interruption_reason="process_shutdown",
+                    )
                 else:
                     self._mark_uncertain_started_approvals(run_id)
-                    await self._abandon_active_decision(
-                        current, cause="user_cancelled"
+                    await self._abandon_open_output_streams(
+                        current,
+                        status="cancelled",
+                        reason="user_cancelled",
                     )
-                    if await self._transition(current, RunState.CANCELLED):
-                        await self._close_turn(
-                            current, "cancelled", "The user stopped this turn."
-                        )
-                        await self.broker.emit(
-                            run_id,
-                            EventType.RUN_COMPLETED,
-                            {"state": RunState.CANCELLED.value},
-                        )
+                    await self._abandon_active_decision(current, cause="user_cancelled")
+                    await self._commit_terminal_turn(
+                        current,
+                        RunState.CANCELLED,
+                        "cancelled",
+                        "The user stopped this turn.",
+                        completion_payload={"state": RunState.CANCELLED.value},
+                    )
             raise
         except ProviderError as exc:
             current = self.storage.get_run(run_id)
@@ -739,6 +1007,11 @@ class AgentManager:
 
     async def _prepare_resume(self, run: RunRecord) -> None:
         previous = run.interrupted_from
+        await self._abandon_open_output_streams(
+            run,
+            status="discarded",
+            reason="run_resumed",
+        )
         active_decision = self.storage.get_active_decision(run.id)
         if run.pending_approval is not None and (
             active_decision is None or active_decision.kind is not DecisionKind.ACTION
@@ -747,23 +1020,15 @@ class AgentManager:
         run.interrupted_from = None
         run.error = None
         preserved_decision = active_decision is not None and (
-            (
-                active_decision.kind is DecisionKind.CLARIFICATION
-                and run.clarification is not None
-            )
+            (active_decision.kind is DecisionKind.CLARIFICATION and run.clarification is not None)
             or (active_decision.kind is DecisionKind.PLAN and run.plan is not None)
-            or (
-                active_decision.kind is DecisionKind.ACTION
-                and run.pending_approval is not None
-            )
+            or (active_decision.kind is DecisionKind.ACTION and run.pending_approval is not None)
         )
         if active_decision is not None and not preserved_decision:
             await self._abandon_active_decision(run, cause="resume_subject_mismatch")
             active_decision = None
         uncertain_approvals = self._mark_uncertain_started_approvals(run.id)
-        repaired_calls = (
-            0 if preserved_decision else self._repair_incomplete_tool_protocol(run)
-        )
+        repaired_calls = 0 if preserved_decision else self._repair_incomplete_tool_protocol(run)
         if run.clarification is not None and not run.plan_approved:
             strategy = (
                 "consume_accepted_clarification"
@@ -775,8 +1040,7 @@ class AgentManager:
         elif run.plan is not None and not run.plan_approved:
             strategy = (
                 "persisted_fast_path"
-                if run.plan_gate
-                and run.plan_gate.decision in {"auto_approved", "agent_continues"}
+                if run.plan_gate and run.plan_gate.decision in {"auto_approved", "agent_continues"}
                 else (
                     "consume_accepted_plan"
                     if active_decision
@@ -812,13 +1076,10 @@ class AgentManager:
             source_tool_call_id = self._pending_tool_call_id(run, "ask_questions")
             existing = (
                 active_decision
-                if active_decision
-                and active_decision.kind is DecisionKind.CLARIFICATION
+                if active_decision and active_decision.kind is DecisionKind.CLARIFICATION
                 else None
             )
-            request_id, answers = await self._await_clarification(
-                run, existing=existing
-            )
+            request_id, answers = await self._await_clarification(run, existing=existing)
             await self._apply_clarification_decision(
                 run,
                 request_id,
@@ -840,9 +1101,7 @@ class AgentManager:
                     if active_decision and active_decision.kind is DecisionKind.PLAN
                     else None
                 )
-                request_id, decision = await self._await_plan_decision(
-                    run, existing=existing
-                )
+                request_id, decision = await self._await_plan_decision(run, existing=existing)
                 await self._apply_plan_decision(
                     run,
                     request_id,
@@ -891,10 +1150,14 @@ class AgentManager:
                 DirectResponse.model_json_schema(),
             ),
             _model_tool(
-                "ask_questions", "Ask material clarification questions.", _questions_schema()
+                "ask_questions",
+                "Ask material clarification questions.",
+                _questions_schema(),
             ),
             _model_tool(
-                "submit_plan", "Submit the implementation plan.", TaskPlan.model_json_schema()
+                "submit_plan",
+                "Submit the implementation plan.",
+                TaskPlan.model_json_schema(),
             ),
         ]
         non_tool_responses = 0
@@ -923,9 +1186,7 @@ class AgentManager:
                     }
                 )
                 continue
-            if terminal_calls and (
-                len(terminal_calls) != 1 or len(response.tool_calls) != 1
-            ):
+            if terminal_calls and (len(terminal_calls) != 1 or len(response.tool_calls) != 1):
                 error = (
                     "A terminal planning action must be called exactly once and alone. "
                     "Review any read results first, then choose respond_to_user, ask_questions, "
@@ -972,7 +1233,11 @@ class AgentManager:
                         ),
                     )
                     self.storage.save_run(run)
-                    await self._complete_answer(run, content)
+                    await self._complete_answer(
+                        run,
+                        content,
+                        final_stream_id=response.output_stream_id,
+                    )
                     return
                 if call.name == "ask_questions":
                     round_number = self._clarification_round(run.id) + 1
@@ -1074,9 +1339,7 @@ class AgentManager:
             ),
         ]
         finish_tools = [
-            schema
-            for schema in builder_tools
-            if schema["function"]["name"] == "finish"
+            schema for schema in builder_tools if schema["function"]["name"] == "finish"
         ]
         consecutive_rejected_batches = 0
 
@@ -1088,16 +1351,12 @@ class AgentManager:
             fatal_error: str | None = None,
         ) -> None:
             nonlocal consecutive_rejected_batches
-            await self._reject_builder_batch(
-                run, calls, error=error, correction=correction
-            )
+            await self._reject_builder_batch(run, calls, error=error, correction=correction)
             if fatal_error is not None:
                 raise RuntimeError(fatal_error)
             consecutive_rejected_batches += 1
             if consecutive_rejected_batches >= 3:
-                raise RuntimeError(
-                    "Builder returned three consecutive rejected tool-call batches"
-                )
+                raise RuntimeError("Builder returned three consecutive rejected tool-call batches")
 
         while True:
             action_budget_exhausted = run.step_count >= self.settings.max_steps
@@ -1143,7 +1402,8 @@ class AgentManager:
                     finish = FinishRequest.model_validate(call.arguments)
                 except ValidationError as exc:
                     details = json.dumps(
-                        exc.errors(include_url=False, include_input=False), ensure_ascii=False
+                        exc.errors(include_url=False, include_input=False),
+                        ensure_ascii=False,
                     )
                     await reject_batch(
                         [call],
@@ -1155,11 +1415,16 @@ class AgentManager:
                     continue
                 missing = self._missing_command_checks(run.plan)
                 if missing:
+                    if response.output_stream_id:
+                        await self._emit_output_abort(
+                            run,
+                            response.output_stream_id,
+                            status="discarded",
+                            reason="completion_checks_missing",
+                        )
                     await reject_batch(
                         [call],
-                        error=(
-                            "Command checks need fresh passing evidence: " + ", ".join(missing)
-                        ),
+                        error=("Command checks need fresh passing evidence: " + ", ".join(missing)),
                         correction=(
                             "Run every missing approved command check before calling finish alone."
                         ),
@@ -1171,7 +1436,11 @@ class AgentManager:
                         ),
                     )
                     continue
-                self._set_turn_summary(run, finish.summary)
+                self._set_turn_summary(
+                    run,
+                    finish.summary,
+                    stream_id=response.output_stream_id,
+                )
                 self._append_tool_result(
                     run,
                     ToolResult(
@@ -1216,9 +1485,7 @@ class AgentManager:
                     )
                     result = self._apply_plan_update(run, call)
                 else:
-                    permission = self.tools.resolve_permission(
-                        call, run.plan, run.approval_mode
-                    )
+                    permission = self.tools.resolve_permission(call, run.plan, run.approval_mode)
                     sandbox_bypass = permission.sandbox_bypass_on_allow
                     if permission.decision is PermissionDecision.DENY:
                         result = ToolResult(
@@ -1303,9 +1570,7 @@ class AgentManager:
             if publish_progress and response.content:
                 await self._emit_message(run, response.content, phase="building")
 
-    def _builder_messages(
-        self, run: RunRecord, plan: TaskPlan
-    ) -> list[dict[str, Any]]:
+    def _builder_messages(self, run: RunRecord, plan: TaskPlan) -> list[dict[str, Any]]:
         evidence = self._planning_evidence(run.messages)
         task_context = (
             f"Current request:\n{self._current_request(run)}\n\n"
@@ -1417,8 +1682,7 @@ class AgentManager:
                 and not submit_calls
                 and read_calls
                 and all(
-                    call.name in {"list_files", "read_file", "search_text"}
-                    for call in read_calls
+                    call.name in {"list_files", "read_file", "search_text"} for call in read_calls
                 )
             ):
                 await self._emit_message(run, response.content, phase="verifying")
@@ -1496,7 +1760,13 @@ class AgentManager:
 
     async def _complete(self, run: RunRecord, report: VerificationReport) -> None:
         async with self._lifecycle_lock(run.id):
+            self._validate_transition(run, RunState.SUCCEEDED)
             if not await self._prepare_terminal_cleanup(run, RunState.SUCCEEDED):
+                await self._abandon_open_output_streams(
+                    run,
+                    status="interrupted",
+                    reason="terminal_cleanup_interrupted",
+                )
                 return
             previous = run.state
             if run.plan:
@@ -1524,60 +1794,69 @@ class AgentManager:
                     "changed_files": turn.changed_files,
                     "approval_mode": turn.approval_mode.value,
                     "reasoning_effort": turn.reasoning_effort.value,
+                    **(
+                        {"final_stream_id": turn.summary_stream_id}
+                        if turn.summary_stream_id
+                        else {}
+                    ),
                 },
                 completion_payload=completion_payload,
-                proof_factory=lambda events: build_success_proof_pack(
-                    run, self.storage, events
-                ),
+                proof_factory=lambda events: build_success_proof_pack(run, self.storage, events),
             )
             for event in terminal_events:
                 await self.broker.publish(event)
 
-    async def _complete_answer(self, run: RunRecord, content: str) -> None:
-        if not await self._transition(run, RunState.ANSWERED):
-            return
-        await self._close_turn(run, "answered", content)
-        await self.broker.emit(
-            run.id,
-            EventType.RUN_COMPLETED,
-            {"state": RunState.ANSWERED.value},
-        )
+    async def _complete_answer(
+        self,
+        run: RunRecord,
+        content: str,
+        *,
+        final_stream_id: str | None = None,
+    ) -> None:
+        async with self._lifecycle_lock(run.id):
+            await self._commit_terminal_turn(
+                run,
+                RunState.ANSWERED,
+                "answered",
+                content,
+                completion_payload={"state": RunState.ANSWERED.value},
+                final_stream_id=final_stream_id,
+            )
 
     async def _fail(self, run: RunRecord, error: str) -> None:
+        await self._abandon_open_output_streams(
+            run,
+            status="failed",
+            reason="run_failed",
+        )
         await self._abandon_active_decision(run, cause="run_failed")
         run.error = error
         self.storage.save_run(run)
         await self.broker.emit(run.id, EventType.ERROR, {"message": error})
-        if not await self._transition(run, RunState.FAILED):
-            return
-        await self._close_turn(run, "failed", error)
-        await self.broker.emit(
-            run.id,
-            EventType.RUN_COMPLETED,
-            {"state": RunState.FAILED.value, "error": error},
+        await self._commit_terminal_turn(
+            run,
+            RunState.FAILED,
+            "failed",
+            error,
+            completion_payload={"state": RunState.FAILED.value, "error": error},
         )
 
-    async def _interrupt_for_provider(
-        self, run: RunRecord, error: str, category: str
-    ) -> None:
-        previous = run.state
-        run.interrupted_from = previous
+    async def _interrupt_for_provider(self, run: RunRecord, error: str, category: str) -> None:
         run.error = (
             f"{error} The workspace and run history were preserved. "
             "Check the connection or model settings, then resume."
         )
-        self.storage.save_run(run)
-        await self.broker.emit(
-            run.id,
-            EventType.ERROR,
-            {
+        await self._transition(
+            run,
+            RunState.INTERRUPTED,
+            interruption_reason="model_unavailable",
+            interruption_error_payload={
                 "message": run.error,
                 "cause": "model_unavailable",
                 "category": category,
                 "recoverable": True,
             },
         )
-        await self._transition(run, RunState.INTERRUPTED)
 
     async def _request_model(
         self,
@@ -1593,13 +1872,11 @@ class AgentManager:
         wire_effort = (
             None
             if effort is ReasoningEffort.AUTO
-            or (
-                capability.transport == "deepseek_chat"
-                and effort is ReasoningEffort.NONE
-            )
+            or (capability.transport == "deepseek_chat" and effort is ReasoningEffort.NONE)
             else effort.value
         )
         for attempt in range(1, attempts + 1):
+            output_stream = self._new_output_stream(run, tools, attempt=attempt)
             try:
                 await self.broker.emit(
                     run.id,
@@ -1626,7 +1903,22 @@ class AgentManager:
                         "capability_source": capability.source,
                     },
                 )
-                if effort is ReasoningEffort.AUTO:
+                if output_stream is not None:
+                    stream_provider = cast(StreamingModelProvider, self.provider)
+                    if effort is ReasoningEffort.AUTO:
+                        response = await stream_provider.stream_complete(
+                            messages,
+                            tools,
+                            on_delta=output_stream.on_delta,
+                        )
+                    else:
+                        response = await stream_provider.stream_complete(
+                            messages,
+                            tools,
+                            reasoning_effort=effort,
+                            on_delta=output_stream.on_delta,
+                        )
+                elif effort is ReasoningEffort.AUTO:
                     response = await self.provider.complete(messages, tools)
                 else:
                     response = await self.provider.complete(
@@ -1639,10 +1931,37 @@ class AgentManager:
                         "Model provider returned an invalid response object",
                         category="provider_contract",
                     )
+                if output_stream is not None:
+                    response.output_stream_id = await output_stream.resolve(response)
                 return response
+            except asyncio.CancelledError:
+                if output_stream is not None:
+                    await asyncio.shield(
+                        output_stream.abort(
+                            status="interrupted" if self._shutting_down else "cancelled",
+                            reason=(
+                                "process_shutdown" if self._shutting_down else "user_cancelled"
+                            ),
+                        )
+                    )
+                raise
             except ProviderError as exc:
+                if output_stream is not None:
+                    await output_stream.abort(
+                        status=(
+                            "retrying"
+                            if exc.retryable and attempt < attempts
+                            else ("interrupted" if exc.retryable else "failed")
+                        ),
+                        reason=exc.category,
+                    )
                 if not exc.retryable or attempt >= attempts:
                     raise
+                retry_delay = (
+                    exc.retry_after_seconds
+                    if exc.retry_after_seconds is not None
+                    else delay
+                )
                 await self.broker.emit(
                     run.id,
                     EventType.MODEL_RETRY,
@@ -1651,21 +1970,55 @@ class AgentManager:
                         "next_attempt": attempt + 1,
                         "max_attempts": attempts,
                         "category": exc.category,
-                        "delay_seconds": delay,
+                        "delay_seconds": retry_delay,
                     },
                 )
-                await asyncio.sleep(delay)
+                await asyncio.sleep(retry_delay)
                 delay *= 2
             except Exception as exc:
+                if output_stream is not None:
+                    await output_stream.abort(
+                        status="failed",
+                        reason="provider_contract",
+                    )
                 raise ProviderError(
                     f"Model provider failed unexpectedly ({type(exc).__name__})",
                     category="provider_contract",
                 ) from exc
         raise AssertionError("Model retry loop ended unexpectedly")
 
-    async def _complete_model(
-        self, run: RunRecord, tools: list[dict[str, Any]]
-    ) -> ModelResponse:
+    def _new_output_stream(
+        self,
+        run: RunRecord,
+        tools: list[dict[str, Any]],
+        *,
+        attempt: int,
+    ) -> _AssistantOutputStream | None:
+        if not getattr(self.provider, "supports_streaming", False):
+            return None
+        names = {
+            str(schema.get("function", {}).get("name", ""))
+            for schema in tools
+            if isinstance(schema.get("function"), dict)
+        }
+        target: _StreamTarget | None = None
+        if run.state is RunState.PLANNING and "respond_to_user" in names:
+            target = _StreamTarget("respond_to_user", "content")
+        elif run.state is RunState.EXECUTING and "finish" in names:
+            target = _StreamTarget("finish", "summary")
+        if target is None:
+            return None
+        return _AssistantOutputStream(
+            self.broker,
+            run_id=run.id,
+            turn_index=self._active_turn(run).index,
+            phase=run.state.value,
+            attempt=attempt,
+            target=target,
+            api_key=self.settings.api_key,
+        )
+
+    async def _complete_model(self, run: RunRecord, tools: list[dict[str, Any]]) -> ModelResponse:
         prepared, compacted = self.context.prepare(run.messages, tools)
         if compacted:
             run.messages = prepared
@@ -1745,9 +2098,7 @@ class AgentManager:
             DecisionKind.CLARIFICATION,
             previous_state=previous,
             resolved_event_type=EventType.CLARIFICATION_ANSWERED,
-            resolved_payload={
-                "answers": [answer.model_dump(mode="json") for answer in answers]
-            },
+            resolved_payload={"answers": [answer.model_dump(mode="json") for answer in answers]},
         )
         await self._publish_persisted(events)
 
@@ -1894,9 +2245,7 @@ class AgentManager:
         await self._publish_persisted(events)
         self._signal_decision(self.storage.get_decision(run.id, approval.id))
         approved = await future
-        persisted_result = await self._consume_action_decision(
-            run, approval, permission, approved
-        )
+        persisted_result = await self._consume_action_decision(run, approval, permission, approved)
         return approved, approval.id, persisted_result
 
     async def _consume_action_decision(
@@ -1952,9 +2301,7 @@ class AgentManager:
                 "approved": approved,
                 "outcome": "approved" if approved else "rejected",
                 "mode": permission.mode.value,
-                "sandbox_bypass": (
-                    permission.sandbox_bypass_on_allow if approved else False
-                ),
+                "sandbox_bypass": (permission.sandbox_bypass_on_allow if approved else False),
             },
             action_call_payload=(
                 approval.tool_call.model_dump(mode="json")
@@ -1974,9 +2321,7 @@ class AgentManager:
         await self._publish_persisted(events)
         return completed_result
 
-    async def _resume_action_decision(
-        self, run: RunRecord, existing: DecisionRequest
-    ) -> None:
+    async def _resume_action_decision(self, run: RunRecord, existing: DecisionRequest) -> None:
         approval = run.pending_approval
         if approval is None or existing.request_id != approval.id:
             raise RuntimeError("Persisted action decision does not match its approval")
@@ -2008,9 +2353,7 @@ class AgentManager:
         permission = self.tools.resolve_permission(
             approval.tool_call, run.plan, approval.approval_mode
         )
-        persisted_result = await self._consume_action_decision(
-            run, approval, permission, approved
-        )
+        persisted_result = await self._consume_action_decision(run, approval, permission, approved)
         if persisted_result is None:
             sandbox_bypass = approval.sandbox_bypass_on_approve
             result = await self.tools.execute(
@@ -2091,9 +2434,44 @@ class AgentManager:
             return
         await self._publish_persisted([event])
 
-    async def _transition(self, run: RunRecord, new_state: RunState) -> bool:
+    async def _transition(
+        self,
+        run: RunRecord,
+        new_state: RunState,
+        *,
+        interruption_reason: str | None = None,
+        interruption_error_payload: dict[str, Any] | None = None,
+    ) -> bool:
         same_state = run.state is new_state
         self._validate_transition(run, new_state)
+        if new_state is RunState.INTERRUPTED:
+            if same_state:
+                await self._abandon_open_output_streams(
+                    run,
+                    status="interrupted",
+                    reason=interruption_reason or "run_interrupted",
+                )
+                return True
+            previous = run.state
+            run.interrupted_from = previous
+            run.state = RunState.INTERRUPTED
+            if run.turns:
+                run.turns[-1].summary_stream_id = None
+            cause = interruption_reason or "run_interrupted"
+            events = self.storage.commit_interruption(
+                run,
+                previous_state=previous,
+                stream_status="interrupted",
+                stream_reason=cause,
+                state_payload={
+                    "state": RunState.INTERRUPTED.value,
+                    "previous": previous.value,
+                    "cause": cause,
+                },
+                error_payload=interruption_error_payload,
+            )
+            await self._publish_persisted(events)
+            return True
         if new_state.terminal and not await self._prepare_terminal_cleanup(run, new_state):
             return False
         if same_state:
@@ -2108,16 +2486,12 @@ class AgentManager:
         )
         return True
 
-    async def _prepare_terminal_cleanup(
-        self, run: RunRecord, intended_state: RunState
-    ) -> bool:
+    async def _prepare_terminal_cleanup(self, run: RunRecord, intended_state: RunState) -> bool:
         # Persist and physically checkpoint the scrub while the row is still recoverable. A
         # crash or busy WAL can then leave a nonterminal/interrupted row, never a terminal row
         # that still contains provider-private replay state.
         scrubbed = self._scrub_provider_reasoning(run)
-        run.provider_reasoning_cleanup_pending = (
-            run.provider_reasoning_cleanup_pending or scrubbed
-        )
+        run.provider_reasoning_cleanup_pending = run.provider_reasoning_cleanup_pending or scrubbed
         self.storage.save_run(run)
         if not run.provider_reasoning_cleanup_pending:
             return True
@@ -2141,27 +2515,27 @@ class AgentManager:
             "WAL cleanup is waiting for an external reader. Close external database readers, "
             "then stop or resume this task."
         )
-        self.storage.save_run(run)
-        await self.broker.emit(
-            run.id,
-            EventType.ERROR,
-            {
+        if run.turns:
+            run.turns[-1].summary_stream_id = None
+        events = self.storage.commit_interruption(
+            run,
+            previous_state=previous,
+            stream_status="interrupted",
+            stream_reason="provider_reasoning_cleanup_pending",
+            error_payload={
                 "message": run.error,
                 "cause": "provider_reasoning_cleanup_pending",
                 "category": "storage_cleanup",
                 "recoverable": True,
                 "intended_state": intended_state.value,
             },
-        )
-        await self.broker.emit(
-            run.id,
-            EventType.STATE_CHANGED,
-            {
+            state_payload={
                 "state": RunState.INTERRUPTED.value,
                 "previous": previous.value,
                 "cause": "provider_reasoning_cleanup_pending",
             },
         )
+        await self._publish_persisted(events)
 
     def _append_clarification_answers(
         self,
@@ -2206,10 +2580,51 @@ class AgentManager:
     def _assistant_message_for_storage(self, response: ModelResponse) -> dict[str, Any]:
         message = response.as_assistant_message()
         private_reasoning = message.pop("reasoning_content", None)
-        serialized = json.dumps(message, ensure_ascii=False)
-        stored = cast(dict[str, Any], json.loads(self._redact(serialized)))
+        if response.tool_calls:
+            wire_calls = message.get("tool_calls")
+            if not isinstance(wire_calls, list) or len(wire_calls) != len(response.tool_calls):
+                raise ProviderError(
+                    "Provider tool calls could not be stored safely",
+                    category="provider_contract",
+                )
+            for wire_call, source_call in zip(wire_calls, response.tool_calls, strict=True):
+                if not isinstance(wire_call, dict):
+                    raise ProviderError(
+                        "Provider tool calls could not be stored safely",
+                        category="provider_contract",
+                    )
+                function = wire_call.get("function")
+                if not isinstance(function, dict):
+                    raise ProviderError(
+                        "Provider tool calls could not be stored safely",
+                        category="provider_contract",
+                    )
+                try:
+                    safe_arguments = redact_json_value(
+                        source_call.arguments,
+                        api_key=self.settings.api_key,
+                    )
+                except ValueError as exc:
+                    raise ProviderError(
+                        "Provider tool calls could not be stored safely",
+                        category="provider_contract",
+                    ) from exc
+                function["arguments"] = json.dumps(safe_arguments, ensure_ascii=False)
+        try:
+            stored = cast(
+                dict[str, Any],
+                redact_json_value(message, api_key=self.settings.api_key),
+            )
+        except ValueError as exc:
+            raise ProviderError(
+                "Provider response could not be stored safely",
+                category="provider_contract",
+            ) from exc
         if private_reasoning is not None:
-            if self._redact(private_reasoning) != private_reasoning:
+            if contains_redactable_secret(
+                private_reasoning,
+                api_key=self.settings.api_key,
+            ):
                 raise ProviderError(
                     "Provider-private replay state could not be stored safely",
                     category="provider_contract",
@@ -2224,9 +2639,7 @@ class AgentManager:
             for field in ("output", "error"):
                 value = result.get(field)
                 if isinstance(value, str):
-                    result[field] = _limit_for_model(
-                        value, self.settings.model_output_limit
-                    )
+                    result[field] = _limit_for_model(value, self.settings.model_output_limit)
         return payload
 
     def _append_tool_error(self, run: RunRecord, call: ToolCall, error: str) -> None:
@@ -2262,9 +2675,7 @@ class AgentManager:
         run.messages.append({"role": "user", "content": correction})
         self.storage.save_run(run)
         for call, result in results:
-            await self.broker.emit(
-                run.id, EventType.TOOL_REQUESTED, call.model_dump(mode="json")
-            )
+            await self.broker.emit(run.id, EventType.TOOL_REQUESTED, call.model_dump(mode="json"))
             await self._emit_tool_result(run, call, result)
 
     async def _reject_invalid_planning_call(
@@ -2359,9 +2770,7 @@ class AgentManager:
             await self.broker.emit(
                 run.id, EventType.DIFF_UPDATED, {"diff": self.workspace.diff(run.id)}
             )
-        await self.broker.emit(
-            run.id, EventType.PLAN_UPDATED, run.plan.model_dump(mode="json")
-        )
+        await self.broker.emit(run.id, EventType.PLAN_UPDATED, run.plan.model_dump(mode="json"))
 
     @staticmethod
     def _apply_plan_update(run: RunRecord, call: ToolCall) -> ToolResult:
@@ -2402,10 +2811,7 @@ class AgentManager:
         return result
 
     def _redact(self, text: str) -> str:
-        redacted = text
-        if self.settings.api_key:
-            redacted = redacted.replace(self.settings.api_key, "[REDACTED]")
-        return re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED]", redacted)
+        return redact_text(text, api_key=self.settings.api_key)
 
     def _control(self, run_id: str) -> _Control:
         try:
@@ -2416,17 +2822,13 @@ class AgentManager:
     @staticmethod
     def _validate_transition(run: RunRecord, new_state: RunState) -> None:
         if new_state is not run.state and new_state not in _ALLOWED_TRANSITIONS[run.state]:
-            raise RuntimeError(
-                f"Invalid run transition: {run.state.value} -> {new_state.value}"
-            )
+            raise RuntimeError(f"Invalid run transition: {run.state.value} -> {new_state.value}")
 
     async def _publish_persisted(self, events: list[RunEvent]) -> None:
         for event in events:
             await self.broker.publish(event)
 
-    def _decision_or_reject(
-        self, run_id: str, request_id: str
-    ) -> DecisionRequest:
+    def _decision_or_reject(self, run_id: str, request_id: str) -> DecisionRequest:
         try:
             return self.storage.get_decision(run_id, request_id)
         except KeyError as exc:
@@ -2435,11 +2837,7 @@ class AgentManager:
     def _active_decision_id(self, run_id: str, kind: DecisionKind) -> str:
         receipt = self.storage.get_active_decision(run_id)
         if receipt is None or receipt.kind is not kind:
-            label = (
-                "clarification"
-                if kind is DecisionKind.CLARIFICATION
-                else "plan approval"
-            )
+            label = "clarification" if kind is DecisionKind.CLARIFICATION else "plan approval"
             raise InvalidRunAction(f"The run is not waiting for {label}")
         return receipt.request_id
 
@@ -2456,9 +2854,7 @@ class AgentManager:
             raise InvalidRunAction(str(exc)) from exc
 
     @staticmethod
-    def _require_decision_subject(
-        receipt: DecisionRequest, subject: dict[str, Any]
-    ) -> None:
+    def _require_decision_subject(receipt: DecisionRequest, subject: dict[str, Any]) -> None:
         if receipt.subject_sha256 != decision_payload_sha256(subject):
             raise InvalidRunAction(
                 "Decision request no longer matches the clarification, plan, or action shown"
@@ -2503,9 +2899,8 @@ class AgentManager:
         events = self.storage.get_events(run_id)
         uncertain_request_ids: set[str] = set()
         for started in events:
-            if (
-                started.type is not EventType.TOOL_STARTED
-                or not started.payload.get("approval_request_id")
+            if started.type is not EventType.TOOL_STARTED or not started.payload.get(
+                "approval_request_id"
             ):
                 continue
             request_id = str(started.payload["approval_request_id"])
@@ -2548,9 +2943,7 @@ class AgentManager:
 
     def _previous_turns_context(self, run: RunRecord) -> str:
         own_entries: list[tuple[str, ConversationTurn]] = [
-            ("this run", turn)
-            for turn in run.turns[:-1]
-            if turn.outcome != "in_progress"
+            ("this run", turn) for turn in run.turns[:-1] if turn.outcome != "in_progress"
         ]
         ancestors: list[RunRecord] = []
         parent_id = self.storage.get_parent_run_id(run.id)
@@ -2597,43 +2990,119 @@ class AgentManager:
         current = f"Current request:\n{request}"
         return f"{previous}\n\n{current}" if previous else current
 
-    def _set_turn_summary(self, run: RunRecord, summary: str) -> None:
+    def _set_turn_summary(
+        self,
+        run: RunRecord,
+        summary: str,
+        *,
+        stream_id: str | None = None,
+    ) -> None:
         if summary:
-            self._active_turn(run).summary = self._redact(summary)[:4_000]
+            turn = self._active_turn(run)
+            turn.summary = self._redact(summary)[:4_000]
+            turn.summary_stream_id = stream_id
             self.storage.save_run(run)
 
-    async def _close_turn(
+    async def _emit_output_abort(
+        self,
+        run: RunRecord,
+        stream_id: str,
+        *,
+        status: str,
+        reason: str,
+    ) -> None:
+        await self.broker.abort_open_assistant_outputs(
+            run.id,
+            status=status,
+            reason=reason,
+            stream_id=stream_id,
+        )
+
+    async def _abandon_open_output_streams(
+        self,
+        run: RunRecord,
+        *,
+        status: str,
+        reason: str,
+    ) -> None:
+        turn = self._active_turn(run)
+        await self.broker.abort_open_assistant_outputs(
+            run.id,
+            status=status,
+            reason=reason,
+        )
+        if turn.summary_stream_id is not None:
+            turn.summary_stream_id = None
+            self.storage.save_run(run)
+
+    def _close_turn_in_memory(
         self,
         run: RunRecord,
         outcome: Literal["answered", "succeeded", "failed", "cancelled"],
         summary: str,
-    ) -> None:
+        *,
+        final_stream_id: str | None = None,
+    ) -> dict[str, Any]:
         turn = self._active_turn(run)
         if turn.outcome != "in_progress":
-            return
+            raise RuntimeError("The active turn was already closed")
         turn.outcome = outcome
         limit = 20_000 if outcome == "answered" else 4_000
         turn.summary = self._redact(summary)[:limit]
+        turn.summary_stream_id = final_stream_id
         turn.completed_at = utc_now()
         self._scrub_provider_reasoning(run)
-        self.storage.save_run(run)
-        await self.broker.emit(
-            run.id,
-            EventType.TURN_COMPLETED,
-            {
-                "index": turn.index,
-                "outcome": outcome,
-                "summary": turn.summary,
-                "changed_files": turn.changed_files,
-                "approval_mode": turn.approval_mode.value,
-                "reasoning_effort": turn.reasoning_effort.value,
-            },
+        payload: dict[str, Any] = {
+            "index": turn.index,
+            "outcome": outcome,
+            "summary": turn.summary,
+            "changed_files": turn.changed_files,
+            "approval_mode": turn.approval_mode.value,
+            "reasoning_effort": turn.reasoning_effort.value,
+        }
+        if final_stream_id:
+            payload["final_stream_id"] = final_stream_id
+        return payload
+
+    async def _commit_terminal_turn(
+        self,
+        run: RunRecord,
+        state: Literal[RunState.ANSWERED, RunState.FAILED, RunState.CANCELLED],
+        outcome: Literal["answered", "failed", "cancelled"],
+        summary: str,
+        *,
+        completion_payload: dict[str, Any],
+        final_stream_id: str | None = None,
+    ) -> bool:
+        if run.state.terminal:
+            raise RuntimeError("The terminal turn was already committed")
+        self._validate_transition(run, state)
+        if not await self._prepare_terminal_cleanup(run, state):
+            await self._abandon_open_output_streams(
+                run,
+                status="interrupted",
+                reason="terminal_cleanup_interrupted",
+            )
+            return False
+        previous = run.state
+        turn_payload = self._close_turn_in_memory(
+            run,
+            outcome,
+            summary,
+            final_stream_id=final_stream_id,
         )
+        run.state = state
+        terminal_events = self.storage.commit_terminal_turn(
+            run,
+            previous_state=previous,
+            turn_payload=turn_payload,
+            completion_payload=completion_payload,
+        )
+        await self._publish_persisted(terminal_events)
+        return True
 
     def _reasoning_capability(self) -> ReasoningCapability:
-        return resolve_reasoning_capability(
-            self.settings.model, base_url=self.settings.base_url
-        )
+        return resolve_reasoning_capability(self.settings.model, base_url=self.settings.base_url)
 
     @staticmethod
     def _scrub_provider_reasoning(run: RunRecord) -> bool:
@@ -2651,9 +3120,7 @@ class AgentManager:
                 break
             if event.type is EventType.CLARIFICATION_REQUESTED:
                 request_id = event.payload.get("request_id")
-                request_ids.add(
-                    str(request_id) if request_id else f"legacy-event:{event.seq}"
-                )
+                request_ids.add(str(request_id) if request_id else f"legacy-event:{event.seq}")
         return len(request_ids)
 
     @staticmethod
@@ -2736,8 +3203,20 @@ class AgentManager:
 def _model_tool(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "function",
-        "function": {"name": name, "description": description, "parameters": parameters},
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        },
     }
+
+
+def _append_stream_fragment(current: str, fragment: str) -> str:
+    if not fragment or fragment == current:
+        return current
+    if fragment.startswith(current):
+        return fragment
+    return current + fragment
 
 
 def _questions_schema() -> dict[str, Any]:

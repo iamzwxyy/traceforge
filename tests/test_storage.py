@@ -595,6 +595,210 @@ def test_atomic_success_commit_rolls_back_run_events_and_proof_together(
     assert storage.get_proof_pack(run.id, 1) == pack
 
 
+@pytest.mark.parametrize(
+    ("terminal_state", "outcome"),
+    [
+        (RunState.ANSWERED, "answered"),
+        (RunState.FAILED, "failed"),
+        (RunState.CANCELLED, "cancelled"),
+    ],
+)
+def test_answered_failed_and_cancelled_turns_commit_atomically(
+    storage: Storage,
+    settings: Settings,
+    terminal_state: RunState,
+    outcome: str,
+) -> None:
+    run = RunRecord(
+        id=f"atomic-{outcome}",
+        task=f"Commit {outcome} atomically",
+        workspace=str(settings.workspace),
+        state=RunState.PLANNING,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request=f"Commit {outcome} atomically",
+                outcome="in_progress",
+            )
+        ],
+    )
+    storage.create_run(run)
+    storage.append_event(run.id, EventType.STATE_CHANGED, {"state": "planning"})
+    run.state = terminal_state
+    run.turns[-1].outcome = outcome  # type: ignore[assignment]
+    run.turns[-1].summary = f"Terminal {outcome}"
+
+    events = storage.commit_terminal_turn(
+        run,
+        previous_state=RunState.PLANNING,
+        turn_payload={"index": 1, "outcome": outcome, "summary": f"Terminal {outcome}"},
+        completion_payload={"state": terminal_state.value},
+    )
+
+    assert [event.type for event in events] == [
+        EventType.STATE_CHANGED,
+        EventType.TURN_COMPLETED,
+        EventType.RUN_COMPLETED,
+    ]
+    persisted = storage.get_run(run.id)
+    assert persisted.state is terminal_state
+    assert persisted.turns[-1].outcome == outcome
+
+
+def test_atomic_terminal_turn_rolls_back_state_turn_and_events_together(
+    storage: Storage,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = RunRecord(
+        id="atomic-answer-fault",
+        task="Do not leave an answered ghost",
+        workspace=str(settings.workspace),
+        state=RunState.PLANNING,
+        turns=[
+            ConversationTurn(index=1, request="Do not leave an answered ghost")
+        ],
+    )
+    storage.create_run(run)
+    storage.append_event(run.id, EventType.STATE_CHANGED, {"state": "planning"})
+    before_events = storage.get_events(run.id)
+    run.state = RunState.ANSWERED
+    run.turns[-1].outcome = "answered"
+    run.turns[-1].summary = "This answer must be atomic"
+    original_insert = storage._insert_event_locked
+
+    def fail_turn_event(event: RunEvent) -> None:
+        original_insert(event)
+        if event.type is EventType.TURN_COMPLETED:
+            raise RuntimeError("terminal turn write failed")
+
+    monkeypatch.setattr(storage, "_insert_event_locked", fail_turn_event)
+    with pytest.raises(RuntimeError, match="terminal turn write failed"):
+        storage.commit_terminal_turn(
+            run,
+            previous_state=RunState.PLANNING,
+            turn_payload={
+                "index": 1,
+                "outcome": "answered",
+                "summary": "This answer must be atomic",
+            },
+            completion_payload={"state": RunState.ANSWERED.value},
+        )
+
+    persisted = storage.get_run(run.id)
+    assert persisted.state is RunState.PLANNING
+    assert persisted.turns[-1].outcome == "in_progress"
+    assert storage.get_events(run.id) == before_events
+
+
+def test_interruption_closes_stream_updates_run_and_emits_events_atomically(
+    storage: Storage,
+    settings: Settings,
+) -> None:
+    run = RunRecord(
+        id="atomic-interruption",
+        task="Pause without leaving an open draft",
+        workspace=str(settings.workspace),
+        state=RunState.PLANNING,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Pause without leaving an open draft",
+                summary_stream_id="draft-stream",
+            )
+        ],
+    )
+    storage.create_run(run)
+    storage.append_event(
+        run.id,
+        EventType.ASSISTANT_OUTPUT_STARTED,
+        {"stream_id": "draft-stream", "status": "streaming"},
+    )
+    run.state = RunState.INTERRUPTED
+    run.interrupted_from = RunState.PLANNING
+    run.error = "Provider unavailable"
+    run.turns[-1].summary_stream_id = None
+
+    events = storage.commit_interruption(
+        run,
+        previous_state=RunState.PLANNING,
+        stream_status="interrupted",
+        stream_reason="model_unavailable",
+        error_payload={"message": run.error, "recoverable": True},
+        state_payload={
+            "state": "interrupted",
+            "previous": "planning",
+            "cause": "model_unavailable",
+        },
+    )
+
+    assert [event.type for event in events] == [
+        EventType.ASSISTANT_OUTPUT_ABORTED,
+        EventType.ERROR,
+        EventType.STATE_CHANGED,
+    ]
+    persisted = storage.get_run(run.id)
+    assert persisted.state is RunState.INTERRUPTED
+    assert persisted.interrupted_from is RunState.PLANNING
+    assert persisted.turns[-1].summary_stream_id is None
+    assert storage.list_open_assistant_output_streams(run.id) == []
+
+
+def test_interruption_commit_fault_rolls_back_stream_state_and_events_together(
+    storage: Storage,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = RunRecord(
+        id="atomic-interruption-fault",
+        task="Remain recoverable after an event write fault",
+        workspace=str(settings.workspace),
+        state=RunState.PLANNING,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Remain recoverable after an event write fault",
+                summary_stream_id="fault-stream",
+            )
+        ],
+    )
+    storage.create_run(run)
+    storage.append_event(
+        run.id,
+        EventType.ASSISTANT_OUTPUT_STARTED,
+        {"stream_id": "fault-stream", "status": "streaming"},
+    )
+    before_events = storage.get_events(run.id)
+    run.state = RunState.INTERRUPTED
+    run.interrupted_from = RunState.PLANNING
+    run.turns[-1].summary_stream_id = None
+    original_insert = storage._insert_event_locked
+
+    def fail_state_event(event: RunEvent) -> None:
+        original_insert(event)
+        if event.type is EventType.STATE_CHANGED:
+            raise RuntimeError("interruption state event write failed")
+
+    monkeypatch.setattr(storage, "_insert_event_locked", fail_state_event)
+    with pytest.raises(RuntimeError, match="interruption state event write failed"):
+        storage.commit_interruption(
+            run,
+            previous_state=RunState.PLANNING,
+            stream_status="interrupted",
+            stream_reason="model_unavailable",
+            state_payload={"state": "interrupted", "previous": "planning"},
+        )
+
+    persisted = storage.get_run(run.id)
+    assert persisted.state is RunState.PLANNING
+    assert persisted.interrupted_from is None
+    assert persisted.turns[-1].summary_stream_id == "fault-stream"
+    assert storage.get_events(run.id) == before_events
+    assert storage.list_open_assistant_output_streams(run.id) == [
+        {"stream_id": "fault-stream", "status": "streaming"}
+    ]
+
+
 def test_atomic_success_rejects_a_different_preexisting_turn_proof(
     storage: Storage, settings: Settings
 ) -> None:

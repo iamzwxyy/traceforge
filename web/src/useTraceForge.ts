@@ -39,6 +39,20 @@ const refreshEventTypes = new Set([
   "rollback.completed",
 ]);
 
+function isRunEvent(value: unknown): value is RunEvent {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const event = value as Record<string, unknown>;
+  return typeof event.run_id === "string"
+    && typeof event.seq === "number"
+    && Number.isInteger(event.seq)
+    && event.seq > 0
+    && typeof event.type === "string"
+    && typeof event.payload === "object"
+    && event.payload !== null
+    && !Array.isArray(event.payload)
+    && typeof event.created_at === "string";
+}
+
 export interface ProofLoadState {
   runId: string;
   turnIndex: number | null;
@@ -161,7 +175,7 @@ export function useTraceForge() {
     }
     let disposed = false;
     let reconnectTimer: number | undefined;
-    let socket: WebSocket | undefined;
+    let activeSocket: WebSocket | undefined;
     lastSeq.current = 0;
     setProofPack(null);
     setProofLoadState(null);
@@ -170,21 +184,32 @@ export function useTraceForge() {
     const connect = () => {
       if (!ownsSelection()) return;
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      socket = new WebSocket(
+      const currentSocket = new WebSocket(
         `${protocol}//${window.location.host}/api/runs/${selectedRunId}/events?after_seq=${lastSeq.current}`,
       );
-      socket.onopen = () => {
-        if (ownsSelection()) setConnected(true);
+      activeSocket = currentSocket;
+      const ownsSocket = () => ownsSelection() && activeSocket === currentSocket;
+      currentSocket.onopen = () => {
+        if (ownsSocket()) setConnected(true);
       };
-      socket.onmessage = (message) => {
-        if (!ownsSelection()) return;
-        const event = JSON.parse(message.data as string) as RunEvent;
+      currentSocket.onmessage = (message) => {
+        if (!ownsSocket()) return;
+        let event: RunEvent;
+        try {
+          const candidate: unknown = JSON.parse(message.data as string);
+          if (!isRunEvent(candidate)) throw new Error("invalid event shape");
+          event = candidate;
+        } catch {
+          setError("实时事件格式无效；TraceForge 正在重新连接并从持久化记录恢复。");
+          currentSocket.close();
+          return;
+        }
         if (event.run_id !== selectedRunId) return;
         lastSeq.current = Math.max(lastSeq.current, event.seq);
         setEvents((current) => mergeEvents(current, [event]));
         if (refreshEventTypes.has(event.type)) {
           void refreshRunMetadata(selectedRunId).catch((reason: unknown) => {
-            if (ownsSelection()) setError(String(reason));
+            if (ownsSocket()) setError(String(reason));
           });
         }
         if (event.type === "diff.updated") {
@@ -198,19 +223,20 @@ export function useTraceForge() {
           }
         }
       };
-      socket.onclose = () => {
-        if (!ownsSelection()) return;
+      currentSocket.onclose = () => {
+        if (!ownsSocket()) return;
+        activeSocket = undefined;
         setConnected(false);
         reconnectTimer = window.setTimeout(connect, 800);
       };
-      socket.onerror = () => socket?.close();
+      currentSocket.onerror = () => {
+        if (ownsSocket()) currentSocket.close();
+      };
     };
 
-    void Promise.all([
-      refreshRun(selectedRunId),
-      api.getEvents(selectedRunId),
-    ])
-      .then(([, initialEvents]) => {
+    const bootstrapEvents = () => {
+      if (!ownsSelection()) return;
+      void api.getEvents(selectedRunId).then((initialEvents) => {
         if (!ownsSelection()) return;
         const ownedEvents = initialEvents.filter((event) => event.run_id === selectedRunId);
         setEvents(ownedEvents);
@@ -218,13 +244,22 @@ export function useTraceForge() {
         connect();
       })
       .catch((reason: unknown) => {
-        if (ownsSelection()) setError(String(reason));
+        if (!ownsSelection()) return;
+        setError(String(reason));
+        reconnectTimer = window.setTimeout(bootstrapEvents, 800);
       });
+    };
+    void refreshRun(selectedRunId).catch((reason: unknown) => {
+      if (ownsSelection()) setError(String(reason));
+    });
+    bootstrapEvents();
 
     return () => {
       disposed = true;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
-      socket?.close();
+      const socketToClose = activeSocket;
+      activeSocket = undefined;
+      socketToClose?.close();
     };
   }, [refreshRun, refreshRunMetadata, selectedRunId]);
 

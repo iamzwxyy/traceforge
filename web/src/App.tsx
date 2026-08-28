@@ -51,6 +51,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import {
   availableProofTurnIndexes,
+  effectiveAssistantOutputStatus,
   isActiveState,
   parseDiff,
   presentState,
@@ -423,6 +424,7 @@ export default function App() {
               key={forge.run.id}
               run={forge.run}
               events={forge.events}
+              connected={forge.connected}
               provider={forge.provider}
               providerReady={providerReady}
               followUpEnabled={forge.status?.mode !== "demo"}
@@ -1497,6 +1499,7 @@ function ProviderDialog({
 function RunStage({
   run,
   events,
+  connected,
   provider,
   providerReady,
   onAnswer,
@@ -1514,6 +1517,7 @@ function RunStage({
 }: {
   run: Run;
   events: RunEvent[];
+  connected: boolean;
   provider: ProviderConfig | null;
   providerReady: boolean;
   followUpEnabled: boolean;
@@ -1598,7 +1602,7 @@ function RunStage({
           )}
         </div>
       </div>
-      <ActivityFeed run={run} events={events} />
+      <ActivityFeed run={run} events={events} connected={connected} />
       <div className="interaction-dock">
         {run.state === "awaiting_clarification" && run.clarification && (
           <ClarificationPanel
@@ -1741,8 +1745,18 @@ function RollbackDialog({
   );
 }
 
-function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
-  const end = useRef<HTMLDivElement>(null);
+function ActivityFeed({
+  run,
+  events,
+  connected,
+}: {
+  run: Run;
+  events: RunEvent[];
+  connected: boolean;
+}) {
+  const feed = useRef<HTMLDivElement>(null);
+  const pinnedToBottom = useRef(true);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const conversation = projectConversationEvents(events);
   const progressSequences = new Set(
     projectProgressEvents(events).map((event) => event.seq),
@@ -1756,15 +1770,56 @@ function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
       "repair.started",
       "model.retry",
       "run.resumed",
+      "assistant.output.aborted",
       "error",
     ].includes(event.type) && (event.type !== "message" || progressSequences.has(event.seq))
   );
   const hasPersistedTurn = conversation.some((event) => event.type === "turn.started");
+  const hasAssistantOutput = conversation.some((event) => event.type !== "turn.started");
+  const conversationVersion = conversation.map((event) => [
+    event.type,
+    event.seq,
+    event.payload.stream_last_seq,
+    event.payload.status,
+    String(event.payload.content ?? "").length,
+  ].join(":" )).join("|");
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior) => {
+    const element = feed.current;
+    if (!element) return;
+    element.scrollTo({ top: element.scrollHeight, behavior });
+    pinnedToBottom.current = true;
+    setShowJumpToLatest(false);
+  }, []);
+
   useEffect(() => {
-    end.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [events.length]);
+    pinnedToBottom.current = true;
+    setShowJumpToLatest(false);
+    window.requestAnimationFrame(() => scrollToLatest("auto"));
+  }, [run.id, scrollToLatest]);
+
+  useEffect(() => {
+    if (pinnedToBottom.current) {
+      window.requestAnimationFrame(() => {
+        if (pinnedToBottom.current) scrollToLatest("auto");
+      });
+    } else {
+      setShowJumpToLatest(true);
+    }
+  }, [conversationVersion, events.length, scrollToLatest]);
+
   return (
-    <div className="activity-feed">
+    <div className="activity-feed-shell">
+      <div
+        ref={feed}
+        className="activity-feed"
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+          pinnedToBottom.current = distance <= 64;
+          if (pinnedToBottom.current) setShowJumpToLatest(false);
+        }}
+      >
       {!hasPersistedTurn && (
         <article className="conversation-turn user-turn">
           <span>你</span><p>{run.task}</p>
@@ -1791,9 +1846,46 @@ function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
             </Fragment>
           );
         }
+        if (event.type === "assistant.output") {
+          const streamId = String(event.payload.stream_id ?? event.seq);
+          const status = effectiveAssistantOutputStatus(
+            String(event.payload.status ?? "streaming"),
+            run.state,
+            connected,
+          );
+          const content = String(event.payload.content ?? "");
+          const committed = status === "committed";
+          const streaming = status === "streaming";
+          const index = Number(event.payload.index ?? event.payload.turn_index ?? 0);
+          const eventFiles = Array.isArray(event.payload.changed_files)
+            ? event.payload.changed_files.filter((path): path is string => typeof path === "string")
+            : [];
+          const changedFiles = eventFiles.length > 0
+            ? eventFiles
+            : run.turns.find((turn) => turn.index === index)?.changed_files ?? [];
+          return (
+            <Fragment key={`stream:${streamId}`}>
+              <article
+                className={`conversation-turn assistant-turn streamed-output ${status}`}
+                aria-busy={streaming}
+              >
+                <span>TraceForge · {assistantOutputStatusLabel(status)}</span>
+                {streaming
+                  ? <p className="streaming-copy">{content}<i className="stream-cursor" aria-hidden="true" /></p>
+                  : <ReactMarkdown>{content || "本次生成没有可显示的内容。"}</ReactMarkdown>}
+                {!committed && !streaming && (
+                  <small className="stream-status-note">{assistantOutputStatusDetail(status)}</small>
+                )}
+              </article>
+              {committed && changedFiles.length > 0 && (
+                <TurnChangedFiles index={index} paths={changedFiles} />
+              )}
+            </Fragment>
+          );
+        }
         return <article className="conversation-turn assistant-turn" key={event.seq}><span>TraceForge</span><ReactMarkdown>{String(event.payload.content ?? "")}</ReactMarkdown></article>;
       })}
-      {conversation.length === 0 && isActiveState(run.state) && (
+      {!hasAssistantOutput && isActiveState(run.state) && (
         <div className="thinking-row"><LoaderCircle className="spin" size={16} /><span>{presentState(run.state).label}…</span></div>
       )}
       {trace.length > 0 && (
@@ -1806,9 +1898,62 @@ function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
           <div className="trace-body">{trace.map((event) => <ActivityItem event={event} key={event.seq} />)}</div>
         </details>
       )}
-      <div ref={end} />
+        <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+          {assistantOutputAnnouncement(conversation, run.state, connected)}
+        </div>
+      </div>
+      {showJumpToLatest && (
+        <button
+          className="jump-to-latest"
+          type="button"
+          onClick={() => scrollToLatest(prefersReducedMotion() ? "auto" : "smooth")}
+        >
+          有新内容 ↓
+        </button>
+      )}
     </div>
   );
+}
+
+function assistantOutputStatusLabel(status: string): string {
+  if (status === "committed") return "正式结果";
+  if (status === "provider_completed") return "等待提交";
+  if (status === "retrying") return "正在重试";
+  if (status === "discarded") return "未采纳草稿";
+  if (status === "cancelled") return "已停止";
+  if (status === "interrupted") return "已中断";
+  if (status === "reconnecting") return "正在重连";
+  if (status === "failed") return "生成失败";
+  return "正在生成";
+}
+
+function assistantOutputStatusDetail(status: string): string {
+  if (status === "provider_completed") return "模型输出已接收，仍需完成本轮提交或独立验证。";
+  if (status === "retrying") return "连接中断；TraceForge 已开始新的隔离生成尝试。";
+  if (status === "discarded") return "这份临时模型输出没有成为本轮正式结果。";
+  if (status === "cancelled") return "你停止了本轮；以上内容是不完整的临时输出。";
+  if (status === "interrupted") return "进程或连接中断；以上内容尚未提交。";
+  if (status === "reconnecting") return "实时连接暂时中断；已显示的内容来自持久化事件。";
+  return "生成未能完成；以上内容不是正式结果。";
+}
+
+function assistantOutputAnnouncement(
+  conversation: RunEvent[],
+  runState: RunState,
+  connected: boolean,
+): string {
+  const output = [...conversation].reverse().find((event) => event.type === "assistant.output");
+  if (!output) return "";
+  const status = effectiveAssistantOutputStatus(
+    String(output.payload.status ?? "streaming"),
+    runState,
+    connected,
+  );
+  return `TraceForge ${assistantOutputStatusLabel(status)}`;
+}
+
+function prefersReducedMotion(): boolean {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 }
 
 function TurnChangedFiles({ index, paths }: { index: number; paths: string[] }) {
@@ -1872,6 +2017,19 @@ function ActivityItem({ event }: { event: RunEvent }) {
       <article className="activity evidence-activity repair-activity">
         <div className="activity-icon"><Wrench size={15} /></div>
         <div><span className="activity-label">有界修复</span><strong>第 {String(event.payload.cycle ?? "?")} / {String(event.payload.limit ?? "?")} 轮</strong><p>{String(event.payload.summary ?? "完成后复核要求进行修复。")}</p></div>
+      </article>
+    );
+  }
+  if (event.type === "assistant.output.aborted") {
+    const status = String(event.payload.status ?? "failed");
+    return (
+      <article className="activity evidence-activity recovery-activity">
+        <div className="activity-icon"><MessageSquareMore size={15} /></div>
+        <div>
+          <span className="activity-label">临时模型输出</span>
+          <strong>{assistantOutputStatusLabel(status)}</strong>
+          <p>{assistantOutputStatusDetail(status)}</p>
+        </div>
       </article>
     );
   }

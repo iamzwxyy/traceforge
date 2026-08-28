@@ -134,6 +134,67 @@ SCENARIOS = (
             "tests/test_sandbox.py::test_explicit_sandbox_bypass_is_visible_and_one_shot",
         ),
     ),
+    Scenario(
+        id="streaming-integrity",
+        title="Durable and redacted streaming",
+        claim=(
+            "Visible output is incrementally persisted without credential leakage; retries, "
+            "cancellation, and restart remain isolated; malformed streams fail closed; and exactly "
+            "one stream plus its terminal turn is committed atomically as the canonical result."
+        ),
+        tests=(
+            (
+                "tests/test_streaming.py::"
+                "test_streaming_redactor_never_releases_a_secret_at_any_chunk_boundary"
+            ),
+            (
+                "tests/test_streaming.py::"
+                "test_streaming_redactor_is_stable_for_adjacent_secrets_and_every_prefix"
+            ),
+            "tests/test_streaming.py::test_redaction_marker_collision_never_releases_configured_key",
+            (
+                "tests/test_streaming.py::"
+                "test_assistant_storage_redacts_escaped_credentials_before_json_serialization"
+            ),
+            "tests/test_streaming.py::test_openai_stream_rejects_unsafe_protocol_shapes",
+            (
+                "tests/test_streaming.py::"
+                "test_raw_transport_rejects_oversized_and_compressed_bodies_before_json"
+            ),
+            (
+                "tests/test_streaming.py::"
+                "test_agent_streams_one_canonical_direct_answer_without_secret_persistence"
+            ),
+            (
+                "tests/test_streaming.py::"
+                "test_retry_uses_distinct_streams_and_commits_only_the_successor"
+            ),
+            (
+                "tests/test_streaming.py::"
+                "test_verified_finish_summary_stream_is_committed_by_the_success_event"
+            ),
+            (
+                "tests/test_streaming.py::"
+                "test_cancelling_a_live_stream_persists_an_aborted_partial"
+            ),
+            (
+                "tests/test_streaming.py::"
+                "test_process_restart_atomically_aborts_uncommitted_stream_generation"
+            ),
+            (
+                "tests/test_streaming.py::"
+                "test_post_stream_private_reasoning_rejection_aborts_the_durable_draft"
+            ),
+            (
+                "tests/test_streaming.py::"
+                "test_answer_commit_fault_cannot_leave_a_terminal_run_with_an_open_turn"
+            ),
+            (
+                "tests/test_storage.py::"
+                "test_interruption_commit_fault_rolls_back_stream_state_and_events_together"
+            ),
+        ),
+    ),
 )
 SCENARIO_BY_ID = {scenario.id: scenario for scenario in SCENARIOS}
 

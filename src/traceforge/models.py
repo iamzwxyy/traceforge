@@ -107,6 +107,10 @@ class EventType(StrEnum):
     REPAIR_STARTED = "repair.started"
     MODEL_REQUESTED = "model.requested"
     MODEL_RETRY = "model.retry"
+    ASSISTANT_OUTPUT_STARTED = "assistant.output.started"
+    ASSISTANT_OUTPUT_DELTA = "assistant.output.delta"
+    ASSISTANT_OUTPUT_COMPLETED = "assistant.output.completed"
+    ASSISTANT_OUTPUT_ABORTED = "assistant.output.aborted"
     RUN_RESUMED = "run.resumed"
     ERROR = "error"
     RUN_COMPLETED = "run.completed"
@@ -367,6 +371,7 @@ class ConversationTurn(BaseModel):
         "in_progress"
     )
     summary: str = Field(default="", max_length=20_000)
+    summary_stream_id: str | None = Field(default=None, min_length=1, max_length=64)
     changed_files: list[str] = Field(default_factory=list)
     started_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None

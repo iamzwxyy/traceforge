@@ -46,6 +46,8 @@ def test_credential_readiness_rejects_empty_or_multiline_files(
 async def test_connection_probe_requires_native_tool_call(
     settings, storage: Storage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    closed: list[bool] = []
+
     class ProbeProvider:
         def __init__(self, _settings) -> None:
             pass
@@ -62,6 +64,9 @@ async def test_connection_probe_requires_native_tool_call(
                 ]
             )
 
+        async def close(self) -> None:
+            closed.append(True)
+
     monkeypatch.setattr(runtime_module, "OpenAICompatibleProvider", ProbeProvider)
     runtime = AgentRuntime(settings, storage, EventBroker(storage))
     storage.save_provider_config(
@@ -75,6 +80,35 @@ async def test_connection_probe_requires_native_tool_call(
     assert "tool calling verified" in result["detail"]
     assert storage.get_provider_verified_at() is not None
     assert runtime.connection_verified() is True
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_connection_probe_redaction_cannot_collide_with_configured_key(
+    settings, storage: Storage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = "[REDACTED]"
+
+    class FailingProbeProvider:
+        def __init__(self, _settings) -> None:
+            pass
+
+        async def complete(self, _messages, _tools=None) -> ModelResponse:
+            raise ProviderError(f"credential={configured}", category="authentication")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(runtime_module, "OpenAICompatibleProvider", FailingProbeProvider)
+    runtime = AgentRuntime(settings, storage, EventBroker(storage))
+
+    result = await runtime._probe_connection(
+        ProviderConfig(model="tool-model", base_url="https://provider.example/v1"),
+        configured,
+    )
+
+    assert result["ok"] is False
+    assert configured not in result["detail"]
 
 
 @pytest.mark.asyncio
