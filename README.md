@@ -122,6 +122,14 @@ the new lock protocol is detected and refused rather than bypassed on another po
 process on the requested port fails before startup mutation and prints a copyable command with an
 available port.
 
+Switching between tasks keeps each direct-task, project, and follow-up draft separate in page memory,
+including plan mode, approval mode, and reasoning effort. Draft text is never written to browser
+storage or the backend and disappears on reload. Successful submissions clear only their own draft;
+failed submissions remain editable. A late create or follow-up response cannot steal navigation,
+surface an error on a different task, or submit twice. Selected-run events remain isolated to one
+WebSocket, while visible background work uses single-flight metadata refresh with slower waiting-state
+checks, failure backoff, and no polling after every run is terminal.
+
 `uv run traceforge doctor` is an optional preflight. It checks direct-task-root and state-directory
 writes, SQLite startup/migrations, the packaged web bundle, listen-address availability, OS sandbox
 enforcement, and the configured credential source without printing its value. Missing model setup
@@ -266,8 +274,8 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 434 backend tests at 87.61% coverage (with a hard 85% gate), 31 frontend
-unit tests, and 31 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 434 backend tests at 87.61% coverage (with a hard 85% gate), 32 frontend
+unit tests, and 34 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 

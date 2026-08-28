@@ -174,6 +174,19 @@ export function isActiveState(state: RunState): boolean {
   ].includes(state);
 }
 
+export function backgroundRunRefreshDelay(
+  runs: readonly Pick<Run, "id" | "state">[],
+  selectedRunId: string | null,
+): number | null {
+  const backgroundRuns = runs.filter((run) => run.id !== selectedRunId);
+  if (backgroundRuns.some((run) => [
+    "created", "planning", "executing", "verifying",
+  ].includes(run.state))) {
+    return 2_000;
+  }
+  return backgroundRuns.some((run) => isActiveState(run.state)) ? 15_000 : null;
+}
+
 export function effectiveAssistantOutputStatus(
   status: string,
   runState: RunState,

@@ -100,6 +100,39 @@ const RIGHT_PANEL_DEFAULT = 390;
 const APPROVAL_MODE_PREFERENCE_KEY = "traceforge:approval-mode:v1";
 const DEFAULT_REASONING_EFFORTS: ReasoningEffort[] = ["auto"];
 
+interface TaskComposerDraft {
+  task: string;
+  planMode: boolean;
+  approvalMode: ApprovalMode;
+  reasoningEffort: ReasoningEffort;
+}
+
+interface FollowUpDraft {
+  prompt: string;
+  planMode: boolean;
+  approvalMode: ApprovalMode;
+  reasoningEffort: ReasoningEffort;
+}
+
+function withSetMembership(current: Set<string>, key: string, present: boolean): Set<string> {
+  if (current.has(key) === present) return current;
+  const next = new Set(current);
+  if (present) next.add(key);
+  else next.delete(key);
+  return next;
+}
+
+function clearMatchingDraft<Draft>(
+  current: Record<string, Draft>,
+  key: string,
+  submittedDraft: Draft,
+): Record<string, Draft> {
+  if (current[key] !== submittedDraft) return current;
+  const next = { ...current };
+  delete next[key];
+  return next;
+}
+
 function storedApprovalMode(): ApprovalMode {
   try {
     const value = window.localStorage.getItem(APPROVAL_MODE_PREFERENCE_KEY);
@@ -239,8 +272,19 @@ function useDrawerFocus(open: boolean, onClose: () => void) {
 
 export default function App() {
   const forge = useTraceForge();
+  const composerSurfaceVersion = useRef(0);
   const [showComposer, setShowComposer] = useState(false);
   const [composerProjectId, setComposerProjectId] = useState<string | null>(null);
+  const [taskDrafts, setTaskDrafts] = useState<Record<string, TaskComposerDraft>>({});
+  const [submittingTaskDrafts, setSubmittingTaskDrafts] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const submittingTaskDraftsRef = useRef(new Set<string>());
+  const [followUpDrafts, setFollowUpDrafts] = useState<Record<string, FollowUpDraft>>({});
+  const [submittingFollowUps, setSubmittingFollowUps] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const submittingFollowUpsRef = useRef(new Set<string>());
   const [showProject, setShowProject] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [proofSelection, setProofSelection] = useState<{
@@ -289,22 +333,51 @@ export default function App() {
   useEffect(() => persistPanelPreference("left-width", leftWidth), [leftWidth]);
   useEffect(() => persistPanelPreference("right-width", rightWidth), [rightWidth]);
 
+  const defaultTaskDraft = (): TaskComposerDraft => ({
+    task: forge.status?.suggested_task ?? "",
+    planMode: forge.status?.mode === "demo",
+    approvalMode: forge.status?.mode === "demo" ? "automatic" : storedApprovalMode(),
+    reasoningEffort: "auto",
+  });
+  const materializeTaskDraft = (draftKey: string) => {
+    setTaskDrafts((current) => current[draftKey]
+      ? current
+      : { ...current, [draftKey]: defaultTaskDraft() });
+  };
   const openDirectComposer = () => {
+    composerSurfaceVersion.current += 1;
+    materializeTaskDraft("direct");
     setComposerProjectId(null);
     setShowComposer(true);
     setMobilePane(null);
   };
   const openProjectComposer = (projectId: string) => {
+    composerSurfaceVersion.current += 1;
+    materializeTaskDraft(`project:${projectId}`);
     setComposerProjectId(projectId);
     setShowComposer(true);
     setMobilePane(null);
   };
   const selectRun = (runId: string) => {
+    composerSurfaceVersion.current += 1;
     forge.selectRun(runId);
     setShowComposer(false);
     setMobilePane(null);
   };
   const composerProject = forge.projects.find((project) => project.id === composerProjectId) ?? null;
+  const composerDraftKey = composerProjectId ? `project:${composerProjectId}` : "direct";
+  const composerDraft = taskDrafts[composerDraftKey] ?? defaultTaskDraft();
+  const followUpDraftKey = forge.run ? `run:${forge.run.id}` : null;
+  const followUpDraft = forge.run && followUpDraftKey
+    ? followUpDrafts[followUpDraftKey] ?? {
+      prompt: "",
+      planMode: false,
+      approvalMode: forge.run.approval_mode === "full_access"
+        ? "automatic"
+        : forge.run.approval_mode,
+      reasoningEffort: forge.run.reasoning_effort,
+    }
+    : null;
 
   const addProject = async () => {
     const choice = await forge.chooseDirectory();
@@ -402,24 +475,57 @@ export default function App() {
         <section className="main-stage">
           {!forge.run || showComposer ? (
             <TaskComposer
-              key={`${forge.status?.suggested_task ?? "standard"}-${composerProjectId ?? "direct"}`}
-              suggestedTask={forge.status?.suggested_task ?? ""}
+              key={composerDraftKey}
+              draft={composerDraft}
+              onDraftChange={(draft) => {
+                setTaskDrafts((current) => ({ ...current, [composerDraftKey]: draft }));
+              }}
+              submitting={submittingTaskDrafts.has(composerDraftKey)}
               defaultWorkspace={forge.status?.workspace ?? ""}
               project={composerProject}
               demoMode={forge.status?.mode === "demo"}
               provider={forge.provider}
               providerReady={providerReady}
               onOpenSettings={() => setShowSettings(true)}
-              onCancel={() => setShowComposer(false)}
-              onSubmit={async (task, mode, approvalMode, reasoningEffort, target) => {
-                await forge.createRun(
-                  task,
-                  mode,
-                  approvalMode,
-                  reasoningEffort,
-                  target,
-                );
+              onCancel={() => {
+                composerSurfaceVersion.current += 1;
                 setShowComposer(false);
+              }}
+              onSubmit={async (task, mode, approvalMode, reasoningEffort, target) => {
+                const submittedDraft = composerDraft;
+                const surfaceVersion = composerSurfaceVersion.current;
+                const ownsSurface = () => composerSurfaceVersion.current === surfaceVersion;
+                if (submittingTaskDraftsRef.current.has(composerDraftKey)) return;
+                submittingTaskDraftsRef.current.add(composerDraftKey);
+                setSubmittingTaskDrafts((current) => withSetMembership(
+                  current,
+                  composerDraftKey,
+                  true,
+                ));
+                try {
+                  const created = await forge.createRun(
+                    task,
+                    mode,
+                    approvalMode,
+                    reasoningEffort,
+                    target,
+                    ownsSurface,
+                  );
+                  persistApprovalMode(approvalMode);
+                  setTaskDrafts((current) => clearMatchingDraft(
+                    current,
+                    composerDraftKey,
+                    submittedDraft,
+                  ));
+                  if (ownsSurface()) selectRun(created.id);
+                } finally {
+                  submittingTaskDraftsRef.current.delete(composerDraftKey);
+                  setSubmittingTaskDrafts((current) => withSetMembership(
+                    current,
+                    composerDraftKey,
+                    false,
+                  ));
+                }
               }}
               canCancel={Boolean(forge.run)}
             />
@@ -433,6 +539,14 @@ export default function App() {
               providerReady={providerReady}
               followUpEnabled={forge.status?.mode !== "demo"}
               rollbackResult={forge.rollbackResult}
+              followUpDraft={followUpDraft!}
+              followUpSubmitting={submittingFollowUps.has(followUpDraftKey!)}
+              onFollowUpDraftChange={(draft) => {
+                setFollowUpDrafts((current) => ({
+                  ...current,
+                  [followUpDraftKey!]: draft,
+                }));
+              }}
               onAnswer={forge.answerQuestions}
               onPlan={forge.decidePlan}
               onAction={forge.decideAction}
@@ -451,7 +565,32 @@ export default function App() {
               onOpenWorkspace={() => forge.openWorkspace(forge.run!.id)}
               onSelectRun={forge.selectRun}
               onFollowUp={async (prompt, mode, approvalMode, reasoningEffort) => {
-                await forge.followUp(prompt, mode, approvalMode, reasoningEffort);
+                const runId = forge.run!.id;
+                const draftKey = `run:${runId}`;
+                const submittedDraft = followUpDraft!;
+                if (submittingFollowUpsRef.current.has(draftKey)) return;
+                submittingFollowUpsRef.current.add(draftKey);
+                setSubmittingFollowUps((current) => withSetMembership(
+                  current,
+                  draftKey,
+                  true,
+                ));
+                try {
+                  await forge.followUp(prompt, mode, approvalMode, reasoningEffort);
+                  persistApprovalMode(approvalMode);
+                  setFollowUpDrafts((current) => clearMatchingDraft(
+                    current,
+                    draftKey,
+                    submittedDraft,
+                  ));
+                } finally {
+                  submittingFollowUpsRef.current.delete(draftKey);
+                  setSubmittingFollowUps((current) => withSetMembership(
+                    current,
+                    draftKey,
+                    false,
+                  ));
+                }
               }}
             />
           )}
@@ -871,7 +1010,9 @@ function SidebarRun({
 }
 
 function TaskComposer({
-  suggestedTask,
+  draft,
+  onDraftChange,
+  submitting,
   defaultWorkspace,
   project,
   demoMode,
@@ -882,7 +1023,9 @@ function TaskComposer({
   onCancel,
   canCancel,
 }: {
-  suggestedTask: string;
+  draft: TaskComposerDraft;
+  onDraftChange: (draft: TaskComposerDraft) => void;
+  submitting: boolean;
   defaultWorkspace: string;
   project: Project | null;
   demoMode: boolean;
@@ -899,24 +1042,21 @@ function TaskComposer({
   onCancel: () => void;
   canCancel: boolean;
 }) {
-  const [task, setTask] = useState(suggestedTask);
-  const [planMode, setPlanMode] = useState(demoMode);
-  const [approvalMode, setApprovalMode] = useState<ApprovalMode>(
-    demoMode ? "automatic" : storedApprovalMode,
-  );
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("auto");
-  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const supportedReasoning = provider?.supported_reasoning_efforts
     ?? DEFAULT_REASONING_EFFORTS;
   const effectiveReasoningEffort = supportedReasoningEffort(
     supportedReasoning,
-    reasoningEffort,
+    draft.reasoningEffort,
   );
   useEffect(() => {
-    if (effectiveReasoningEffort !== reasoningEffort) {
-      setReasoningEffort(effectiveReasoningEffort);
+    if (effectiveReasoningEffort !== draft.reasoningEffort) {
+      onDraftChange({ ...draft, reasoningEffort: effectiveReasoningEffort });
     }
-  }, [effectiveReasoningEffort, reasoningEffort]);
+  }, [draft, effectiveReasoningEffort, onDraftChange]);
+  useEffect(() => {
+    submittingRef.current = submitting;
+  }, [submitting]);
   const targetLabel = project ? project.name : demoMode ? "固定演示" : "直接任务";
   return (
     <div className="composer-wrap">
@@ -934,23 +1074,24 @@ function TaskComposer({
         className="task-composer"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!task.trim()) return;
-          setSubmitting(true);
+          if (!draft.task.trim() || submittingRef.current) return;
+          submittingRef.current = true;
           const target: RunTarget = project
             ? { project_id: project.id }
             : demoMode
               ? {}
               : { create_direct_workspace: true };
-          persistApprovalMode(approvalMode);
           void onSubmit(
-            task.trim(),
-            planMode ? "plan" : "agent",
-            demoMode ? "automatic" : approvalMode,
+            draft.task.trim(),
+            draft.planMode ? "plan" : "agent",
+            demoMode ? "automatic" : draft.approvalMode,
             demoMode ? "auto" : effectiveReasoningEffort,
             target,
           )
             .catch(() => undefined)
-            .finally(() => setSubmitting(false));
+            .finally(() => {
+              submittingRef.current = false;
+            });
         }}
       >
         {!providerReady && (
@@ -978,8 +1119,9 @@ function TaskComposer({
         </div>
         <textarea
           autoFocus
-          value={task}
-          onChange={(event) => setTask(event.target.value)}
+          value={draft.task}
+          onChange={(event) => onDraftChange({ ...draft, task: event.target.value })}
+          disabled={submitting}
           readOnly={demoMode}
           aria-readonly={demoMode}
           onKeyDown={(event) => {
@@ -991,6 +1133,7 @@ function TaskComposer({
               })
               && providerReady
               && !submitting
+              && !submittingRef.current
             ) {
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
@@ -1000,35 +1143,34 @@ function TaskComposer({
           rows={6}
         />
         <ApprovalModePicker
-          value={approvalMode}
+          value={draft.approvalMode}
           onChange={(value) => {
-            setApprovalMode(value);
-            persistApprovalMode(value);
+            onDraftChange({ ...draft, approvalMode: value });
           }}
-          disabled={demoMode}
+          disabled={demoMode || submitting}
         />
         <div className="composer-actions">
           <label className="toggle-row plan-mode-toggle">
-            <input type="checkbox" checked={planMode} onChange={(event) => setPlanMode(event.target.checked)} disabled={demoMode} />
+            <input type="checkbox" checked={draft.planMode} onChange={(event) => onDraftChange({ ...draft, planMode: event.target.checked })} disabled={demoMode || submitting} />
             <span className="toggle" />
             <span><strong>计划模式</strong><small>先生成完整方案，确认后再实施</small></span>
           </label>
           <ReasoningEffortPicker
             value={effectiveReasoningEffort}
-            onChange={setReasoningEffort}
+            onChange={(reasoningEffort) => onDraftChange({ ...draft, reasoningEffort })}
             provider={provider}
-            disabled={demoMode}
+            disabled={demoMode || submitting}
           />
           <div className="composer-safeguards" aria-label="任务保障">
-            <span><ShieldCheck size={13} /><strong>{approvalModeLabel(approvalMode)}</strong> · {approvalModeShortDescription(approvalMode)}</span>
+            <span><ShieldCheck size={13} /><strong>{approvalModeLabel(draft.approvalMode)}</strong> · {approvalModeShortDescription(draft.approvalMode)}</span>
             <span><CheckCircle2 size={13} /><strong>完成后复核</strong> · 独立只读审查</span>
           </div>
           <div className="button-row">
-            {canCancel && <button className="button ghost" type="button" onClick={onCancel}>取消</button>}
+            {canCancel && <button className="button ghost" type="button" onClick={onCancel} disabled={submitting}>取消</button>}
             <button
               className="button primary"
               type="submit"
-              disabled={!task.trim() || !providerReady || submitting}
+              disabled={!draft.task.trim() || !providerReady || submitting}
             >
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={16} />}
               发送
@@ -1636,6 +1778,9 @@ function RunStage({
   onSelectRun,
   onFollowUp,
   followUpEnabled,
+  followUpDraft,
+  followUpSubmitting,
+  onFollowUpDraftChange,
   rollbackResult,
 }: {
   run: Run;
@@ -1644,6 +1789,9 @@ function RunStage({
   provider: ProviderConfig | null;
   providerReady: boolean;
   followUpEnabled: boolean;
+  followUpDraft: FollowUpDraft;
+  followUpSubmitting: boolean;
+  onFollowUpDraftChange: (draft: FollowUpDraft) => void;
   rollbackResult: RollbackResult | null;
   onAnswer: (answers: ClarificationAnswer[]) => Promise<void>;
   onPlan: (decision: "approve" | "revise", feedback?: string) => Promise<void>;
@@ -1789,10 +1937,11 @@ function RunStage({
         {followUpEnabled && ["answered", "succeeded", "failed", "cancelled", "rolled_back"].includes(run.state) && !(run.state === "rolled_back" && run.successor_run_id) && (
           <FollowUpComposer
             key={`${run.id}:${run.turns.length}`}
-            defaultApprovalMode={run.approval_mode}
-            defaultReasoningEffort={run.reasoning_effort}
             provider={provider}
             providerReady={providerReady}
+            draft={followUpDraft}
+            onDraftChange={onFollowUpDraftChange}
+            submitting={followUpSubmitting}
             onSubmit={onFollowUp}
           />
         )}
@@ -2497,16 +2646,18 @@ function latestRollbackResult(events: RunEvent[]): RollbackResult | null {
 }
 
 function FollowUpComposer({
-  defaultApprovalMode,
-  defaultReasoningEffort,
   provider,
   providerReady,
+  draft,
+  onDraftChange,
+  submitting,
   onSubmit,
 }: {
-  defaultApprovalMode: ApprovalMode;
-  defaultReasoningEffort: ReasoningEffort;
   provider: ProviderConfig | null;
   providerReady: boolean;
+  draft: FollowUpDraft;
+  onDraftChange: (draft: FollowUpDraft) => void;
+  submitting: boolean;
   onSubmit: (
     prompt: string,
     mode: InteractionMode,
@@ -2514,59 +2665,46 @@ function FollowUpComposer({
     reasoningEffort: ReasoningEffort,
   ) => Promise<void>;
 }) {
-  const [prompt, setPrompt] = useState("");
-  const [planMode, setPlanMode] = useState(false);
-  const [approvalMode, setApprovalMode] = useState<ApprovalMode>(
-    defaultApprovalMode === "full_access" ? "automatic" : defaultApprovalMode,
-  );
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(
-    supportedReasoningEffort(
-      provider?.supported_reasoning_efforts ?? DEFAULT_REASONING_EFFORTS,
-      defaultReasoningEffort,
-    ),
-  );
-  const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false);
   const supportedReasoning = provider?.supported_reasoning_efforts
     ?? DEFAULT_REASONING_EFFORTS;
   const effectiveReasoningEffort = supportedReasoningEffort(
     supportedReasoning,
-    reasoningEffort,
+    draft.reasoningEffort,
   );
   useEffect(() => {
-    if (effectiveReasoningEffort !== reasoningEffort) {
-      setReasoningEffort(effectiveReasoningEffort);
+    if (effectiveReasoningEffort !== draft.reasoningEffort) {
+      onDraftChange({ ...draft, reasoningEffort: effectiveReasoningEffort });
     }
-  }, [effectiveReasoningEffort, reasoningEffort]);
+  }, [draft, effectiveReasoningEffort, onDraftChange]);
+  useEffect(() => {
+    submittingRef.current = submitting;
+  }, [submitting]);
   return (
     <form
       className="follow-up-composer"
       aria-busy={submitting}
       onSubmit={(event) => {
         event.preventDefault();
-        const request = prompt.trim();
-        if (!request || submittingRef.current || !providerReady) return;
+        const request = draft.prompt.trim();
+        if (!request || submitting || submittingRef.current || !providerReady) return;
         submittingRef.current = true;
-        setSubmitting(true);
-        persistApprovalMode(approvalMode);
         void onSubmit(
           request,
-          planMode ? "plan" : "agent",
-          approvalMode,
+          draft.planMode ? "plan" : "agent",
+          draft.approvalMode,
           effectiveReasoningEffort,
         )
-          .then(() => setPrompt(""))
           .catch(() => undefined)
           .finally(() => {
             submittingRef.current = false;
-            setSubmitting(false);
           });
       }}
     >
       <textarea
         disabled={submitting}
-        value={prompt}
-        onChange={(event) => setPrompt(event.target.value)}
+        value={draft.prompt}
+        onChange={(event) => onDraftChange({ ...draft, prompt: event.target.value })}
         onKeyDown={(event) => {
           if (shouldSubmitPrompt({
             key: event.key,
@@ -2583,7 +2721,7 @@ function FollowUpComposer({
       />
       <div className="follow-up-actions">
         <label className="toggle-row">
-          <input type="checkbox" disabled={submitting} checked={planMode} onChange={(event) => setPlanMode(event.target.checked)} />
+          <input type="checkbox" disabled={submitting} checked={draft.planMode} onChange={(event) => onDraftChange({ ...draft, planMode: event.target.checked })} />
           <span className="toggle" />
           <span><strong>计划模式</strong><small>本轮先审计划再执行</small></span>
         </label>
@@ -2591,12 +2729,11 @@ function FollowUpComposer({
           <span>权限</span>
           <select
             aria-label="本轮权限模式"
-            value={approvalMode}
+            value={draft.approvalMode}
             disabled={submitting}
             onChange={(event) => {
               const value = event.target.value as ApprovalMode;
-              setApprovalMode(value);
-              persistApprovalMode(value);
+              onDraftChange({ ...draft, approvalMode: value });
             }}
           >
             <option value="manual">手动审批（逐项）</option>
@@ -2606,7 +2743,7 @@ function FollowUpComposer({
         </label>
         <ReasoningEffortPicker
           value={effectiveReasoningEffort}
-          onChange={setReasoningEffort}
+          onChange={(reasoningEffort) => onDraftChange({ ...draft, reasoningEffort })}
           provider={provider}
           disabled={submitting}
         />
@@ -2617,7 +2754,7 @@ function FollowUpComposer({
               ? "需要验证模型连接：请在模型设置中重新测试"
               : "需要配置模型：请先填写凭证并测试连接"}
         </span>
-        <button className="button primary" type="submit" disabled={!prompt.trim() || submitting || !providerReady}>
+        <button className="button primary" type="submit" disabled={!draft.prompt.trim() || submitting || !providerReady}>
           {submitting ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}
           继续任务
         </button>

@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import { mergeEvents, preferNewerRun, proofPackTurnIndex } from "./lib";
+import {
+  backgroundRunRefreshDelay,
+  mergeEvents,
+  preferNewerRun,
+  proofPackTurnIndex,
+} from "./lib";
 import type {
   AppStatus,
   ApprovalMode,
@@ -72,6 +77,7 @@ export function useTraceForge() {
   const [diff, setDiff] = useState("");
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [backgroundRefreshEpoch, setBackgroundRefreshEpoch] = useState(0);
   const [rollbackResults, setRollbackResults] = useState<Record<string, RollbackResult>>({});
   const lastSeq = useRef(0);
   const selectedRunIdRef = useRef<string | null>(null);
@@ -81,6 +87,8 @@ export function useTraceForge() {
   const diffRequestVersions = useRef(new Map<string, number>());
   const diffEventVersions = useRef(new Map<string, number>());
   const proofRequestVersion = useRef(0);
+  const creationRequestVersion = useRef(0);
+  const runsRefreshPromise = useRef<Promise<Run[]> | null>(null);
   const run = selectedRunId
     ? runs.find((candidate) => candidate.id === selectedRunId) ?? null
     : null;
@@ -106,19 +114,30 @@ export function useTraceForge() {
     setSelectedRunId(runId);
   }, []);
 
-  const refreshRuns = useCallback(async () => {
-    const next = await api.listRuns();
-    setRuns((current) => {
-      const returnedIds = new Set(next.map((candidate) => candidate.id));
-      return [
-        ...next.map((candidate) => preferNewerRun(
-          current.find((existing) => existing.id === candidate.id) ?? null,
-          candidate,
-        )),
-        ...current.filter((candidate) => !returnedIds.has(candidate.id)),
-      ].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
-    });
-    return next;
+  const refreshRuns = useCallback(async (forceFresh = false): Promise<Run[]> => {
+    if (forceFresh && runsRefreshPromise.current) {
+      await runsRefreshPromise.current.catch(() => undefined);
+    }
+    if (runsRefreshPromise.current) return runsRefreshPromise.current;
+    const request = api.listRuns()
+      .then((next) => {
+        setRuns((current) => {
+          const returnedIds = new Set(next.map((candidate) => candidate.id));
+          return [
+            ...next.map((candidate) => preferNewerRun(
+              current.find((existing) => existing.id === candidate.id) ?? null,
+              candidate,
+            )),
+            ...current.filter((candidate) => !returnedIds.has(candidate.id)),
+          ].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+        });
+        return next;
+      })
+      .finally(() => {
+        if (runsRefreshPromise.current === request) runsRefreshPromise.current = null;
+      });
+    runsRefreshPromise.current = request;
+    return request;
   }, []);
 
   const storeRun = useCallback((nextRun: Run) => {
@@ -164,6 +183,63 @@ export function useTraceForge() {
       })
       .catch((reason: unknown) => setError(String(reason)));
   }, [refreshRuns, selectRun]);
+
+  const refreshRunsQuietly = useCallback(async (): Promise<"refreshed" | "failed" | "skipped"> => {
+    if (document.visibilityState !== "visible") return "skipped";
+    try {
+      await refreshRuns();
+      return "refreshed";
+    } catch {
+      return "failed";
+    }
+  }, [refreshRuns]);
+
+  useEffect(() => {
+    const refreshOnVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void refreshRunsQuietly().then((result) => {
+          if (result === "refreshed") setBackgroundRefreshEpoch((current) => current + 1);
+        });
+      }
+    };
+    const refreshOnFocus = () => {
+      void refreshRunsQuietly().then((result) => {
+        if (result === "refreshed") setBackgroundRefreshEpoch((current) => current + 1);
+      });
+    };
+    window.addEventListener("focus", refreshOnFocus);
+    document.addEventListener("visibilitychange", refreshOnVisibility);
+    return () => {
+      window.removeEventListener("focus", refreshOnFocus);
+      document.removeEventListener("visibilitychange", refreshOnVisibility);
+    };
+  }, [refreshRunsQuietly]);
+
+  const backgroundRefreshDelay = backgroundRunRefreshDelay(runs, selectedRunId);
+  useEffect(() => {
+    if (backgroundRefreshDelay === null) return;
+    let disposed = false;
+    let timer: number | undefined;
+    let consecutiveFailures = 0;
+    const schedule = (delay: number) => {
+      timer = window.setTimeout(() => {
+        void refreshRunsQuietly().then((result) => {
+          if (disposed) return;
+          if (result === "refreshed") consecutiveFailures = 0;
+          else if (result === "failed") consecutiveFailures += 1;
+          const nextDelay = result === "failed"
+            ? Math.min(backgroundRefreshDelay * (2 ** consecutiveFailures), 60_000)
+            : backgroundRefreshDelay;
+          schedule(nextDelay);
+        });
+      }, delay);
+    };
+    schedule(backgroundRefreshDelay);
+    return () => {
+      disposed = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [backgroundRefreshDelay, backgroundRefreshEpoch, refreshRunsQuietly]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -268,7 +344,7 @@ export function useTraceForge() {
     ownsFeedback: () => boolean,
   ) => {
     const synchronizationError = "操作已成功接收，但状态同步失败；TraceForge 正在重试。";
-    const synchronize = () => Promise.all([refreshRun(runId), refreshRuns()]);
+    const synchronize = () => Promise.all([refreshRun(runId), refreshRuns(true)]);
     void synchronize().catch(() => {
       if (ownsFeedback()) setError(synchronizationError);
       window.setTimeout(() => {
@@ -325,8 +401,14 @@ export function useTraceForge() {
       approvalMode: ApprovalMode,
       reasoningEffort: ReasoningEffort,
       target: RunTarget,
-    ) => {
-      setError(null);
+      ownsSurface: () => boolean,
+    ): Promise<Run> => {
+      const requestVersion = creationRequestVersion.current + 1;
+      creationRequestVersion.current = requestVersion;
+      const ownsFeedback = () => (
+        creationRequestVersion.current === requestVersion && ownsSurface()
+      );
+      if (ownsFeedback()) setError(null);
       try {
         const created = await api.createRun(
           task,
@@ -335,15 +417,21 @@ export function useTraceForge() {
           reasoningEffort,
           target,
         );
-        setRuns((current) => [created, ...current]);
-        selectRun(created.id);
-        setStatus(await api.status());
+        storeRun(created);
+        void api.status()
+          .then((nextStatus) => {
+            if (creationRequestVersion.current === requestVersion) setStatus(nextStatus);
+          })
+          .catch(() => undefined);
+        return created;
       } catch (reason) {
-        setError(reason instanceof Error ? reason.message : String(reason));
+        if (ownsFeedback()) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
         throw reason;
       }
     },
-    [selectRun],
+    [storeRun],
   );
 
   const followUp = useCallback(async (
@@ -389,7 +477,7 @@ export function useTraceForge() {
     } catch (reason) {
       await Promise.allSettled([
         refreshRunMetadata(runId),
-        refreshRuns(),
+        refreshRuns(true),
       ]);
       if (ownsFeedback()) {
         setError(reason instanceof Error ? reason.message : String(reason));
@@ -398,7 +486,7 @@ export function useTraceForge() {
     }
     storeRun(successor);
     if (ownsFeedback()) selectRun(successor.id);
-    void refreshRuns().catch(() => undefined);
+    void refreshRuns(true).catch(() => undefined);
     return successor;
   }, [perform, refreshRunMetadata, refreshRuns, run, selectRun, storeRun]);
 

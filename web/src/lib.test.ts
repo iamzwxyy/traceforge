@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   availableProofTurnIndexes,
+  backgroundRunRefreshDelay,
   buildActivityChapters,
   effectiveAssistantOutputStatus,
   inferProviderPreset,
@@ -78,6 +79,29 @@ describe("mission control helpers", () => {
       "deepseek-v4-pro",
     ]);
     expect(providerModelSuggestions("custom")).toEqual([]);
+  });
+
+  it("refreshes only unselected background work at a state-appropriate cadence", () => {
+    const run = (id: string, state: Run["state"]): Pick<Run, "id" | "state"> => ({
+      id,
+      state,
+    });
+    expect(backgroundRunRefreshDelay([
+      run("selected", "executing"),
+      run("done", "succeeded"),
+    ], "selected")).toBeNull();
+    expect(backgroundRunRefreshDelay([
+      run("selected", "answered"),
+      run("background", "planning"),
+    ], "selected")).toBe(2_000);
+    expect(backgroundRunRefreshDelay([
+      run("selected", "succeeded"),
+      run("background", "awaiting_plan_approval"),
+    ], "selected")).toBe(15_000);
+    expect(backgroundRunRefreshDelay([
+      run("selected", "succeeded"),
+      run("done", "cancelled"),
+    ], "selected")).toBeNull();
   });
 
   it("deduplicates and orders replayed events", () => {
