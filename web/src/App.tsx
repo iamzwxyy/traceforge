@@ -52,16 +52,20 @@ import ReactMarkdown from "react-markdown";
 import {
   availableProofTurnIndexes,
   effectiveAssistantOutputStatus,
+  inferProviderPreset,
   isActiveState,
   parseDiff,
   presentState,
   proofPackTurnIndex,
+  providerModelSuggestions,
+  providerPresetValues,
   projectConversationEvents,
   projectProgressEvents,
   reasoningErrorLabel,
   shouldSubmitPrompt,
   supportedReasoningEffort,
   taskTitle,
+  type ProviderPreset,
 } from "./lib";
 import type {
   ApprovalMode,
@@ -1340,8 +1344,18 @@ function ProviderDialog({
   onSave: (config: ProviderUpdate) => Promise<ProviderConfig>;
   onTest: (config: ProviderUpdate) => Promise<ProviderProbe>;
 }) {
+  const initialProviderPreset = inferProviderPreset(provider.base_url);
+  const [providerPreset, setProviderPreset] = useState<ProviderPreset>(
+    initialProviderPreset,
+  );
   const [model, setModel] = useState(provider.model);
   const [baseUrl, setBaseUrl] = useState(provider.base_url ?? "");
+  const [customDraft, setCustomDraft] = useState<{
+    model: string;
+    baseUrl: string;
+  } | null>(initialProviderPreset === "custom"
+    ? { model: provider.model, baseUrl: provider.base_url ?? "" }
+    : null);
   const [apiKey, setApiKey] = useState("");
   const [credentialFile, setCredentialFile] = useState(provider.credential_file ?? "");
   const [contextWindow, setContextWindow] = useState(
@@ -1369,11 +1383,34 @@ function ProviderDialog({
   const routeDraftChanged = model.trim() !== provider.model
     || (baseUrl.trim() || null) !== provider.base_url;
   const connectionReady = provider.api_key_configured && provider.connection_verified;
+  const implicitCredentialAvailable = provider.environment_credential_configured || (
+    provider.api_key_configured && provider.credential_source !== "file"
+  );
+  const credentialAvailable = Boolean(
+    apiKey.trim() || credentialFile.trim() || implicitCredentialAvailable,
+  );
+  const customRouteReady = providerPreset !== "custom" || (
+    Boolean(baseUrl.trim()) && inferProviderPreset(baseUrl) === "custom"
+  );
+  const settingsReady = Boolean(config.model && contextWindowValid && customRouteReady);
+  const modelSuggestions = providerModelSuggestions(providerPreset);
+  const presetDescription = providerPreset === "openai"
+    ? "使用 OpenAI 官方接口；接口地址留空即可，模型建议来自 TraceForge 的精确能力目录。"
+    : providerPreset === "deepseek"
+      ? "使用 DeepSeek 官方接口，并提供 TraceForge 已精确适配的 V4 模型建议。"
+      : "保留自定义模型与接口地址；未知路由仍可使用，并采用保守的协议能力。";
+  const baseUrlPlaceholder = providerPreset === "openai"
+    ? "https://api.openai.com/v1（留空即可）"
+    : providerPreset === "deepseek"
+      ? "https://api.deepseek.com"
+      : "https://your-provider.example/v1";
   const credentialDescription = provider.credential_source === "file"
     ? "已安全保存在仅当前用户可读的本地文件"
     : provider.credential_source === "environment"
       ? provider.credential_env
-      : "在下方输入 API Key，或设置 OPENAI_API_KEY";
+      : provider.api_key_configured
+        ? "当前运行模式已提供凭证"
+        : "在下方输入 API Key，或在高级设置中选择凭证文件";
   const verificationDescription = provider.verified_at
     ? `${new Date(provider.verified_at).toLocaleString("zh-CN")} 已验证原生工具调用`
     : provider.connection_verified
@@ -1394,8 +1431,77 @@ function ProviderDialog({
             <small>{credentialDescription} · {verificationDescription}</small>
           </div>
         </div>
-        <label className="field-label"><span>模型</span><input value={model} onChange={(event) => { setModel(event.target.value); setProbe(null); }} data-dialog-initial-focus /></label>
-        <label className="field-label"><span>OpenAI 兼容接口地址</span><input value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setProbe(null); }} placeholder="https://api.deepseek.com" /></label>
+        <label className="field-label">
+          <span>服务预设</span>
+          <select
+            value={providerPreset}
+            onChange={(event) => {
+              const nextPreset = event.target.value as ProviderPreset;
+              if (providerPreset === "custom") setCustomDraft({ model, baseUrl });
+              const next = nextPreset === "custom" && customDraft
+                ? customDraft
+                : providerPresetValues(nextPreset, model, baseUrl);
+              setProviderPreset(nextPreset);
+              setModel(next.model);
+              setBaseUrl(next.baseUrl);
+              setProbe(null);
+            }}
+            data-dialog-initial-focus
+          >
+            <option value="openai">OpenAI 官方</option>
+            <option value="deepseek">DeepSeek 官方</option>
+            <option value="custom">自定义兼容服务</option>
+          </select>
+          <small>{presetDescription}</small>
+        </label>
+        <label className="field-label">
+          <span>模型</span>
+          <input
+            value={model}
+            list={modelSuggestions.length > 0 ? "provider-model-suggestions" : undefined}
+            onChange={(event) => {
+              const nextModel = event.target.value;
+              setModel(nextModel);
+              if (providerPreset === "custom") {
+                setCustomDraft({ model: nextModel, baseUrl });
+              }
+              setProbe(null);
+            }}
+          />
+          {modelSuggestions.length > 0 && (
+            <datalist id="provider-model-suggestions">
+              {modelSuggestions.map((suggestion) => (
+                <option key={suggestion} value={suggestion} />
+              ))}
+            </datalist>
+          )}
+        </label>
+        <label className="field-label">
+          <span>OpenAI 兼容接口地址</span>
+          <input
+            value={baseUrl}
+            onChange={(event) => {
+              const nextBaseUrl = event.target.value;
+              const nextPreset = inferProviderPreset(nextBaseUrl);
+              if (providerPreset === "custom") {
+                setCustomDraft(nextPreset === "custom"
+                  ? { model, baseUrl: nextBaseUrl }
+                  : null);
+              } else if (nextPreset === "custom") {
+                setCustomDraft({ model, baseUrl: nextBaseUrl });
+              }
+              setBaseUrl(nextBaseUrl);
+              setProviderPreset(nextPreset);
+              setProbe(null);
+            }}
+            placeholder={baseUrlPlaceholder}
+          />
+          {!customRouteReady && (
+            <small className="provider-credential-help" role="status">
+              自定义服务需要填写非官方兼容接口地址。
+            </small>
+          )}
+        </label>
         <div className={`reasoning-capability-note ${provider.reasoning_effort_source}`}>
           <Gauge size={16} />
           <span>
@@ -1407,6 +1513,11 @@ function ProviderDialog({
           <span>API Key</span>
           <input type="password" autoComplete="off" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setProbe(null); }} placeholder={provider.api_key_configured ? "已配置；留空则保持不变" : "输入模型服务的 API Key"} />
           <small>只写入本机仅当前用户可读的私密文件；页面、数据库与运行记录都不会保存或回显 Key。</small>
+          {!credentialAvailable && (
+            <small className="provider-credential-help" role="status">
+              首次连接请输入 API Key；也可在高级设置中选择凭证文件。
+            </small>
+          )}
         </label>
         <details className="advanced-settings">
           <summary>高级设置</summary>
@@ -1450,12 +1561,16 @@ function ProviderDialog({
           </div>
         )}
         <div className="modal-actions">
-          <span className="muted">测试成功才会保存并启用连接；单独保存会要求重新测试。</span>
+          <span className="muted">
+            {credentialAvailable
+              ? "测试成功才会保存并启用连接；单独保存会要求重新测试。"
+              : "请先输入 API Key，或在高级设置中选择凭证文件。"}
+          </span>
           <div className="button-row">
             <button
               className="button"
               type="button"
-              disabled={!config.model || !contextWindowValid || Boolean(working)}
+              disabled={!settingsReady || !credentialAvailable || Boolean(working)}
               onClick={() => {
                 setWorking("test");
                 setProbe(null);
@@ -1463,6 +1578,14 @@ function ProviderDialog({
                   .then((result) => {
                     setProbe(result);
                     if (!result.ok) return;
+                    const resolvedPreset = inferProviderPreset(result.provider.base_url);
+                    setProviderPreset(resolvedPreset);
+                    if (resolvedPreset === "custom") {
+                      setCustomDraft({
+                        model: result.provider.model,
+                        baseUrl: result.provider.base_url ?? "",
+                      });
+                    }
                     setModel(result.provider.model);
                     setBaseUrl(result.provider.base_url ?? "");
                     setApiKey("");
@@ -1478,7 +1601,7 @@ function ProviderDialog({
             <button
               className="button primary"
               type="button"
-              disabled={!config.model || !contextWindowValid || Boolean(working)}
+              disabled={!settingsReady || Boolean(working)}
               onClick={() => {
                 setWorking("save");
                 void onSave(config)
@@ -2903,7 +3026,7 @@ function systemMessageLabel(message: string): string {
     "Credential file must be owner-only; run chmod 600 on it": "凭证文件必须仅限所有者访问；请对它运行 chmod 600",
     "Credential file could not be read as UTF-8": "无法按 UTF-8 读取凭证文件",
     "Credential file must contain exactly one non-empty line": "凭证文件必须恰好包含一行非空内容",
-    "Configure a credential file or set OPENAI_API_KEY before starting a run": "开始任务前，请配置凭证文件或设置 OPENAI_API_KEY",
+    "Configure a credential file or set OPENAI_API_KEY before starting a run": "开始任务前，请输入 API Key，或在高级设置中选择凭证文件；也可设置 OPENAI_API_KEY",
     "Test and verify the model connection before starting or continuing a task": "开始或继续任务前，请先测试并验证模型连接",
     "Model must not be empty": "模型不能为空",
     "Base URL must be an absolute http:// or https:// URL": "接口地址必须是以 http:// 或 https:// 开头的绝对 URL",

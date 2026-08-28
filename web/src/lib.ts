@@ -21,6 +21,84 @@ const states: Record<RunState, StatePresentation> = {
   rolled_back: { label: "已回滚", tone: "idle" },
 };
 
+export type ProviderPreset = "openai" | "deepseek" | "custom";
+
+const providerModels: Record<Exclude<ProviderPreset, "custom">, readonly string[]> = {
+  openai: [
+    "gpt-5.6-sol",
+    "gpt-5.6",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.3-codex",
+    "gpt-5",
+  ],
+  deepseek: [
+    "deepseek-v4-flash-vision-exp",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+  ],
+};
+const providerDefaults: Record<Exclude<ProviderPreset, "custom">, string> = {
+  openai: "gpt-5.6-sol",
+  deepseek: "deepseek-v4-flash-vision-exp",
+};
+
+function matchesOfficialEndpoint(raw: string, hostname: string): boolean {
+  const trimmed = raw.trim();
+  const parsed = trimmed.match(
+    /^([a-z][a-z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/iu,
+  );
+  if (!parsed) return false;
+  const scheme = parsed[1] ?? "";
+  const authority = parsed[2] ?? "";
+  const rawPath = parsed[3] ?? "";
+  const query = parsed[4] ?? "";
+  const fragment = parsed[5] ?? "";
+  const normalizedAuthority = authority.toLocaleLowerCase("en-US");
+  const path = rawPath.replace(/\/+$/u, "");
+  return scheme.toLocaleLowerCase("en-US") === "https"
+    && normalizedAuthority === hostname
+    && (path === "" || path === "/v1")
+    && !query
+    && !fragment;
+}
+
+export function inferProviderPreset(baseUrl: string | null): ProviderPreset {
+  if (!baseUrl?.trim()) return "openai";
+  if (matchesOfficialEndpoint(baseUrl, "api.openai.com")) return "openai";
+  if (matchesOfficialEndpoint(baseUrl, "api.deepseek.com")) return "deepseek";
+  return "custom";
+}
+
+export function providerModelSuggestions(preset: ProviderPreset): readonly string[] {
+  return preset === "custom" ? [] : providerModels[preset];
+}
+
+export function providerPresetValues(
+  preset: ProviderPreset,
+  currentModel: string,
+  currentBaseUrl: string,
+): { model: string; baseUrl: string } {
+  if (preset === "custom") {
+    return {
+      model: currentModel,
+      baseUrl: inferProviderPreset(currentBaseUrl) === "custom" ? currentBaseUrl : "",
+    };
+  }
+  const suggestions = providerModelSuggestions(preset);
+  const normalized = currentModel.trim().toLocaleLowerCase("en-US");
+  const model = suggestions.find((candidate) => candidate === normalized)
+    ?? providerDefaults[preset];
+  return {
+    model,
+    baseUrl: preset === "openai" ? "" : "https://api.deepseek.com",
+  };
+}
+
 export function presentState(state: RunState): StatePresentation {
   return states[state];
 }

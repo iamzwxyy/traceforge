@@ -3,11 +3,14 @@ import {
   availableProofTurnIndexes,
   buildActivityChapters,
   effectiveAssistantOutputStatus,
+  inferProviderPreset,
   mergeEvents,
   parseDiff,
   preferNewerRun,
   presentState,
   proofPackTurnIndex,
+  providerModelSuggestions,
+  providerPresetValues,
   projectConversationEvents,
   projectProgressEvents,
   reasoningErrorLabel,
@@ -22,6 +25,61 @@ function event(seq: number): RunEvent {
 }
 
 describe("mission control helpers", () => {
+  it("infers official provider presets with the same fail-closed route boundary", () => {
+    expect(inferProviderPreset(null)).toBe("openai");
+    expect(inferProviderPreset("  ")).toBe("openai");
+    expect(inferProviderPreset("https://api.openai.com/v1/")).toBe("openai");
+    expect(inferProviderPreset("https://api.openai.com:/v1")).toBe("custom");
+    expect(inferProviderPreset("https://api.deepseek.com")).toBe("deepseek");
+    expect(inferProviderPreset("https://api.deepseek.com/v1////")).toBe("deepseek");
+    expect(inferProviderPreset("https://api.openai.com/v1/.")).toBe("custom");
+    expect(inferProviderPreset("http://api.openai.com/v1")).toBe("custom");
+    expect(inferProviderPreset("https://api.openai.com:443/v1")).toBe("custom");
+    expect(inferProviderPreset("https://api.openai.com.evil.example/v1")).toBe("custom");
+    expect(inferProviderPreset("https://user@api.deepseek.com/v1")).toBe("custom");
+    expect(inferProviderPreset("https://api.deepseek.com/v1/models")).toBe("custom");
+    expect(inferProviderPreset("https://api.openai.com:bad/v1")).toBe("custom");
+  });
+
+  it("pairs official presets with a safe endpoint and known model default", () => {
+    expect(providerPresetValues("openai", "gpt-5.4", "https://old.example/v1"))
+      .toEqual({ model: "gpt-5.4", baseUrl: "" });
+    expect(providerPresetValues("openai", "unknown-model", "https://old.example/v1"))
+      .toEqual({ model: "gpt-5.6-sol", baseUrl: "" });
+    expect(providerPresetValues("deepseek", "unknown-model", ""))
+      .toEqual({
+        model: "deepseek-v4-flash-vision-exp",
+        baseUrl: "https://api.deepseek.com",
+      });
+    expect(providerPresetValues("custom", " local-model ", "http://localhost:11434/v1"))
+      .toEqual({ model: " local-model ", baseUrl: "http://localhost:11434/v1" });
+    expect(providerPresetValues("custom", "gpt-5.6-sol", ""))
+      .toEqual({ model: "gpt-5.6-sol", baseUrl: "" });
+    expect(providerPresetValues("custom", "gpt-5.6-sol", "https://api.openai.com/v1"))
+      .toEqual({ model: "gpt-5.6-sol", baseUrl: "" });
+  });
+
+  it("suggests only models with an exact built-in provider capability route", () => {
+    expect(providerModelSuggestions("openai")).toEqual([
+      "gpt-5.6-sol",
+      "gpt-5.6",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+      "gpt-5.4",
+      "gpt-5.4-mini",
+      "gpt-5.4-nano",
+      "gpt-5.3-codex",
+      "gpt-5",
+    ]);
+    expect(providerModelSuggestions("deepseek")).toEqual([
+      "deepseek-v4-flash-vision-exp",
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+    ]);
+    expect(providerModelSuggestions("custom")).toEqual([]);
+  });
+
   it("deduplicates and orders replayed events", () => {
     expect(mergeEvents([event(2)], [event(1), event(2)]).map((item) => item.seq)).toEqual([
       1, 2,

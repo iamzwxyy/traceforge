@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
-from urllib.parse import urlparse
 
 from traceforge.models import ReasoningEffort
 
@@ -12,6 +12,10 @@ ReasoningCapabilitySource = Literal[
 ReasoningTransport = Literal["openai_chat", "deepseek_chat", "omit"]
 
 CATALOG_VERSION = "2026-08-28"
+_OFFICIAL_ENDPOINT_PATTERN = re.compile(
+    r"^([a-z][a-z0-9+.-]*)://([^/?#]*)([^?#]*)(?:\?([^#]*))?(?:#(.*))?$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,18 +158,14 @@ def is_official_deepseek_endpoint(base_url: str | None) -> bool:
 
 
 def _matches_endpoint(raw: str, *, hostname: str) -> bool:
-    try:
-        parsed = urlparse(raw.strip())
-        return (
-            parsed.scheme == "https"
-            and parsed.hostname == hostname
-            and parsed.port is None
-            and parsed.path.rstrip("/") in {"", "/v1"}
-            and not parsed.query
-            and not parsed.fragment
-            and parsed.username is None
-            and parsed.password is None
-        )
-    except ValueError:
-        # Invalid ports and malformed bracketed hosts must remain auto-only, never crash setup.
+    parsed = _OFFICIAL_ENDPOINT_PATTERN.fullmatch(raw.strip())
+    if parsed is None:
         return False
+    scheme, authority, path, query, fragment = parsed.groups()
+    return (
+        scheme.casefold() == "https"
+        and authority.casefold() == hostname
+        and path.rstrip("/") in {"", "/v1"}
+        and not query
+        and not fragment
+    )

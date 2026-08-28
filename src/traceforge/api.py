@@ -136,6 +136,7 @@ class ProviderConfigView(BaseModel):
     credential_source: str
     credential_file: str | None
     credential_env: str = "OPENAI_API_KEY"
+    environment_credential_configured: bool
     api_key_configured: bool
     connection_verified: bool
     verified_at: datetime | None
@@ -459,6 +460,7 @@ def create_app(
             base_url=selected.base_url,
             credential_source=source,
             credential_file=selected.credential_file,
+            environment_credential_configured=bool(settings.api_key),
             api_key_configured=runtime.credential_configured(selected),
             connection_verified=runtime.connection_verified(),
             verified_at=storage.get_provider_verified_at(),

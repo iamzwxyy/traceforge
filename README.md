@@ -129,8 +129,16 @@ is a warning because the UI can configure it. For a strict preflight after confi
 `--require-os-sandbox --probe-model`; the latter makes one real native tool-call request and fails
 if the selected model cannot complete it.
 
-Open <http://127.0.0.1:8765>, then use the settings button to choose the model, compatible base
-URL, and API key. **测试并保存** keeps the draft key in request memory until the native tool-call
+Open <http://127.0.0.1:8765>, then use the settings button to choose an OpenAI, DeepSeek, or custom
+compatible-service preset. Official presets pair the endpoint with suggestions from TraceForge's
+exact model-capability catalog; they remain editable and are not a routing whitelist. A manually
+entered route is treated as official only when its HTTPS host and raw root or `/v1` path match the
+backend contract (apart from trailing slashes); ports, credentials, extra path segments, and lookalike
+domains stay custom. Custom drafts survive preset switching and require a non-official route.
+Enter an API key, or select an existing credential file under advanced settings; the connection-test
+button stays disabled with a local explanation until one of those sources is available. When both a
+file and the environment key exist, clearing the file path can test the environment fallback directly.
+**测试并保存** keeps the draft key in request memory until the native tool-call
 probe succeeds, then writes it to a new owner-only (`0600`) file and atomically swaps the saved
 configuration. Managed keys live in a dedicated owner-only (`0700`) directory that rejects symbolic
 links; similarly named user-supplied credential files are never treated as managed files. The
@@ -258,8 +266,8 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 434 backend tests at 87.62% coverage (with a hard 85% gate), 28 frontend
-unit tests, and 29 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 434 backend tests at 87.61% coverage (with a hard 85% gate), 31 frontend
+unit tests, and 31 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 

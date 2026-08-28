@@ -34,6 +34,7 @@ function provider(efforts = ["auto", "none", "low", "high", "max"]) {
     credential_source: "environment",
     credential_file: null,
     credential_env: "DEEPSEEK_API_KEY",
+    environment_credential_configured: true,
     api_key_configured: true,
     connection_verified: true,
     verified_at: createdAt,
@@ -206,6 +207,7 @@ test("a fresh failed draft probe stays unsaved and cannot enable task submission
     credential_source: "missing",
     credential_file: null,
     credential_env: "OPENAI_API_KEY",
+    environment_credential_configured: false,
     api_key_configured: false,
     connection_verified: false,
     verified_at: null,
@@ -258,6 +260,130 @@ test("a fresh failed draft probe stays unsaved and cannot enable task submission
     "title",
     "本地服务已就绪，仍需配置模型",
   );
+});
+
+test("first-use provider presets pair routes and models before connection testing", async ({ page }) => {
+  const workspace = "/tmp/traceforge-provider-onboarding";
+  const freshProvider = {
+    ...provider(["auto", "none", "low", "medium", "high", "xhigh", "max"]),
+    model: "gpt-5.6-sol",
+    base_url: null,
+    credential_source: "missing",
+    credential_file: null,
+    credential_env: "OPENAI_API_KEY",
+    environment_credential_configured: false,
+    api_key_configured: false,
+    connection_verified: false,
+    verified_at: null,
+    context_window_source: "fallback",
+    default_reasoning_effort: "medium",
+    reasoning_effort_source: "openai_catalog",
+  };
+
+  await page.route("**/api/status", (route) => route.fulfill(json({
+    ...status(workspace),
+    model: "gpt-5.6-sol",
+    base_url: "https://api.openai.com/v1",
+    api_key_configured: false,
+    connection_verified: false,
+  })));
+  await page.route("**/api/runs", (route) => route.fulfill(json([])));
+  await page.route("**/api/projects", (route) => route.fulfill(json([])));
+  await page.route("**/api/provider", (route) => route.fulfill(json(freshProvider)));
+
+  await page.goto("/");
+  await page.getByRole("button", { name: /需要配置模型/ }).click();
+
+  const preset = page.getByLabel("服务预设");
+  const model = page.getByLabel("模型", { exact: true });
+  const baseUrl = page.getByLabel("OpenAI 兼容接口地址");
+  const testConnection = page.getByRole("button", { name: "测试并保存" });
+
+  await expect(preset).toBeFocused();
+  await expect(preset).toHaveValue("openai");
+  await expect(model).toHaveValue("gpt-5.6-sol");
+  await expect(baseUrl).toHaveValue("");
+  await expect(testConnection).toBeDisabled();
+  await expect(page.getByText("首次连接请输入 API Key；也可在高级设置中选择凭证文件。"))
+    .toBeVisible();
+  await expect(page.getByRole("button", { name: "保存设置" })).toBeEnabled();
+
+  await preset.selectOption("deepseek");
+  await expect(model).toHaveValue("deepseek-v4-flash-vision-exp");
+  await expect(baseUrl).toHaveValue("https://api.deepseek.com");
+  expect(await page.locator("#provider-model-suggestions option").evaluateAll(
+    (options) => options.map((option) => (option as HTMLOptionElement).value),
+  )).toEqual([
+    "deepseek-v4-flash-vision-exp",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+  ]);
+
+  await preset.selectOption("openai");
+  await expect(model).toHaveValue("gpt-5.6-sol");
+  await expect(baseUrl).toHaveValue("");
+
+  await preset.selectOption("custom");
+  await expect(model).toHaveValue("gpt-5.6-sol");
+  await expect(baseUrl).toHaveValue("");
+  await expect(testConnection).toBeDisabled();
+  await expect(page.getByText("自定义服务需要填写非官方兼容接口地址。"))
+    .toBeVisible();
+  await baseUrl.fill("https://gateway.example/v1");
+  await model.fill("gateway-model");
+  await expect(preset).toHaveValue("custom");
+  await expect(testConnection).toBeDisabled();
+
+  await page.locator('input[type="password"]').fill("test-browser-provider-preset-key");
+  await expect(testConnection).toBeEnabled();
+  await preset.selectOption("openai");
+  await expect(model).toHaveValue("gpt-5.6-sol");
+  await expect(baseUrl).toHaveValue("");
+  await preset.selectOption("custom");
+  await expect(model).toHaveValue("gateway-model");
+  await expect(baseUrl).toHaveValue("https://gateway.example/v1");
+  await expect(testConnection).toBeEnabled();
+  await page.setViewportSize({ width: 390, height: 768 });
+  const dialog = page.getByRole("dialog", { name: "连接设置" });
+  const dialogBox = await dialog.boundingBox();
+  expect(dialogBox).not.toBeNull();
+  expect(dialogBox!.x).toBeGreaterThanOrEqual(0);
+  expect(dialogBox!.x + dialogBox!.width).toBeLessThanOrEqual(390.5);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth))
+    .toBe(true);
+  await testConnection.scrollIntoViewIfNeeded();
+  await expect(testConnection).toBeVisible();
+  await expectNoWcagViolations(page, "first-use provider presets");
+});
+
+test("clearing a file credential can use an already available environment credential", async ({ page }) => {
+  const workspace = "/tmp/traceforge-provider-environment-fallback";
+  const fileAndEnvironmentProvider = {
+    ...provider(["auto"]),
+    credential_source: "file",
+    credential_file: "/tmp/traceforge-owner-only.key",
+    credential_env: "OPENAI_API_KEY",
+    environment_credential_configured: true,
+    connection_verified: false,
+    verified_at: null,
+  };
+
+  await page.route("**/api/status", (route) => route.fulfill(json({
+    ...status(workspace),
+    connection_verified: false,
+  })));
+  await page.route("**/api/runs", (route) => route.fulfill(json([])));
+  await page.route("**/api/projects", (route) => route.fulfill(json([])));
+  await page.route("**/api/provider", (route) => route.fulfill(json(fileAndEnvironmentProvider)));
+
+  await page.goto("/");
+  await page.getByRole("button", { name: /需要验证模型连接/ }).click();
+  await page.getByText("高级设置", { exact: true }).click();
+  await page.getByLabel("凭证文件路径").fill("");
+
+  await expect(page.getByRole("button", { name: "测试并保存" })).toBeEnabled();
+  await expect(page.getByText("首次连接请输入 API Key；也可在高级设置中选择凭证文件。"))
+    .toHaveCount(0);
 });
 
 test("a saved but unverified credential asks for verification instead of reconfiguration", async ({ page }) => {

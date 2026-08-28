@@ -9,7 +9,7 @@ test("new-task and setup dialogs meet the automated WCAG A/AA baseline", async (
 
   const settingsTrigger = page.getByRole("button", { name: "模型设置" });
   await settingsTrigger.click();
-  await expect(page.getByLabel("模型", { exact: true })).toBeFocused();
+  await expect(page.getByLabel("服务预设")).toBeFocused();
   await expectNoWcagViolations(page, "model settings dialog");
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog", { name: "连接设置" })).toHaveCount(0);

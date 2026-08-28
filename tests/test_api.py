@@ -1341,6 +1341,7 @@ def test_provider_config_uses_a_file_reference_without_returning_secret(
         payload = updated.json()
         assert payload["credential_source"] == "file"
         assert payload["credential_file"] == str(credential.resolve())
+        assert payload["environment_credential_configured"] is True
         assert payload["api_key_configured"] is True
         assert payload["context_window"] is None
         assert payload["resolved_context_window"] == 1_000_000

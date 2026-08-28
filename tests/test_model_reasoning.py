@@ -111,6 +111,8 @@ def test_unknown_or_deceptive_routes_remain_auto_only(
 def test_endpoint_helpers_are_strict() -> None:
     assert is_official_openai_endpoint(None)
     assert is_official_openai_endpoint("https://api.openai.com/v1")
+    assert not is_official_openai_endpoint("https://api.openai.com:/v1")
+    assert not is_official_openai_endpoint("https://api.openai.com/v1/.")
     assert not is_official_openai_endpoint("http://api.openai.com/v1")
     assert is_official_deepseek_endpoint("https://api.deepseek.com")
     assert not is_official_deepseek_endpoint("https://api.deepseek.com:443/v1")

@@ -205,6 +205,7 @@ export interface ProviderConfig {
   credential_source: "file" | "environment" | "missing";
   credential_file: string | null;
   credential_env: string;
+  environment_credential_configured: boolean;
   api_key_configured: boolean;
   connection_verified: boolean;
   verified_at: string | null;
