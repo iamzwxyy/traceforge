@@ -67,6 +67,8 @@ class CreateRunRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_target(self) -> CreateRunRequest:
+        if self.workspace is not None and not self.workspace.strip():
+            raise ValueError("Workspace must not be empty")
         selected_targets = sum(
             (bool(self.project_id), bool(self.workspace), self.create_direct_workspace)
         )
@@ -236,7 +238,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     @app.get("/api/status")
     async def get_status() -> dict[str, Any]:
         config = runtime.provider_config
-        last_workspace = storage.get_preference("last_workspace") or str(settings.workspace)
+        last_workspace = str(_preferred_directory(storage, fallback=settings.workspace))
         return {
             "version": __version__,
             "workspace": str(settings.workspace),
@@ -308,12 +310,15 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             if created:
                 _remove_empty_directory(root)
             raise
+        storage.set_preference("last_workspace", str(root))
         return project
 
     @app.get("/api/filesystem/directories")
     async def list_directories(path: str | None = None) -> dict[str, Any]:
-        selected = resolve_workspace(
-            path or storage.get_preference("last_workspace") or settings.workspace
+        selected = (
+            resolve_workspace(path)
+            if path
+            else _preferred_directory(storage, fallback=settings.workspace)
         )
         return _directory_listing(selected)
 
@@ -321,7 +326,8 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     async def choose_directory() -> dict[str, Any]:
         if settings.demo_mode or platform.system() != "Darwin":
             return {"supported": False, "path": None}
-        selected = await asyncio.to_thread(_choose_macos_directory, settings.workspace)
+        initial = _preferred_directory(storage, fallback=settings.workspace)
+        selected = await asyncio.to_thread(_choose_macos_directory, initial)
         return {"supported": True, "path": selected}
 
     @app.get("/api/runs", response_model=list[RunView])
@@ -338,27 +344,24 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         if settings.demo_mode:
             if body.task.strip() != (settings.suggested_task or "").strip():
                 raise ValueError(
-                    "The fixed demo only supports its prefilled task; use traceforge serve "
+                    "The fixed demo only supports its prefilled task; use traceforge "
                     "for real tasks"
                 )
             if body.project_id or body.workspace or body.create_direct_workspace:
                 raise ValueError("The fixed demo only runs in its disposable demo workspace")
         project_id = body.project_id
         created_workspace: Path | None = None
-        if project_id:
+        if settings.demo_mode:
+            workspace = str(settings.workspace)
+        elif project_id:
             project = storage.get_project(project_id)
             workspace = project.root
             storage.touch_project(project_id)
-        elif body.create_direct_workspace:
+        elif body.create_direct_workspace or body.workspace is None:
             created_workspace = _create_direct_workspace(settings.workspace)
             workspace = str(created_workspace)
         else:
-            workspace = (
-                body.workspace
-                or storage.get_preference("last_workspace")
-                or str(settings.workspace)
-            )
-            workspace = str(resolve_workspace(workspace))
+            workspace = str(resolve_workspace(body.workspace))
             storage.set_preference("last_workspace", workspace)
         try:
             run = await runtime.start_run(
@@ -432,7 +435,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     async def follow_up(run_id: str, body: FollowUpRequest) -> RunView:
         if settings.demo_mode:
             raise ValueError(
-                "The fixed demo is a single-turn guided tour; use traceforge serve "
+                "The fixed demo is a single-turn guided tour; use traceforge "
                 "for multi-turn tasks"
             )
         run = await runtime.manager_for_run(run_id).follow_up(
@@ -548,6 +551,18 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
 def _allowed_origin(origin: str) -> bool:
     return bool(re.fullmatch(r"https?://(?:127\.0\.0\.1|localhost)(?::\d+)?", origin))
+
+
+def _preferred_directory(storage: Storage, *, fallback: Path) -> Path:
+    preferred = storage.get_preference("last_workspace")
+    for candidate in (preferred, Path.home(), fallback):
+        if candidate is None:
+            continue
+        try:
+            return resolve_workspace(candidate)
+        except ValueError:
+            continue
+    return resolve_workspace(fallback)
 
 
 def _prepare_project_root(raw: str, *, create: bool) -> tuple[Path, bool]:

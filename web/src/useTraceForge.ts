@@ -189,6 +189,7 @@ export function useTraceForge() {
       try {
         const created = await api.createProject(name, root, createDirectory);
         setProjects((current) => [created, ...current]);
+        setStatus(await api.status());
         return created;
       } catch (reason) {
         setError(reason instanceof Error ? reason.message : String(reason));

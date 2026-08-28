@@ -380,9 +380,9 @@ function Header({
           aria-label="运行证据"
           aria-expanded={mobilePane === "inspector"}
         ><PanelRight size={18} /></button>
-        <div className="context-item workspace-path" title={run?.workspace ?? status?.last_workspace}>
+        <div className="context-item workspace-path" title={run?.workspace ?? status?.workspace}>
           <GitBranch size={14} />
-          <span>{run?.workspace ?? status?.last_workspace ?? "正在连接…"}</span>
+          <span>{run?.workspace ?? status?.workspace ?? "正在连接…"}</span>
         </div>
         <div className="context-item"><Sparkles size={14} /><span>{status?.model ?? "—"}</span></div>
         <div
@@ -481,7 +481,7 @@ function Sidebar({
           type="button"
           onClick={onAddProject}
           disabled={demoMode}
-          title={demoMode ? "固定演示不连接真实项目；请运行 traceforge serve" : "使用系统选择器添加项目"}
+          title={demoMode ? "固定演示不连接真实项目；请运行 traceforge" : "使用系统选择器添加项目"}
         >
           <FolderOpen size={16} /> 添加项目
         </button>
@@ -610,7 +610,7 @@ function TaskComposer({
         {project
           ? `任务会在 ${project.root} 中执行，并归入这个项目。`
           : demoMode
-            ? "这是可重复的固定导览，只接受下方预置案例；真实任务请使用 traceforge serve。"
+            ? "这是可重复的固定导览，只接受下方预置案例；真实任务请运行 traceforge。"
             : "只需描述结果。TraceForge 会在默认路径下自动创建独立目录，并用证据证明完成情况。"}
       </p>
       <form
@@ -632,13 +632,18 @@ function TaskComposer({
         {!providerReady && (
           <button className="setup-callout" type="button" onClick={onOpenSettings}>
             <AlertTriangle size={15} />
-            <span><strong>需要配置模型</strong><small>添加本地凭证文件，并验证原生工具调用。</small></span>
+            <span><strong>需要配置模型</strong><small>填写 API Key，并验证原生工具调用。</small></span>
             <ArrowRight size={15} />
           </button>
         )}
         <div className="composer-target" title={project?.root ?? defaultWorkspace}>
           {project ? <FolderOpen size={16} /> : <Code2 size={16} />}
-          <span><strong>{targetLabel}</strong><small>{project?.root ?? (demoMode ? defaultWorkspace : "自动创建独立任务目录")}</small></span>
+          <span>
+            <strong>{targetLabel}</strong>
+            <small>
+              {project?.root ?? (demoMode ? defaultWorkspace : `在 ${defaultWorkspace} 下自动创建独立目录`)}
+            </small>
+          </span>
         </div>
         <textarea
           autoFocus

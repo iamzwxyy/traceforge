@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -49,6 +50,45 @@ def test_settings_from_env_and_validation(tmp_path, monkeypatch) -> None:
         Settings.from_env(workspace, require_api_key=False)
     with pytest.raises(ValueError, match="not a directory"):
         Settings.from_env(workspace / "missing", require_api_key=False)
+
+
+def test_settings_creates_and_reuses_a_default_workspace_root(
+    tmp_path, monkeypatch
+) -> None:
+    default_root = tmp_path / "TraceForge"
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(config_module, "_default_workspace_path", lambda: default_root)
+    monkeypatch.setattr(config_module, "user_data_path", lambda *args, **kwargs: data_dir)
+
+    first = Settings.from_env(require_api_key=False)
+    second = Settings.from_env(require_api_key=False)
+
+    assert first.workspace == default_root.resolve()
+    assert second.workspace == first.workspace
+    assert first.workspace.is_dir()
+    assert stat.S_IMODE(first.workspace.stat().st_mode) & 0o077 == 0
+
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("occupied")
+    monkeypatch.setattr(
+        config_module, "_default_workspace_path", lambda: blocked_parent / "TraceForge"
+    )
+    with pytest.raises(ValueError, match="could not be created"):
+        Settings.from_env(require_api_key=False)
+
+
+def test_settings_honors_the_default_workspace_environment_override(
+    tmp_path, monkeypatch
+) -> None:
+    configured_root = tmp_path / "custom-direct-tasks"
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("TRACEFORGE_WORKSPACE_ROOT", str(configured_root))
+    monkeypatch.setattr(config_module, "user_data_path", lambda *args, **kwargs: data_dir)
+
+    settings = Settings.from_env(require_api_key=False)
+
+    assert settings.workspace == configured_root.resolve()
+    assert stat.S_IMODE(settings.workspace.stat().st_mode) & 0o077 == 0
 
 
 def test_model_response_serializes_tool_calls() -> None:

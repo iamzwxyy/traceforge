@@ -156,12 +156,17 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
 def test_api_rejects_second_active_run(settings: Settings) -> None:
     app = create_app(settings, provider=ScriptedProvider([_plan_response()]))
     with TestClient(app) as client:
-        first = client.post("/api/runs", json={"task": "First", "mode": "plan"})
+        first = client.post(
+            "/api/runs",
+            json={"task": "First", "workspace": str(settings.workspace), "mode": "plan"},
+        )
         assert first.status_code == 201
         run_id = first.json()["id"]
         _wait_for_state(client, run_id, "awaiting_plan_approval")
 
-        second = client.post("/api/runs", json={"task": "Second"})
+        second = client.post(
+            "/api/runs", json={"task": "Second", "workspace": str(settings.workspace)}
+        )
         assert second.status_code == 409
         assert "active" in second.json()["detail"]
 
@@ -237,12 +242,12 @@ def test_projects_direct_tasks_and_directory_browser(settings: Settings, tmp_pat
 
 
 def test_direct_task_allocates_an_isolated_workspace(settings: Settings) -> None:
-    app = create_app(settings, provider=ScriptedProvider([_plan_response()]))
+    app = create_app(settings, provider=ScriptedProvider([_plan_response(), _plan_response()]))
 
     with TestClient(app) as client:
         created = client.post(
             "/api/runs",
-            json={"task": "Direct", "create_direct_workspace": True, "mode": "plan"},
+            json={"task": "Direct", "mode": "plan"},
         )
 
         assert created.status_code == 201
@@ -252,6 +257,19 @@ def test_direct_task_allocates_an_isolated_workspace(settings: Settings) -> None
         assert workspace.name.startswith("traceforge-task-")
         assert workspace.is_dir()
         assert run["project_id"] is None
+
+        explicit = client.post(
+            "/api/runs",
+            json={"task": "Explicit direct", "create_direct_workspace": True, "mode": "plan"},
+        )
+        assert explicit.status_code == 201
+        explicit_run = _wait_for_state(
+            client, explicit.json()["id"], "awaiting_plan_approval"
+        )
+        explicit_workspace = Path(str(explicit_run["workspace"]))
+        assert explicit_workspace.parent == settings.workspace.resolve()
+        assert explicit_workspace != workspace
+        assert explicit_workspace.stat().st_mode & 0o077 == 0
 
         ambiguous = client.post(
             "/api/runs",
@@ -263,6 +281,31 @@ def test_direct_task_allocates_an_isolated_workspace(settings: Settings) -> None
         )
         assert ambiguous.status_code == 422
         assert "Choose a project" in ambiguous.text
+        for invalid_workspace in ("", "   "):
+            invalid = client.post(
+                "/api/runs", json={"task": "Invalid", "workspace": invalid_workspace}
+            )
+            assert invalid.status_code == 422
+            assert "Workspace must not be empty" in invalid.text
+
+
+def test_failed_direct_task_creation_removes_only_its_empty_directory(
+    settings: Settings, monkeypatch
+) -> None:
+    retained = settings.workspace / "existing-user-directory"
+    retained.mkdir()
+    app = create_app(settings, provider=ScriptedProvider([]))
+
+    async def fail_start(*_args, **_kwargs):
+        raise ValueError("provider is unavailable")
+
+    monkeypatch.setattr(app.state.runtime, "start_run", fail_start)
+
+    with TestClient(app) as client:
+        response = client.post("/api/runs", json={"task": "Cannot start"})
+
+    assert response.status_code == 422
+    assert list(settings.workspace.iterdir()) == [retained]
 
 
 def test_fixed_demo_rejects_unrelated_tasks(settings: Settings) -> None:
@@ -293,14 +336,37 @@ def test_macos_directory_picker_reports_capability(
 ) -> None:
     selected = tmp_path / "selected"
     selected.mkdir()
+    recent = tmp_path / "recent"
+    recent.mkdir()
+    initial_paths: list[Path] = []
     app = create_app(settings, provider=ScriptedProvider([]))
     monkeypatch.setattr("traceforge.api.platform.system", lambda: "Darwin")
-    monkeypatch.setattr("traceforge.api._choose_macos_directory", lambda _initial: str(selected))
+
+    def choose(initial: Path) -> str:
+        initial_paths.append(initial)
+        return str(selected)
+
+    monkeypatch.setattr("traceforge.api._choose_macos_directory", choose)
 
     with TestClient(app) as client:
+        client.app.state.storage.set_preference("last_workspace", str(recent))
         picked = client.post("/api/filesystem/choose-directory")
         assert picked.status_code == 200
         assert picked.json() == {"supported": True, "path": str(selected)}
+        assert initial_paths == [recent.resolve()]
+
+        client.app.state.storage.set_preference(
+            "last_workspace", str(tmp_path / "removed-project")
+        )
+        fallback_to_home = client.post("/api/filesystem/choose-directory")
+        assert fallback_to_home.status_code == 200
+        assert initial_paths[-1] == Path.home().resolve()
+        assert client.get("/api/status").json()["last_workspace"] == str(Path.home().resolve())
+
+        monkeypatch.setattr("traceforge.api.Path.home", lambda: tmp_path / "missing-home")
+        assert client.get("/api/status").json()["last_workspace"] == str(
+            settings.workspace.resolve()
+        )
 
         monkeypatch.setattr("traceforge.api.platform.system", lambda: "Linux")
         fallback = client.post("/api/filesystem/choose-directory")

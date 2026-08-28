@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import socket
 import sqlite3
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
 import traceforge.config as config_module
-from traceforge.cli import _available_port, _writable_directory, app
+from traceforge import __version__
+from traceforge.cli import (
+    _available_port,
+    _browser_url,
+    _server_ready,
+    _wait_for_server_and_open,
+    _writable_directory,
+    app,
+)
 from traceforge.demo import DEMO_TASK
 from traceforge.models import ProviderConfig
 from traceforge.storage import Storage
@@ -18,46 +27,107 @@ def test_serve_and_demo_commands_build_runnable_apps(tmp_path, monkeypatch) -> N
     workspace.mkdir()
     data_dir = tmp_path / "data"
     data_dir.mkdir()
+    default_root = tmp_path / "TraceForge"
     monkeypatch.setattr(config_module, "user_data_path", lambda *args, **kwargs: data_dir)
+    monkeypatch.setattr(config_module, "_default_workspace_path", lambda: default_root)
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    launched: list[tuple[object, str, int]] = []
+    servers: list[tuple[object, str, int]] = []
+    opened: list[str] = []
 
     def fake_run(application, *, host: str, port: int) -> None:
-        launched.append((application, host, port))
+        servers.append((application, host, port))
         application.state.storage.close()
 
     monkeypatch.setattr("uvicorn.run", fake_run)
+    monkeypatch.setattr("traceforge.cli._schedule_browser_open", opened.append)
     runner = CliRunner()
 
-    served = runner.invoke(
+    launched = runner.invoke(app, [])
+    served_default = runner.invoke(
+        app, ["serve", "--port", "9000", "--no-open-browser"]
+    )
+    served_override = runner.invoke(
         app,
-        ["serve", "--workspace", str(workspace), "--host", "127.0.0.1", "--port", "9001"],
+        [
+            "serve",
+            "--workspace",
+            str(workspace),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9001",
+            "--no-open-browser",
+        ],
     )
     demonstrated = runner.invoke(app, ["demo", "--port", "9002"])
 
-    assert served.exit_code == 0, served.output
+    assert launched.exit_code == 0, launched.output
+    assert served_default.exit_code == 0, served_default.output
+    assert served_override.exit_code == 0, served_override.output
     assert demonstrated.exit_code == 0, demonstrated.output
-    assert launched[0][1:] == ("127.0.0.1", 9001)
-    assert launched[1][1:] == ("127.0.0.1", 9002)
-    assert launched[1][0].state.settings.suggested_task == DEMO_TASK
-    assert launched[1][0].state.settings.demo_mode is True
+    assert servers[0][1:] == ("127.0.0.1", 8765)
+    assert servers[0][0].state.settings.workspace == default_root.resolve()
+    assert "Direct-task root:" in launched.output
+    assert servers[1][1:] == ("127.0.0.1", 9000)
+    assert servers[1][0].state.settings.workspace == default_root.resolve()
+    assert servers[2][1:] == ("127.0.0.1", 9001)
+    assert servers[2][0].state.settings.workspace == workspace.resolve()
+    assert servers[3][1:] == ("127.0.0.1", 9002)
+    assert servers[3][0].state.settings.suggested_task == DEMO_TASK
+    assert servers[3][0].state.settings.demo_mode is True
+    assert opened == ["http://127.0.0.1:8765"]
     assert "task is prefilled" in demonstrated.output
 
 
 def test_cli_help_is_available() -> None:
     result = CliRunner().invoke(app, ["--help"])
+    serve_help = CliRunner().invoke(app, ["serve", "--help"])
 
     assert result.exit_code == 0
     assert "local coding agent" in result.output
     assert "doctor" in result.output
+    assert serve_help.exit_code == 0
+    assert "[required]" not in serve_help.output
+
+
+def test_browser_open_waits_for_the_traceforge_healthcheck(monkeypatch) -> None:
+    readiness = iter([False, True])
+    opened: list[str] = []
+    monkeypatch.setattr("traceforge.cli._server_ready", lambda _url: next(readiness))
+    monkeypatch.setattr("traceforge.cli.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("traceforge.cli.webbrowser.open", opened.append)
+
+    assert _wait_for_server_and_open("http://127.0.0.1:8765", timeout=1) is True
+    assert opened == ["http://127.0.0.1:8765"]
+    assert _browser_url("0.0.0.0", 8765) == "http://127.0.0.1:8765"
+    assert _browser_url("::", 8765) == "http://127.0.0.1:8765"
+    assert _browser_url("::1", 8765) == "http://[::1]:8765"
+
+
+def test_server_ready_rejects_an_unrelated_service(monkeypatch) -> None:
+    response = SimpleNamespace(status=200)
+    monkeypatch.setattr(
+        "traceforge.cli.urlopen", lambda *_args, **_kwargs: nullcontext(response)
+    )
+    monkeypatch.setattr(
+        "traceforge.cli.json.load", lambda _response: {"status": "ok", "version": "other"}
+    )
+
+    assert _server_ready("http://127.0.0.1:8765") is False
+
+    monkeypatch.setattr(
+        "traceforge.cli.json.load",
+        lambda _response: {"status": "ok", "version": __version__},
+    )
+    assert _server_ready("http://127.0.0.1:8765") is True
 
 
 def test_doctor_reports_readiness_without_exposing_credentials(tmp_path, monkeypatch) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
     data_dir = tmp_path / "data"
     data_dir.mkdir()
+    default_root = tmp_path / "TraceForge"
     monkeypatch.setattr(config_module, "user_data_path", lambda *args, **kwargs: data_dir)
+    monkeypatch.setattr(config_module, "_default_workspace_path", lambda: default_root)
     monkeypatch.setattr("traceforge.cli.platform.system", lambda: "Darwin")
     monkeypatch.setattr(
         "traceforge.cli._available_port",
@@ -89,15 +159,16 @@ def test_doctor_reports_readiness_without_exposing_credentials(tmp_path, monkeyp
 
     result = CliRunner().invoke(
         app,
-        ["doctor", "--workspace", str(workspace), "--probe-model"],
+        ["doctor", "--probe-model"],
     )
 
     assert result.exit_code == 0, result.output
-    assert "[PASS] Workspace write" in result.output
+    assert "[PASS] Direct-task root write" in result.output
     assert "[PASS] Command sandbox" in result.output
     assert "[PASS] Model credential" in result.output
     assert "[PASS] Model probe" in result.output
     assert "READY TO SERVE" in result.output
+    assert default_root.is_dir()
     assert "never-print-this-value" not in result.output
 
 

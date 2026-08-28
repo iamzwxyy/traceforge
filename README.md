@@ -31,9 +31,10 @@ Its differentiator is a defensible engineering loop with useful human control.
 - **Conversation without losing the Trace.** Follow-up prompts continue the same task and preserve
   prior turn summaries, workspace, and evidence. The main feed reads like a coding conversation;
   the exact plan, tools, checks, and review stay one click away in a collapsed Trace and inspector.
-- **Low-friction workspaces.** A direct task automatically receives an isolated folder under the
-  configured default root. Projects use macOS's native folder picker when available and keep
-  their runs nested under a collapsible folder. Neither mode uploads files.
+- **Low-friction workspaces.** The app starts without a workspace argument. A direct task
+  automatically receives an isolated folder under the visible `Documents/TraceForge` root;
+  existing code is selected inside the UI. Projects use macOS's native folder picker when
+  available and keep their runs nested under a collapsible folder. Neither mode uploads files.
 - **Layered, inspectable command isolation.** Routine and planned commands run under macOS
   Seatbelt or Linux Bubblewrap when available; the UI and Proof Pack distinguish enforced,
   user-approved bypass, and policy-only execution instead of presenting approval as a sandbox.
@@ -63,18 +64,26 @@ read-only and unrelated prompts are rejected instead of being silently mapped on
 ## Run against your own workspaces
 
 TraceForge accepts an OpenAI-compatible Chat Completions endpoint with native tool calling.
-It can launch before credentials are configured:
+It can launch before credentials are configured, and the application no longer binds itself to a
+command-line workspace:
 
 ```bash
-uv run traceforge doctor --workspace /absolute/path/to/project --port 8765
-uv run traceforge serve --workspace /absolute/path/to/project --port 8765
+uv run traceforge
 ```
 
-`doctor` checks workspace and state-directory writes, SQLite startup/migrations, the packaged web
-bundle, listen-address availability, OS sandbox enforcement, and the configured credential source
-without printing its value. Missing model setup is a warning because the UI can configure it. For
-a strict preflight after configuration, add `--require-os-sandbox --probe-model`; the latter makes
-one real native tool-call request and fails if the selected model cannot complete it.
+The first launch creates `Documents/TraceForge` as the visible root for isolated direct tasks and
+opens the local UI in your browser. Use `traceforge serve --no-open-browser` in a headless shell.
+Open existing code from **添加项目** in the UI; each run is sandboxed against its actual direct-task
+directory or selected project root, not the application startup directory. `traceforge serve`
+remains an explicit alias, and `--workspace /absolute/path` remains an optional advanced override
+for the direct-task root.
+
+`uv run traceforge doctor` is an optional preflight. It checks direct-task-root and state-directory
+writes, SQLite startup/migrations, the packaged web bundle, listen-address availability, OS sandbox
+enforcement, and the configured credential source without printing its value. Missing model setup
+is a warning because the UI can configure it. For a strict preflight after configuration, add
+`--require-os-sandbox --probe-model`; the latter makes one real native tool-call request and fails
+if the selected model cannot complete it.
 
 Open <http://127.0.0.1:8765>, then use the settings button to choose the model, compatible base
 URL, and API key. TraceForge atomically writes the key to an owner-only (`0600`) file in its local
@@ -85,9 +94,9 @@ file.
 Click **新建任务** to enter only the request; press Enter to submit or Shift+Enter for a newline.
 The optional **计划模式** toggle is off by default. Leave it off for the normal Agent flow, or
 turn it on when you want to review and download the plan before any implementation. TraceForge
-creates a unique task directory beneath
-the `--workspace` default root. Click **添加项目** to select a reusable project root, then use the
-plus button beside that folder for project-scoped tasks. Direct runs stay at the top level. After a
+creates a unique task directory beneath the visible default root. Click **添加项目** to select a
+reusable project root in the application, then use the plus button beside that folder for
+project-scoped tasks. Direct runs stay at the top level. After a
 turn finishes, use the bottom composer to continue in the same task; each follow-up can choose its
 own Agent or Plan mode.
 
@@ -100,6 +109,7 @@ Environment variables remain available as a non-persisted fallback:
 | `OPENAI_BASE_URL` | no | OpenAI-compatible endpoint |
 | `TRACEFORGE_CONTEXT_LIMIT` | no | Token-window estimate; defaults to 64,000 |
 | `TRACEFORGE_MODEL_TIMEOUT` | no | Per-attempt model timeout in seconds; defaults to 180 |
+| `TRACEFORGE_WORKSPACE_ROOT` | no | Advanced override for the direct-task root |
 
 Before the first real run, use **Test connection**. The probe requires the selected model to
 complete a native function call, so a successful HTTP response alone is not treated as readiness.
@@ -160,7 +170,7 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
 ```
 
-The current suite has 122 backend tests at 86.77% coverage (with a hard 85% gate), eight frontend
+The current suite has 127 backend tests at 86.90% coverage (with a hard 85% gate), eight frontend
 unit tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.

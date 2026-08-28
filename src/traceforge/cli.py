@@ -1,22 +1,38 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import platform
 import shutil
 import socket
 import sqlite3
+import time
+import webbrowser
 from importlib import resources
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
+from threading import Thread
 from typing import Annotated
+from urllib.request import urlopen
 
 import typer
 
+from traceforge import __version__
+
 app = typer.Typer(
     name="traceforge",
-    help="A local coding agent that proves its work.",
-    no_args_is_help=True,
+    help="A local coding agent that proves its work. Run without a command to launch the UI.",
+    no_args_is_help=False,
+    invoke_without_command=True,
 )
+
+
+@app.callback()
+def launch(ctx: typer.Context) -> None:
+    """Launch TraceForge, or choose a command for advanced workflows."""
+
+    if ctx.invoked_subcommand is None:
+        _serve_application(None, host="127.0.0.1", port=8765, open_browser=True)
 
 
 def _writable_directory(directory: Path) -> tuple[bool, str]:
@@ -54,8 +70,14 @@ def _doctor_line(status: str, label: str, detail: str) -> None:
 @app.command()
 def doctor(
     workspace: Annotated[
-        Path, typer.Option(exists=True, file_okay=False, resolve_path=True)
-    ],
+        Path | None,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            resolve_path=True,
+            help="Optional direct-task root to check instead of Documents/TraceForge.",
+        ),
+    ] = None,
     host: Annotated[str, typer.Option(help="Bind address to check.")] = "127.0.0.1",
     port: Annotated[int, typer.Option(min=1, max=65535)] = 8765,
     require_os_sandbox: Annotated[
@@ -82,7 +104,7 @@ def doctor(
     failures += not supported
 
     write_targets = (
-        ("Workspace write", settings.workspace),
+        ("Direct-task root write", settings.workspace),
         ("State write", settings.data_dir),
     )
     for label, directory in write_targets:
@@ -193,19 +215,79 @@ def doctor(
 @app.command()
 def serve(
     workspace: Annotated[
-        Path, typer.Option(exists=True, file_okay=False, resolve_path=True)
-    ],
+        Path | None,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            resolve_path=True,
+            help="Optional direct-task root override; defaults to Documents/TraceForge.",
+        ),
+    ] = None,
     host: Annotated[str, typer.Option(help="Bind address.")] = "127.0.0.1",
     port: Annotated[int, typer.Option(min=1, max=65535)] = 8765,
+    open_browser: Annotated[
+        bool, typer.Option(help="Open the local UI after the server starts.")
+    ] = True,
 ) -> None:
     """Run the local TraceForge web application."""
+
+    _serve_application(workspace, host=host, port=port, open_browser=open_browser)
+
+
+def _serve_application(
+    workspace: Path | None, *, host: str, port: int, open_browser: bool
+) -> None:
     import uvicorn
 
     from traceforge.api import create_app
     from traceforge.config import Settings
 
     settings = Settings.from_env(workspace, require_api_key=False)
+    url = _browser_url(host, port)
+    typer.echo(f"Direct-task root: {settings.workspace}")
+    typer.echo(f"Open {url}")
+    if open_browser:
+        _schedule_browser_open(url)
     uvicorn.run(create_app(settings), host=host, port=port)
+
+
+def _schedule_browser_open(url: str) -> None:
+    thread = Thread(target=_wait_for_server_and_open, args=(url,), daemon=True)
+    thread.start()
+
+
+def _browser_url(host: str, port: int) -> str:
+    browser_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    if ":" in browser_host and not browser_host.startswith("["):
+        browser_host = f"[{browser_host}]"
+    return f"http://{browser_host}:{port}"
+
+
+def _wait_for_server_and_open(url: str, *, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _server_ready(url):
+            webbrowser.open(url)
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _server_ready(url: str) -> bool:
+    try:
+        with urlopen(f"{url}/healthz", timeout=0.5) as response:
+            payload: object = json.load(response)
+            if not isinstance(payload, dict):
+                return False
+            return all(
+                (
+                    response.status == 200,
+                    payload.get("status") == "ok",
+                    payload.get("version") == __version__,
+                )
+            )
+    except (OSError, ValueError):
+        return False
 
 
 @app.command()

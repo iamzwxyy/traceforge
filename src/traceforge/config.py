@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from platformdirs import user_data_path
+from platformdirs import user_data_path, user_documents_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,11 +29,22 @@ class Settings:
     demo_mode: bool = False
 
     @classmethod
-    def from_env(cls, workspace: Path, *, require_api_key: bool = True) -> Settings:
+    def from_env(
+        cls, workspace: Path | None = None, *, require_api_key: bool = True
+    ) -> Settings:
+        selected_workspace = workspace or _default_workspace_path()
+        if workspace is None:
+            try:
+                # Existing roots may be intentionally shared; direct-task children are always 0700.
+                selected_workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ValueError(
+                    f"Default workspace root could not be created: {selected_workspace}"
+                ) from exc
         try:
-            resolved = workspace.expanduser().resolve(strict=True)
+            resolved = selected_workspace.expanduser().resolve(strict=True)
         except OSError as exc:
-            raise ValueError(f"Workspace is not a directory: {workspace}") from exc
+            raise ValueError(f"Workspace is not a directory: {selected_workspace}") from exc
         if not resolved.is_dir():
             raise ValueError(f"Workspace is not a directory: {resolved}")
         api_key = os.getenv("OPENAI_API_KEY", "")
@@ -54,6 +65,15 @@ class Settings:
     @property
     def masked_base_url(self) -> str:
         return self.base_url or "https://api.openai.com/v1"
+
+
+def _default_workspace_path() -> Path:
+    configured = os.getenv("TRACEFORGE_WORKSPACE_ROOT", "").strip()
+    return (
+        Path(configured).expanduser()
+        if configured
+        else user_documents_path() / "TraceForge"
+    )
 
 
 def _positive_int(name: str, default: int) -> int:
