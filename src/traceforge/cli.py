@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
+import hashlib
+import http.client
 import json
+import os
 import platform
+import secrets
+import shlex
 import shutil
 import socket
 import sqlite3
+import stat
 import time
 import webbrowser
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import Thread
-from typing import Annotated
-from urllib.request import urlopen
+from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 import typer
 
@@ -25,6 +34,264 @@ app = typer.Typer(
     no_args_is_help=False,
     invoke_without_command=True,
 )
+
+_INSTANCE_LOCK_NAME = "traceforge-instance.lock"
+_INSTANCE_RECORD_LIMIT = 4 * 1024
+_INSTANCE_STARTUP_WAIT_SECONDS = 5.0
+_INSTANCE_RETRY_INTERVAL_SECONDS = 0.1
+_HEALTH_RESPONSE_LIMIT = 8 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _InstanceRecord:
+    pid: int
+    url: str
+    version: str
+    instance_id: str | None
+    config_fingerprint: str | None
+
+
+@dataclass(slots=True)
+class _InstanceLock:
+    descriptor: int
+    path: Path
+
+    def publish(
+        self, url: str, *, instance_id: str, config_fingerprint: str
+    ) -> None:
+        payload = json.dumps(
+            {
+                "config_fingerprint": config_fingerprint,
+                "instance_id": instance_id,
+                "pid": os.getpid(),
+                "url": url,
+                "version": __version__,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(payload) > _INSTANCE_RECORD_LIMIT:
+            raise ValueError("TraceForge instance metadata is unexpectedly large")
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        os.ftruncate(self.descriptor, 0)
+        os.write(self.descriptor, payload)
+        os.fsync(self.descriptor)
+
+    def close(self) -> None:
+        if self.descriptor < 0:
+            return
+        descriptor = self.descriptor
+        self.descriptor = -1
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+class _InstanceBusy(Exception):
+    def __init__(self, record: _InstanceRecord | None) -> None:
+        super().__init__("another TraceForge process holds the instance lock")
+        self.record = record
+
+
+def _read_instance_record(descriptor: int) -> _InstanceRecord | None:
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        raw_record = os.read(descriptor, _INSTANCE_RECORD_LIMIT + 1)
+        if not raw_record or len(raw_record) > _INSTANCE_RECORD_LIMIT:
+            return None
+        payload = json.loads(raw_record)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pid = payload.get("pid")
+    url = payload.get("url")
+    version = payload.get("version")
+    instance_id = payload.get("instance_id")
+    config_fingerprint = payload.get("config_fingerprint")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(url, str)
+        or len(url) > 2_048
+        or _health_target(url) is None
+        or not isinstance(version, str)
+        or not _valid_optional_instance_identity(instance_id, config_fingerprint)
+    ):
+        return None
+    return _InstanceRecord(
+        pid=pid,
+        url=url,
+        version=version,
+        instance_id=instance_id,
+        config_fingerprint=config_fingerprint,
+    )
+
+
+def _valid_optional_instance_identity(
+    instance_id: object, config_fingerprint: object
+) -> bool:
+    if instance_id is None and config_fingerprint is None:
+        return True
+    return bool(
+        isinstance(instance_id, str)
+        and 16 <= len(instance_id) <= 128
+        and all(character.isalnum() or character in "-_" for character in instance_id)
+        and isinstance(config_fingerprint, str)
+        and len(config_fingerprint) == 64
+        and all(character in "0123456789abcdef" for character in config_fingerprint)
+    )
+
+
+def _acquire_instance_lock(data_dir: Path) -> _InstanceLock:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    path = data_dir / _INSTANCE_LOCK_NAME
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError(errno.EINVAL, "instance lock is not a regular file", path)
+        if file_stat.st_uid != os.getuid() or file_stat.st_nlink != 1:
+            raise OSError(errno.EPERM, "instance lock has unsafe ownership or links", path)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            record = _read_instance_record(descriptor)
+            raise _InstanceBusy(record) from exc
+        os.fchmod(descriptor, 0o600)
+        # A new owner must not expose a stale healthy URL while it is still starting.
+        os.ftruncate(descriptor, 0)
+        return _InstanceLock(descriptor=descriptor, path=path)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _reuse_existing_instance(
+    record: _InstanceRecord | None,
+    *,
+    config_fingerprint: str,
+    open_browser: bool,
+) -> bool:
+    if (
+        record is None
+        or record.version != __version__
+        or record.instance_id is None
+        or record.config_fingerprint != config_fingerprint
+        or not _server_ready(
+            record.url,
+            instance_id=record.instance_id,
+        )
+    ):
+        return False
+    typer.echo(f"TraceForge is already running at {record.url}")
+    if open_browser:
+        webbrowser.open(record.url)
+    return True
+
+
+def _acquire_or_reuse_instance(
+    data_dir: Path,
+    *,
+    config_fingerprint: str,
+    open_browser: bool,
+    wait_timeout: float,
+) -> _InstanceLock | None:
+    deadline = time.monotonic() + max(0.0, wait_timeout)
+    while True:
+        try:
+            return _acquire_instance_lock(data_dir)
+        except _InstanceBusy as exc:
+            record = exc.record
+            if _reuse_existing_instance(
+                record,
+                config_fingerprint=config_fingerprint,
+                open_browser=open_browser,
+            ):
+                return None
+            if (
+                record is not None
+                and (
+                    record.version != __version__
+                    or record.instance_id is None
+                    or record.config_fingerprint != config_fingerprint
+                )
+            ):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(_INSTANCE_RETRY_INTERVAL_SECONDS, remaining))
+
+
+def _instance_fingerprint(workspace: Path, *, host: str, port: int) -> str:
+    payload = json.dumps(
+        {
+            "host": host.strip().lower(),
+            "port": port,
+            "workspace": str(workspace),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _reserve_listener(host: str, port: int) -> socket.socket:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    listener = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((host, port))
+        listener.listen(2_048)
+        listener.set_inheritable(False)
+    except BaseException:
+        listener.close()
+        raise
+    return listener
+
+
+def _suggested_port(host: str) -> int:
+    with _reserve_listener(host, 0) as listener:
+        address = listener.getsockname()
+        return int(address[1])
+
+
+def _retry_command(
+    command: str,
+    *,
+    host: str,
+    port: int,
+    workspace: Path | None = None,
+    open_browser: bool = True,
+) -> str:
+    arguments = ["uv", "run", "traceforge", command]
+    if workspace is not None:
+        arguments.extend(("--workspace", str(workspace)))
+    if host != "127.0.0.1":
+        arguments.extend(("--host", host))
+    arguments.extend(("--port", str(port)))
+    if command == "serve" and not open_browser:
+        arguments.append("--no-open-browser")
+    return shlex.join(arguments)
+
+
+def _run_server(
+    application: Any,
+    listener: socket.socket,
+    *,
+    host: str,
+    port: int,
+) -> None:
+    import uvicorn
+
+    config = uvicorn.Config(application, host=host, port=port)
+    uvicorn.Server(config).run(sockets=[listener])
 
 
 @app.callback()
@@ -235,59 +502,252 @@ def serve(
 
 
 def _serve_application(
-    workspace: Path | None, *, host: str, port: int, open_browser: bool
+    workspace: Path | None,
+    *,
+    host: str,
+    port: int,
+    open_browser: bool,
+    startup_wait: float | None = None,
 ) -> None:
-    import uvicorn
-
-    from traceforge.api import create_app
     from traceforge.config import Settings
 
     settings = Settings.from_env(workspace, require_api_key=False)
     url = _browser_url(host, port)
-    typer.echo(f"Direct-task root: {settings.workspace}")
-    typer.echo(f"Open {url}")
-    if open_browser:
-        _schedule_browser_open(url)
-    uvicorn.run(create_app(settings), host=host, port=port)
+    config_fingerprint = _instance_fingerprint(settings.workspace, host=host, port=port)
+    instance_id = secrets.token_urlsafe(24)
+    wait_timeout = (
+        _INSTANCE_STARTUP_WAIT_SECONDS if startup_wait is None else startup_wait
+    )
+    try:
+        instance_lock = _acquire_or_reuse_instance(
+            settings.data_dir,
+            config_fingerprint=config_fingerprint,
+            open_browser=open_browser,
+            wait_timeout=wait_timeout,
+        )
+    except _InstanceBusy as exc:
+        if exc.record is None:
+            reason = "the owning process has not published a complete startup record"
+        elif exc.record.version != __version__:
+            reason = (
+                f"pid {exc.record.pid} reports version {exc.record.version}; "
+                f"this command is version {__version__}"
+            )
+        elif exc.record.instance_id is None:
+            reason = (
+                f"pid {exc.record.pid} uses an older instance-lock protocol; "
+                "stop that TraceForge process before starting this version"
+            )
+        elif exc.record.config_fingerprint != config_fingerprint:
+            reason = (
+                f"pid {exc.record.pid} at {exc.record.url} was started with a different "
+                "workspace, host, or port configuration; stop it before changing the "
+                "launch configuration"
+            )
+        else:
+            reason = (
+                f"pid {exc.record.pid} recorded {exc.record.url}, but its matching "
+                "instance health endpoint is not ready or reachable"
+            )
+        typer.echo(
+            "TraceForge could not start: another process holds the instance lock, "
+            f"and {reason}.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    except OSError as exc:
+        typer.echo(f"TraceForge could not secure its instance lock: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if instance_lock is None:
+        return
+
+    try:
+        legacy_url = _find_legacy_instance(url, include_default=port != 8_765)
+        if legacy_url is not None:
+            _stop_for_legacy_instance(legacy_url)
+        try:
+            listener = _reserve_listener(host, port)
+        except OSError as exc:
+            if _legacy_server_ready(url):
+                _stop_for_legacy_instance(url)
+            try:
+                retry_port = _suggested_port(host)
+            except OSError:
+                retry_port = port + 1 if port < 65_535 else port - 1
+            retry = _retry_command(
+                "serve",
+                host=host,
+                port=retry_port,
+                workspace=workspace,
+                open_browser=open_browser,
+            )
+            typer.echo(
+                f"TraceForge could not bind {host}:{port}: {exc}. Retry with: {retry}",
+                err=True,
+            )
+            raise typer.Exit(code=1) from exc
+
+        with listener:
+            instance_lock.publish(
+                url,
+                instance_id=instance_id,
+                config_fingerprint=config_fingerprint,
+            )
+            from traceforge.api import create_app
+
+            application = create_app(
+                settings,
+                instance_id=instance_id,
+                instance_config_fingerprint=config_fingerprint,
+            )
+            typer.echo(f"Direct-task root: {settings.workspace}")
+            typer.echo(f"Open {url}")
+            if open_browser:
+                _schedule_browser_open(
+                    url,
+                    instance_id=instance_id,
+                )
+            _run_server(application, listener, host=host, port=port)
+    finally:
+        instance_lock.close()
 
 
-def _schedule_browser_open(url: str) -> None:
-    thread = Thread(target=_wait_for_server_and_open, args=(url,), daemon=True)
+def _find_legacy_instance(requested_url: str, *, include_default: bool) -> str | None:
+    candidates = [requested_url]
+    default_url = _browser_url("127.0.0.1", 8_765)
+    if include_default and default_url not in candidates:
+        candidates.append(default_url)
+    for candidate in candidates:
+        if _legacy_server_ready(candidate):
+            return candidate
+    return None
+
+
+def _stop_for_legacy_instance(url: str) -> None:
+    typer.echo(
+        "TraceForge could not start: an older TraceForge instance is already running "
+        f"at {url} without the current instance-lock protocol. Stop that process before "
+        "starting this version; a second server was not started.",
+        err=True,
+    )
+    raise typer.Exit(code=1)
+
+
+def _schedule_browser_open(url: str, *, instance_id: str) -> None:
+    thread = Thread(
+        target=_wait_for_server_and_open,
+        args=(url,),
+        kwargs={"instance_id": instance_id},
+        daemon=True,
+    )
     thread.start()
 
 
 def _browser_url(host: str, port: int) -> str:
-    browser_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    browser_host = "127.0.0.1" if host == "0.0.0.0" else host
+    if browser_host == "::":
+        browser_host = "::1"
     if ":" in browser_host and not browser_host.startswith("["):
         browser_host = f"[{browser_host}]"
     return f"http://{browser_host}:{port}"
 
 
-def _wait_for_server_and_open(url: str, *, timeout: float = 10.0) -> bool:
+def _wait_for_server_and_open(
+    url: str,
+    *,
+    timeout: float = 10.0,
+    instance_id: str | None = None,
+) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if _server_ready(url):
+        if _server_ready(
+            url,
+            instance_id=instance_id,
+        ):
             webbrowser.open(url)
             return True
         time.sleep(0.1)
     return False
 
 
-def _server_ready(url: str) -> bool:
+def _health_target(url: str) -> tuple[str, int] | None:
     try:
-        with urlopen(f"{url}/healthz", timeout=0.5) as response:
-            payload: object = json.load(response)
-            if not isinstance(payload, dict):
-                return False
-            return all(
-                (
-                    response.status == 200,
-                    payload.get("status") == "ok",
-                    payload.get("version") == __version__,
-                )
-            )
-    except (OSError, ValueError):
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
+        return parsed.hostname, parsed.port or 80
+    except ValueError:
+        return None
+
+
+def _health_payload(url: str) -> dict[str, Any] | None:
+    target = _health_target(url)
+    if target is None:
+        return None
+    host, port = target
+    connection: http.client.HTTPConnection | None = None
+    try:
+        connection = http.client.HTTPConnection(host, port, timeout=0.5)
+        connection.request(
+            "GET",
+            "/healthz",
+            headers={"Accept": "application/json", "Connection": "close"},
+        )
+        response = connection.getresponse()
+        if response.status != 200:
+            return None
+        raw_payload = response.read(_HEALTH_RESPONSE_LIMIT + 1)
+        if len(raw_payload) > _HEALTH_RESPONSE_LIMIT:
+            return None
+        payload: object = json.loads(raw_payload.decode("utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except (
+        OSError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        http.client.HTTPException,
+    ):
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _server_ready(
+    url: str,
+    *,
+    instance_id: str | None = None,
+) -> bool:
+    payload = _health_payload(url)
+    if payload is None:
         return False
+    if payload.get("status") != "ok" or payload.get("version") != __version__:
+        return False
+    if instance_id is None:
+        return True
+    return payload.get("instance_id") == instance_id
+
+
+def _legacy_server_ready(url: str) -> bool:
+    payload = _health_payload(url)
+    version = payload.get("version") if payload is not None else None
+    return bool(
+        payload is not None
+        and payload.get("status") == "ok"
+        and isinstance(version, str)
+        and 0 < len(version.strip()) <= 128
+        and "instance_id" not in payload
+    )
 
 
 @app.command()
@@ -296,34 +756,54 @@ def demo(
     port: Annotated[int, typer.Option(min=1, max=65535)] = 8765,
 ) -> None:
     """Launch a disposable, zero-credential demonstration workspace."""
-    import uvicorn
-
-    from traceforge.api import create_app
-    from traceforge.config import Settings
-    from traceforge.demo import DEMO_TASK, scripted_demo_provider
-
-    development_source = (
-        Path(__file__).resolve().parents[2] / "demo" / "tenant-cache-api"
-    )
-    packaged_source = resources.files("traceforge").joinpath("demo_workspace")
-    source = development_source if development_source.is_dir() else packaged_source
-    with resources.as_file(source) as source_path, TemporaryDirectory(
-        prefix="traceforge-demo-"
-    ) as temporary:
-        temporary_root = Path(temporary)
-        workspace = temporary_root / "tenant-cache-api"
-        shutil.copytree(source_path, workspace)
-        settings = Settings(
-            workspace=workspace,
-            data_dir=temporary_root / "data",
-            api_key="",
-            base_url=None,
-            model="scripted-demo",
-            suggested_task=DEMO_TASK,
-            demo_mode=True,
+    try:
+        listener = _reserve_listener(host, port)
+    except OSError as exc:
+        try:
+            retry_port = _suggested_port(host)
+        except OSError:
+            retry_port = port + 1 if port < 65_535 else port - 1
+        retry = _retry_command("demo", host=host, port=retry_port)
+        typer.echo(
+            f"TraceForge demo could not bind {host}:{port}: {exc}. Retry with: {retry}",
+            err=True,
         )
-        typer.echo(f"Demo workspace: {workspace}")
-        typer.echo(f"Open http://{host}:{port} — the task is prefilled for you.")
-        uvicorn.run(
-            create_app(settings, provider=scripted_demo_provider()), host=host, port=port
+        raise typer.Exit(code=1) from exc
+
+    with listener:
+        from traceforge.api import create_app
+        from traceforge.config import Settings
+        from traceforge.demo import DEMO_TASK, scripted_demo_provider
+
+        development_source = (
+            Path(__file__).resolve().parents[2] / "demo" / "tenant-cache-api"
         )
+        packaged_source = resources.files("traceforge").joinpath("demo_workspace")
+        source = development_source if development_source.is_dir() else packaged_source
+        with resources.as_file(source) as source_path, TemporaryDirectory(
+            prefix="traceforge-demo-"
+        ) as temporary:
+            temporary_root = Path(temporary)
+            workspace = temporary_root / "tenant-cache-api"
+            shutil.copytree(source_path, workspace)
+            settings = Settings(
+                workspace=workspace,
+                data_dir=temporary_root / "data",
+                api_key="",
+                base_url=None,
+                model="scripted-demo",
+                suggested_task=DEMO_TASK,
+                demo_mode=True,
+            )
+            url = _browser_url(host, port)
+            instance_id = secrets.token_urlsafe(24)
+            config_fingerprint = _instance_fingerprint(workspace, host=host, port=port)
+            typer.echo(f"Demo workspace: {workspace}")
+            typer.echo(f"Open {url} — the task is prefilled for you.")
+            application = create_app(
+                settings,
+                provider=scripted_demo_provider(),
+                instance_id=instance_id,
+                instance_config_fingerprint=config_fingerprint,
+            )
+            _run_server(application, listener, host=host, port=port)

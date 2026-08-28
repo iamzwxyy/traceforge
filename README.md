@@ -94,11 +94,17 @@ uv run traceforge
 ```
 
 The first launch creates `Documents/TraceForge` as the visible root for isolated direct tasks and
-opens the local UI in your browser. Use `traceforge serve --no-open-browser` in a headless shell.
+opens the local UI in your browser. Use `uv run traceforge serve --no-open-browser` in a headless shell.
 Open existing code from **添加项目** in the UI; each run is sandboxed against its actual direct-task
-directory or selected project root, not the application startup directory. `traceforge serve`
+directory or selected project root, not the application startup directory. `uv run traceforge serve`
 remains an explicit alias, and `--workspace /absolute/path` remains an optional advanced override
-for the direct-task root.
+for the direct-task root. One owner-only lock protects each local data directory: a second launch
+reuses a healthy same-version instance only when its random identity and launch configuration also
+match, instead of rebuilding the application or rewriting active run state. A bounded readiness
+wait covers the first process's pre-health startup window, while an older TraceForge process without
+the new lock protocol is detected and refused rather than bypassed on another port. An unrelated
+process on the requested port fails before startup mutation and prints a copyable command with an
+available port.
 
 `uv run traceforge doctor` is an optional preflight. It checks direct-task-root and state-directory
 writes, SQLite startup/migrations, the packaged web bundle, listen-address availability, OS sandbox
@@ -108,9 +114,14 @@ is a warning because the UI can configure it. For a strict preflight after confi
 if the selected model cannot complete it.
 
 Open <http://127.0.0.1:8765>, then use the settings button to choose the model, compatible base
-URL, and API key. TraceForge atomically writes the key to an owner-only (`0600`) file in its local
-data directory; SQLite saves only that file's absolute path, and the value is never returned by
-the API or UI. Advanced users may instead reference an existing one-line owner-only credential
+URL, and API key. **测试并保存** keeps the draft key in request memory until the native tool-call
+probe succeeds, then writes it to a new owner-only (`0600`) file and atomically swaps the saved
+configuration. Managed keys live in a dedicated owner-only (`0700`) directory that rejects symbolic
+links; similarly named user-supplied credential files are never treated as managed files. The
+separate save-only path can retain an unverified draft for later testing but
+does not enable tasks. SQLite saves only the credential file's absolute path, and the value is never
+returned by the API or UI.
+Advanced users may instead reference an existing one-line owner-only credential
 file or set a model's documented context window. Leaving the context field empty uses an exact
 catalog entry only for a recognized model on its official endpoint; all other routes use the
 configurable conservative fallback. The resolved value and its source remain visible in settings.
@@ -159,8 +170,12 @@ Environment variables remain available as a non-persisted fallback:
 | `TRACEFORGE_MODEL_TIMEOUT` | no | Per-attempt model timeout in seconds; defaults to 180 |
 | `TRACEFORGE_WORKSPACE_ROOT` | no | Advanced override for the direct-task root |
 
-Before the first real run, use **Test connection**. The probe requires the selected model to
-complete a native function call, so a successful HTTP response alone is not treated as readiness.
+Before the first real run, use **测试并保存**. The probe exercises the unsaved draft in memory and
+requires the selected model to complete a native function call, so a successful HTTP response
+alone is not treated as readiness. Only a successful probe atomically replaces the saved route
+and credential reference; a rejected draft and its raw key are not persisted. Saving without a
+probe deliberately clears readiness, and new tasks, follow-ups, and resumes remain disabled until
+the current saved connection has been verified.
 
 ## How a run works
 
@@ -222,8 +237,8 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 235 backend tests at 88.02% coverage (with a hard 85% gate), 13 frontend
-unit tests, and 12 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 287 backend tests at 88.33% coverage (with a hard 85% gate), 13 frontend
+unit tests, and 15 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 

@@ -332,7 +332,7 @@ async def test_full_clarify_build_verify_flow(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Created result.txt", "evidence": ["check passed"]},
+                        arguments={"summary": "Created result.txt"},
                     )
                 ]
             ),
@@ -411,7 +411,7 @@ async def test_agent_mode_continues_without_plan_approval_but_stays_visible(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Created note", "evidence": ["diff"]},
+                        arguments={"summary": "Created note"},
                     )
                 ]
             ),
@@ -494,7 +494,9 @@ async def test_follow_up_continues_the_same_task_with_prior_turn_context(
                     ToolCall(
                         id="finish-1",
                         name="finish",
-                        arguments={"summary": "Reviewed the first request"},
+                        arguments={
+                            "summary": "Reviewed the first request",
+                        },
                     )
                 ]
             ),
@@ -508,7 +510,9 @@ async def test_follow_up_continues_the_same_task_with_prior_turn_context(
                     ToolCall(
                         id="finish-2",
                         name="finish",
-                        arguments={"summary": "Applied the follow-up review"},
+                        arguments={
+                            "summary": "Applied the follow-up review",
+                        },
                     )
                 ]
             ),
@@ -580,7 +584,7 @@ async def test_each_turn_persists_its_actual_native_edit_files(
                     ToolCall(
                         id="finish-1",
                         name="finish",
-                        arguments={"summary": "Created a.txt", "evidence": ["diff"]},
+                        arguments={"summary": "Created a.txt"},
                     )
                 ]
             ),
@@ -617,7 +621,7 @@ async def test_each_turn_persists_its_actual_native_edit_files(
                     ToolCall(
                         id="finish-2",
                         name="finish",
-                        arguments={"summary": "Updated both files", "evidence": ["diff"]},
+                        arguments={"summary": "Updated both files"},
                     )
                 ]
             ),
@@ -769,7 +773,6 @@ async def test_no_op_edit_keeps_passing_check_fresh_and_reports_no_changed_file(
                         name="finish",
                         arguments={
                             "summary": "Confirmed the existing file",
-                            "evidence": ["check"],
                         },
                     )
                 ]
@@ -844,7 +847,7 @@ async def test_planner_can_repair_invalid_structured_calls(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Created note", "evidence": ["diff"]},
+                        arguments={"summary": "Created note"},
                     )
                 ]
             ),
@@ -962,7 +965,7 @@ async def test_unknown_command_waits_for_explicit_approval(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Observed", "evidence": ["command was rejected"]},
+                        arguments={"summary": "Observed"},
                     )
                 ]
             ),
@@ -1029,7 +1032,7 @@ async def test_terminal_builder_and_verifier_drafts_are_not_published(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Reviewed", "evidence": ["plan"]},
+                        arguments={"summary": "Reviewed"},
                     )
                 ],
             ),
@@ -1062,6 +1065,687 @@ async def test_terminal_builder_and_verifier_drafts_are_not_published(
     ]
     assert len(completed_turns) == 1
     assert completed_turns[0].payload["summary"] == "Reviewed"
+
+
+@pytest.mark.parametrize("verifier_enabled", [False, True])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param({}, id="missing-summary"),
+        pytest.param({"summary": "   "}, id="blank-summary"),
+        pytest.param({"summary": 1}, id="non-string-summary"),
+        pytest.param(
+            {"summary": "Reviewed", "evidence": ["legacy claim"]},
+            id="legacy-evidence-forbidden",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_builder_rejects_malformed_finish_before_verification(
+    settings: Settings,
+    storage: Storage,
+    verifier_enabled: bool,
+    arguments: dict[str, object],
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="malformed-finish", name="finish", arguments=arguments)
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run(
+        "Review the workspace", verifier_enabled=verifier_enabled
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.FAILED
+    assert completed.verification is None
+    correction_request = provider.requests[-1][0]
+    result = json.loads(
+        next(
+            message["content"]
+            for message in correction_request
+            if message.get("tool_call_id") == "malformed-finish"
+        )
+    )
+    assert result["ok"] is False
+    assert "Invalid finish schema" in result["error"]
+    events = storage.get_events(run.id)
+    assert EventType.VERIFICATION_COMPLETED not in {event.type for event in events}
+    assert [
+        event.payload["id"]
+        for event in events
+        if event.type is EventType.TOOL_REQUESTED
+    ] == ["malformed-finish"]
+    assert [
+        event.payload["call"]["id"]
+        for event in events
+        if event.type is EventType.TOOL_COMPLETED
+    ] == ["malformed-finish"]
+    assert not [event for event in events if event.type is EventType.TOOL_STARTED]
+    rejected = next(
+        event for event in events if event.type is EventType.TOOL_COMPLETED
+    )
+    assert rejected.payload["result"]["metadata"] == {
+        "outcome": "protocol_rejected",
+        "execution": "not_started",
+    }
+
+
+@pytest.mark.asyncio
+async def test_builder_fails_after_three_consecutive_malformed_finish_batches(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            *[
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id=f"malformed-{index}", name="finish", arguments={})
+                    ]
+                )
+                for index in range(3)
+            ],
+        ],
+        repeat=True,
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Reject repeated malformed finish", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.FAILED
+    assert "three consecutive rejected" in (completed.error or "")
+    assert len(provider.requests) == 4
+    paired_ids = {
+        message.get("tool_call_id")
+        for message in completed.messages
+        if message.get("role") == "tool"
+    }
+    assert {f"malformed-{index}" for index in range(3)} <= paired_ids
+
+
+@pytest.mark.asyncio
+async def test_successful_builder_batch_resets_consecutive_rejection_budget(
+    settings: Settings, storage: Storage
+) -> None:
+    def malformed(call_id: str) -> ModelResponse:
+        return ModelResponse(
+            tool_calls=[ToolCall(id=call_id, name="finish", arguments={})]
+        )
+
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            malformed("malformed-1"),
+            malformed("malformed-2"),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="create",
+                        name="create_file",
+                        arguments={"path": "reset.txt", "content": "reset\n"},
+                    )
+                ]
+            ),
+            malformed("malformed-3"),
+            malformed("malformed-4"),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Created reset.txt"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Reset rejection budget", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert completed.step_count == 1
+    assert (settings.workspace / "reset.txt").read_text() == "reset\n"
+
+
+@pytest.mark.parametrize("finish_position", ["first", "last"])
+@pytest.mark.asyncio
+async def test_builder_rejects_entire_mixed_finish_batch_and_preserves_public_progress(
+    settings: Settings,
+    storage: Storage,
+    finish_position: str,
+) -> None:
+    finish = ToolCall(
+        id="mixed-finish",
+        name="finish",
+        arguments={"summary": "Not done"},
+    )
+    rejected_create = ToolCall(
+        id="mixed-create",
+        name="create_file",
+        arguments={"path": "rejected.txt", "content": "must not exist\n"},
+    )
+    mixed_calls = (
+        [finish, rejected_create]
+        if finish_position == "first"
+        else [rejected_create, finish]
+    )
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(content="Rejected mixed progress", tool_calls=mixed_calls),
+            ModelResponse(
+                content="Accepted progress",
+                tool_calls=[
+                    ToolCall(
+                        id="accepted-create",
+                        name="create_file",
+                        arguments={"path": "accepted.txt", "content": "created\n"},
+                    )
+                ],
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="valid-finish",
+                        name="finish",
+                        arguments={"summary": "Created accepted.txt"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Create the accepted file", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert completed.step_count == 1
+    assert not (settings.workspace / "rejected.txt").exists()
+    assert (settings.workspace / "accepted.txt").read_text() == "created\n"
+    correction_request = provider.requests[2][0]
+    rejected_results = {
+        message["tool_call_id"]: json.loads(message["content"])
+        for message in correction_request
+        if message.get("tool_call_id") in {"mixed-finish", "mixed-create"}
+    }
+    assert set(rejected_results) == {"mixed-finish", "mixed-create"}
+    assert all(result["ok"] is False for result in rejected_results.values())
+    assert all(
+        "No tool call in this response was executed" in result["error"]
+        for result in rejected_results.values()
+    )
+    tool_events = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TOOL_COMPLETED
+    ]
+    expected_ids = [call.id for call in mixed_calls] + ["accepted-create"]
+    assert [event.payload["call"]["id"] for event in tool_events] == expected_ids
+    assert all(
+        event.payload["result"]["metadata"]
+        == {"outcome": "protocol_rejected", "execution": "not_started"}
+        for event in tool_events[:2]
+    )
+    requested_ids = [
+        event.payload["id"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TOOL_REQUESTED
+    ]
+    assert requested_ids == expected_ids
+    started_ids = [
+        event.payload["id"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TOOL_STARTED
+    ]
+    assert started_ids == ["accepted-create"]
+    messages = [
+        event.payload["content"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.MESSAGE
+    ]
+    assert messages == ["Accepted progress"]
+
+
+@pytest.mark.parametrize("verifier_enabled", [False, True])
+@pytest.mark.parametrize("action_count", [1, 2], ids=["max-minus-one", "exact-max"])
+@pytest.mark.asyncio
+async def test_builder_action_budget_allows_finish_below_or_at_exact_limit(
+    settings: Settings,
+    storage: Storage,
+    verifier_enabled: bool,
+    action_count: int,
+) -> None:
+    limited = replace(settings, max_steps=2)
+    responses = [
+        ModelResponse(
+            tool_calls=[
+                ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+            ]
+        ),
+        *[
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id=f"create-{index}",
+                        name="create_file",
+                        arguments={
+                            "path": f"budget-{index}.txt",
+                            "content": f"{index}\n",
+                        },
+                    )
+                ]
+            )
+            for index in range(action_count)
+        ],
+        ModelResponse(
+            tool_calls=[
+                ToolCall(
+                    id="finish",
+                    name="finish",
+                    arguments={"summary": "Budget respected"},
+                )
+            ]
+        ),
+    ]
+    if verifier_enabled:
+        responses.append(_verification("pass", "The bounded actions satisfy the plan."))
+    provider = ScriptedProvider(responses)
+    manager = AgentManager(limited, storage, provider)
+
+    run = await manager.start_run(
+        "Exercise the action budget", verifier_enabled=verifier_enabled
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert completed.step_count == action_count
+    assert all(
+        (settings.workspace / f"budget-{index}.txt").exists()
+        for index in range(action_count)
+    )
+    finish_tool_names = {
+        schema["function"]["name"]
+        for schema in (provider.requests[action_count + 1][1] or [])
+    }
+    if action_count == limited.max_steps:
+        assert finish_tool_names == {"finish"}
+    else:
+        assert {"finish", "create_file", "update_plan"} <= finish_tool_names
+
+
+@pytest.mark.asyncio
+async def test_exact_action_budget_verifier_failure_stops_without_phantom_repair(
+    settings: Settings, storage: Storage
+) -> None:
+    limited = replace(settings, max_steps=1, max_repair_cycles=2)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="consume-budget",
+                        name="create_file",
+                        arguments={"path": "draft.txt", "content": "draft\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Draft created"},
+                    )
+                ]
+            ),
+            _verification("fail", "The draft does not satisfy the task."),
+            _verification("pass", "This response must never be requested."),
+        ]
+    )
+    manager = AgentManager(limited, storage, provider)
+
+    run = await manager.start_run("Produce a finished result")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.FAILED
+    assert completed.step_count == 1
+    assert completed.repair_cycles == 0
+    assert "total non-terminal tool action budget" in (completed.error or "")
+    assert len(provider.requests) == 4
+    events = storage.get_events(run.id)
+    assert sum(event.type is EventType.VERIFICATION_COMPLETED for event in events) == 1
+    assert EventType.REPAIR_STARTED not in {event.type for event in events}
+
+
+@pytest.mark.asyncio
+async def test_builder_rejects_over_budget_batch_before_executing_any_call(
+    settings: Settings, storage: Storage
+) -> None:
+    limited = replace(settings, max_steps=2)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="first",
+                        name="create_file",
+                        arguments={"path": "first.txt", "content": "first\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                content="Rejected over-budget progress",
+                tool_calls=[
+                    ToolCall(
+                        id="overflow-a",
+                        name="create_file",
+                        arguments={"path": "overflow-a.txt", "content": "a\n"},
+                    ),
+                    ToolCall(
+                        id="overflow-command",
+                        name="run_command",
+                        arguments={"argv": ["python3", "-V"]},
+                    ),
+                ],
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="second",
+                        name="create_file",
+                        arguments={"path": "second.txt", "content": "second\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Created two files"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(limited, storage, provider)
+
+    run = await manager.start_run("Stay within two actions", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert completed.step_count == 2
+    assert (settings.workspace / "first.txt").exists()
+    assert (settings.workspace / "second.txt").exists()
+    assert not (settings.workspace / "overflow-a.txt").exists()
+    correction_request = provider.requests[3][0]
+    overflow_results = {
+        message["tool_call_id"]: json.loads(message["content"])
+        for message in correction_request
+        if message.get("tool_call_id") in {"overflow-a", "overflow-command"}
+    }
+    assert set(overflow_results) == {"overflow-a", "overflow-command"}
+    assert all(result["ok"] is False for result in overflow_results.values())
+    assert all(
+        "1 remaining, 2 requested" in result["error"]
+        for result in overflow_results.values()
+    )
+    events = storage.get_events(run.id)
+    completed_events = [
+        event for event in events if event.type is EventType.TOOL_COMPLETED
+    ]
+    assert [event.payload["call"]["id"] for event in completed_events] == [
+        "first",
+        "overflow-a",
+        "overflow-command",
+        "second",
+    ]
+    assert all(
+        event.payload["result"]["metadata"]
+        == {"outcome": "protocol_rejected", "execution": "not_started"}
+        for event in completed_events[1:3]
+    )
+    assert [
+        event.payload["id"]
+        for event in events
+        if event.type is EventType.TOOL_STARTED
+    ] == ["first", "second"]
+    pack = build_proof_pack(completed, storage)
+    assert pack.command_sandbox.not_executed_commands == 1
+    assert [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.MESSAGE
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_builder_fails_after_three_consecutive_over_budget_batches(
+    settings: Settings, storage: Storage
+) -> None:
+    limited = replace(settings, max_steps=1)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="accepted",
+                        name="create_file",
+                        arguments={"path": "accepted.txt", "content": "accepted\n"},
+                    )
+                ]
+            ),
+            *[
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id=f"overflow-{index}",
+                            name="create_file",
+                            arguments={
+                                "path": f"overflow-{index}.txt",
+                                "content": "rejected\n",
+                            },
+                        )
+                    ]
+                )
+                for index in range(3)
+            ],
+        ],
+        repeat=True,
+    )
+    manager = AgentManager(limited, storage, provider)
+
+    run = await manager.start_run("Reject repeated overflow", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.FAILED
+    assert completed.step_count == 1
+    assert "three consecutive rejected" in (completed.error or "")
+    assert len(provider.requests) == 5
+    assert (settings.workspace / "accepted.txt").exists()
+    assert all(
+        not (settings.workspace / f"overflow-{index}.txt").exists()
+        for index in range(3)
+    )
+    paired_ids = {
+        message.get("tool_call_id")
+        for message in completed.messages
+        if message.get("role") == "tool"
+    }
+    assert {f"overflow-{index}" for index in range(3)} <= paired_ids
+
+
+@pytest.mark.asyncio
+async def test_rejected_finish_does_not_consume_budget_needed_for_command_check(
+    settings: Settings, storage: Storage
+) -> None:
+    limited = replace(settings, max_steps=2)
+    check = [
+        "python3",
+        "-c",
+        "from pathlib import Path; assert Path('checked.txt').read_text() == 'ready\\n'",
+    ]
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_plan_arguments(check))
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="create",
+                        name="create_file",
+                        arguments={"path": "checked.txt", "content": "ready\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="premature-finish",
+                        name="finish",
+                        arguments={"summary": "Ready"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="check", name="run_command", arguments={"argv": check})
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Created and checked"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(limited, storage, provider)
+
+    run = await manager.start_run("Create and check the file", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert completed.step_count == 2
+    assert completed.plan is not None
+    assert completed.plan.acceptance_checks[0].status.value == "passed"
+    correction_request = provider.requests[3][0]
+    premature_result = json.loads(
+        next(
+            message["content"]
+            for message in correction_request
+            if message.get("tool_call_id") == "premature-finish"
+        )
+    )
+    assert premature_result["ok"] is False
+    assert "fresh passing evidence" in premature_result["error"]
+    final_tool_names = {
+        schema["function"]["name"] for schema in (provider.requests[4][1] or [])
+    }
+    assert final_tool_names == {"finish"}
+
+
+@pytest.mark.asyncio
+async def test_finish_fails_immediately_when_budget_cannot_run_missing_command_check(
+    settings: Settings, storage: Storage
+) -> None:
+    limited = replace(settings, max_steps=1)
+    check = ["python3", "-c", "raise SystemExit(0)"]
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_plan_arguments(check))
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="consume-budget",
+                        name="create_file",
+                        arguments={"path": "created.txt", "content": "created\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="blocked-finish",
+                        name="finish",
+                        arguments={"summary": "Not checked"},
+                    )
+                ]
+            ),
+        ],
+        repeat=True,
+    )
+    manager = AgentManager(limited, storage, provider)
+
+    run = await manager.start_run("Do not finish without the command", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.FAILED
+    assert completed.step_count == 1
+    assert "before all command checks" in (completed.error or "")
+    assert len(provider.requests) == 3
+    blocked_result = json.loads(
+        next(
+            message["content"]
+            for message in completed.messages
+            if message.get("tool_call_id") == "blocked-finish"
+        )
+    )
+    assert blocked_result["ok"] is False
+    assert "fresh passing evidence" in blocked_result["error"]
 
 
 @pytest.mark.asyncio
@@ -1115,7 +1799,7 @@ async def test_builder_publishes_only_progress_backed_by_accepted_tools(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Reviewed", "evidence": ["plan"]},
+                        arguments={"summary": "Reviewed"},
                     )
                 ]
             ),
@@ -1154,7 +1838,7 @@ async def test_reasoning_effort_is_frozen_across_planner_builder_and_verifier(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Reviewed", "evidence": ["plan"]},
+                        arguments={"summary": "Reviewed"},
                     )
                 ],
             ),
@@ -1388,7 +2072,7 @@ async def test_builder_reuses_successful_planning_inspection(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Reviewed", "evidence": ["planner read"]},
+                        arguments={"summary": "Reviewed"},
                     )
                 ]
             ),
@@ -1431,7 +2115,7 @@ async def test_plan_revision_then_completion(settings: Settings, storage: Storag
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Reviewed", "evidence": ["plan approved"]},
+                        arguments={"summary": "Reviewed"},
                     )
                 ]
             ),
@@ -1485,7 +2169,7 @@ async def test_verifier_failure_triggers_one_repair_cycle(
                     ToolCall(
                         id="finish-1",
                         name="finish",
-                        arguments={"summary": "Draft", "evidence": ["file created"]},
+                        arguments={"summary": "Draft"},
                     )
                 ]
             ),
@@ -1509,7 +2193,7 @@ async def test_verifier_failure_triggers_one_repair_cycle(
                     ToolCall(
                         id="finish-2",
                         name="finish",
-                        arguments={"summary": "Final", "evidence": ["file repaired"]},
+                        arguments={"summary": "Final"},
                     )
                 ]
             ),
@@ -1569,7 +2253,7 @@ async def test_repair_cannot_reuse_a_passing_check_from_before_the_edit(
                     ToolCall(
                         id="finish-1",
                         name="finish",
-                        arguments={"summary": "Draft", "evidence": ["initial check"]},
+                        arguments={"summary": "Draft"},
                     )
                 ]
             ),
@@ -1593,7 +2277,7 @@ async def test_repair_cannot_reuse_a_passing_check_from_before_the_edit(
                     ToolCall(
                         id="finish-stale",
                         name="finish",
-                        arguments={"summary": "Final", "evidence": ["old check"]},
+                        arguments={"summary": "Final"},
                     )
                 ]
             ),
@@ -1605,7 +2289,7 @@ async def test_repair_cannot_reuse_a_passing_check_from_before_the_edit(
                     ToolCall(
                         id="finish-2",
                         name="finish",
-                        arguments={"summary": "Final", "evidence": ["fresh check"]},
+                        arguments={"summary": "Final"},
                     )
                 ]
             ),
@@ -1657,7 +2341,7 @@ async def test_verifier_failure_at_repair_limit_fails_run(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Done", "evidence": ["claimed"]},
+                        arguments={"summary": "Done"},
                     )
                 ]
             ),
@@ -1730,7 +2414,7 @@ async def test_approved_unknown_command_runs_once(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Ran", "evidence": ["approved output"]},
+                        arguments={"summary": "Ran"},
                     )
                 ]
             ),
@@ -1803,7 +2487,7 @@ async def test_manual_mode_asks_for_planned_edit_and_check_without_sandbox_bypas
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Approved", "evidence": ["check"]},
+                        arguments={"summary": "Approved"},
                     )
                 ]
             ),
@@ -1915,7 +2599,7 @@ async def test_full_access_auto_allows_scope_drift_but_not_hard_denials(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Created", "evidence": ["diff"]},
+                        arguments={"summary": "Created"},
                     )
                 ]
             ),
@@ -1974,7 +2658,7 @@ async def test_full_access_unknown_command_auto_runs_only_inside_enforced_sandbo
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Ran safely", "evidence": ["sandbox"]},
+                        arguments={"summary": "Ran safely"},
                     )
                 ]
             ),
@@ -2142,7 +2826,6 @@ async def test_restart_abandons_pending_approval_without_replaying_action(
                             name="finish",
                             arguments={
                                 "summary": "Inspected after restart",
-                                "evidence": ["no replay"],
                             },
                         )
                     ]
@@ -2188,7 +2871,7 @@ async def test_shutdown_resume_plan_then_rollback(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Resumed", "evidence": ["approved"]},
+                        arguments={"summary": "Resumed"},
                     )
                 ]
             )
@@ -2238,7 +2921,7 @@ async def test_transient_model_outage_pauses_and_resumes_without_losing_run(
                         ToolCall(
                             id="finish",
                             name="finish",
-                            arguments={"summary": "Reviewed", "evidence": ["workspace"]},
+                            arguments={"summary": "Reviewed"},
                         )
                     ]
                 ),
@@ -2300,11 +2983,16 @@ async def test_unexpected_provider_exception_never_leaves_a_ghost_run(
 
 
 @pytest.mark.asyncio
-async def test_resume_closes_an_incomplete_tool_call_without_replaying_it(
+async def test_resume_repairs_only_the_missing_result_in_a_partial_tool_batch(
     settings: Settings, storage: Storage
 ) -> None:
     interrupted_call = ModelResponse(
         tool_calls=[
+            ToolCall(
+                id="known-complete",
+                name="create_file",
+                arguments={"path": "known.txt", "content": "already handled\n"},
+            ),
             ToolCall(
                 id="unknown-side-effect",
                 name="create_file",
@@ -2321,7 +3009,20 @@ async def test_resume_closes_an_incomplete_tool_call_without_replaying_it(
         verifier_enabled=False,
         plan=TaskPlan.model_validate(_review_plan()),
         plan_approved=True,
-        messages=[interrupted_call],
+        messages=[
+            interrupted_call,
+            {
+                "role": "tool",
+                "tool_call_id": "known-complete",
+                "name": "create_file",
+                "content": ToolResult(
+                    tool_call_id="known-complete",
+                    name="create_file",
+                    ok=True,
+                    output="The first call already completed before interruption.",
+                ).model_dump_json(),
+            },
+        ],
     )
     storage.create_run(run)
     provider = ScriptedProvider(
@@ -2333,7 +3034,6 @@ async def test_resume_closes_an_incomplete_tool_call_without_replaying_it(
                         name="finish",
                         arguments={
                             "summary": "Recovered after inspection",
-                            "evidence": ["no action replayed"],
                         },
                     )
                 ]
@@ -2346,6 +3046,7 @@ async def test_resume_closes_an_incomplete_tool_call_without_replaying_it(
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED, completed.error
+    assert not (settings.workspace / "known.txt").exists()
     assert not (settings.workspace / "must-not-be-replayed.txt").exists()
     resumed = next(
         event
@@ -2358,7 +3059,14 @@ async def test_resume_closes_an_incomplete_tool_call_without_replaying_it(
         "incomplete_tool_calls_repaired": 1,
     }
     first_request = provider.requests[0][0]
-    synthetic = next(message for message in first_request if message.get("role") == "tool")
+    tool_messages = [
+        message for message in first_request if message.get("role") == "tool"
+    ]
+    assert [message["tool_call_id"] for message in tool_messages] == [
+        "known-complete",
+        "unknown-side-effect",
+    ]
+    synthetic = tool_messages[1]
     assert "stopped before this tool call completed" in synthetic["content"]
 
 
@@ -2399,7 +3107,7 @@ async def test_resume_preserves_persisted_fast_path_decision(
                         ToolCall(
                             id="finish",
                             name="finish",
-                            arguments={"summary": "Resumed", "evidence": ["plan"]},
+                            arguments={"summary": "Resumed"},
                         )
                     ]
                 )
@@ -2505,7 +3213,7 @@ async def test_verifier_reads_evidence_before_structured_verdict(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Ready", "evidence": ["evidence.txt"]},
+                        arguments={"summary": "Ready"},
                     )
                 ]
             ),
@@ -2593,7 +3301,7 @@ async def test_verifier_recovers_from_invalid_structured_report(
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Ready", "evidence": ["reviewed"]},
+                        arguments={"summary": "Ready"},
                     )
                 ]
             ),

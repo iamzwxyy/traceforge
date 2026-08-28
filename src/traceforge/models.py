@@ -139,6 +139,12 @@ class DirectResponse(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
 
 
+class FinishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+
+    summary: str = Field(min_length=1, max_length=4_000)
+
+
 class ClarificationAnswer(BaseModel):
     question_id: str
     option_id: str | None = None

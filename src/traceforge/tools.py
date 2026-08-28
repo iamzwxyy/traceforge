@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from traceforge.config import Settings
-from traceforge.models import ApprovalMode, TaskPlan, ToolCall, ToolResult
+from traceforge.models import ApprovalMode, FinishRequest, TaskPlan, ToolCall, ToolResult
 from traceforge.patching import FilePatch, PatchError, apply_file_patch, parse_unified_diff
 from traceforge.planning import is_safe_routine_check_variant
 from traceforge.sandbox import CommandSandbox, SandboxStatus
@@ -143,15 +143,17 @@ class ToolRegistry:
                 },
                 required=["argv"],
             ),
-            _tool_schema(
-                "finish",
-                "Request completion after all accepted checks have current evidence.",
-                {
-                    "summary": {"type": "string"},
-                    "evidence": {"type": "array", "items": {"type": "string"}},
+            {
+                "type": "function",
+                "function": {
+                    "name": "finish",
+                    "description": (
+                        "Request completion in a model turn containing no other tool calls, after "
+                        "all accepted command checks have current passing results."
+                    ),
+                    "parameters": FinishRequest.model_json_schema(),
                 },
-                required=["summary", "evidence"],
-            ),
+            },
         ]
 
     def assess(self, call: ToolCall, plan: TaskPlan | None) -> PermissionAssessment:

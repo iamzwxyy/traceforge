@@ -120,6 +120,8 @@ class ProviderConfigView(BaseModel):
     credential_file: str | None
     credential_env: str = "OPENAI_API_KEY"
     api_key_configured: bool
+    connection_verified: bool
+    verified_at: datetime | None
     context_window: int | None
     resolved_context_window: int
     context_window_source: Literal["configured", "catalog", "fallback"]
@@ -130,6 +132,16 @@ class ProviderConfigView(BaseModel):
     ]
     reasoning_effort_catalog_version: str
     updated_at: datetime
+
+
+class ProviderProbeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    model: str
+    latency_ms: int
+    detail: str
+    provider: ProviderConfigView
 
 
 class ClarificationAnswersRequest(BaseModel):
@@ -203,7 +215,15 @@ class RunView(BaseModel):
         return cls.model_validate(public)
 
 
-def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> FastAPI:
+def create_app(
+    settings: Settings,
+    *,
+    provider: ModelProvider | None = None,
+    instance_id: str | None = None,
+    instance_config_fingerprint: str | None = None,
+) -> FastAPI:
+    if (instance_id is None) != (instance_config_fingerprint is None):
+        raise ValueError("Instance identity and configuration fingerprint must be paired")
     storage = Storage(settings.data_dir / "traceforge.db")
     storage.mark_all_active_runs_interrupted()
     broker = EventBroker(storage)
@@ -226,6 +246,8 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
     app.state.storage = storage
     app.state.runtime = runtime
     app.state.broker = broker
+    app.state.instance_id = instance_id
+    app.state.instance_config_fingerprint = instance_config_fingerprint
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Any) -> Any:
@@ -282,7 +304,10 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     @app.get("/healthz")
     async def health() -> dict[str, str]:
-        return {"status": "ok", "version": __version__}
+        payload = {"status": "ok", "version": __version__}
+        if instance_id is not None:
+            payload["instance_id"] = instance_id
+        return payload
 
     @app.get("/api/status")
     async def get_status() -> dict[str, Any]:
@@ -296,6 +321,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             "model": config.model,
             "base_url": config.base_url or "https://api.openai.com/v1",
             "api_key_configured": runtime.credential_configured(config),
+            "connection_verified": runtime.connection_verified(),
             "suggested_task": settings.suggested_task,
             "mode": "demo" if settings.demo_mode else "standard",
             "sandbox": sandbox_status(settings.workspace).as_dict(),
@@ -330,6 +356,8 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
             credential_source=source,
             credential_file=selected.credential_file,
             api_key_configured=runtime.credential_configured(selected),
+            connection_verified=runtime.connection_verified(),
+            verified_at=storage.get_provider_verified_at(),
             context_window=selected.context_window,
             resolved_context_window=model_context.context_window,
             context_window_source=model_context.source,
@@ -357,9 +385,33 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         )
         return provider_view(saved)
 
-    @app.post("/api/provider/test")
-    async def test_provider_connection() -> dict[str, Any]:
-        return await runtime.test_connection()
+    @app.post("/api/provider/test", response_model=ProviderProbeResponse)
+    async def test_provider_connection(
+        body: UpdateProviderRequest | None = None,
+    ) -> ProviderProbeResponse:
+        if body is None:
+            result = await runtime.test_connection()
+        else:
+            result = await runtime.test_and_save_provider_config(
+                ProviderConfig(
+                    model=body.model,
+                    base_url=body.base_url,
+                    credential_file=body.credential_file,
+                    context_window=body.context_window,
+                ),
+                api_key=(
+                    body.api_key.get_secret_value()
+                    if body.api_key is not None
+                    else None
+                ),
+            )
+        return ProviderProbeResponse(
+            ok=bool(result["ok"]),
+            model=str(result["model"]),
+            latency_ms=int(result["latency_ms"]),
+            detail=str(result["detail"]),
+            provider=provider_view(),
+        )
 
     @app.get("/api/projects", response_model=list[ProjectRecord])
     async def list_projects() -> list[ProjectRecord]:
@@ -544,7 +596,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 "The fixed demo is a single-turn guided tour; use traceforge "
                 "for multi-turn tasks"
             )
-        run = await runtime.manager_for_run(run_id).follow_up(
+        run = await runtime.follow_up(
             run_id,
             body.prompt,
             mode=body.mode,
@@ -581,9 +633,7 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
     @app.post("/api/runs/{run_id}/resume", response_model=RunView)
     async def resume_run(run_id: str) -> RunView:
-        return RunView.from_record(
-            await runtime.manager_for_run(run_id).resume(run_id)
-        )
+        return RunView.from_record(await runtime.resume_run(run_id))
 
     @app.post("/api/runs/{run_id}/rollback")
     async def rollback_run(run_id: str) -> dict[str, list[str]]:
@@ -661,7 +711,11 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
 
 
 def _allowed_origin(origin: str) -> bool:
-    return bool(re.fullmatch(r"https?://(?:127\.0\.0\.1|localhost)(?::\d+)?", origin))
+    return bool(
+        re.fullmatch(
+            r"https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?", origin
+        )
+    )
 
 
 def _preferred_directory(storage: Storage, *, fallback: Path) -> Path:

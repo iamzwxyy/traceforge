@@ -161,6 +161,7 @@ export interface AppStatus {
   model: string;
   base_url: string;
   api_key_configured: boolean;
+  connection_verified: boolean;
   suggested_task: string | null;
   mode: "demo" | "standard";
   sandbox: {
@@ -192,6 +193,8 @@ export interface ProviderConfig {
   credential_file: string | null;
   credential_env: string;
   api_key_configured: boolean;
+  connection_verified: boolean;
+  verified_at: string | null;
   context_window: number | null;
   resolved_context_window: number;
   context_window_source: "configured" | "catalog" | "fallback";
@@ -215,6 +218,7 @@ export interface ProviderProbe {
   model: string;
   latency_ms: number;
   detail: string;
+  provider: ProviderConfig;
 }
 
 export interface DirectoryEntry {

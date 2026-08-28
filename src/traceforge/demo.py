@@ -216,10 +216,6 @@ def scripted_demo_provider() -> ScriptedProvider:
                             "summary": (
                                 "已按 (tenant_id, profile_id) 隔离缓存项，并补充跨租户回归测试。"
                             ),
-                            "evidence": [
-                                "python -m pytest -q 已通过",
-                                "现有缓存命中和 TTL 测试仍然通过",
-                            ],
                         },
                     )
                 ]

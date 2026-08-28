@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import time
 from dataclasses import replace
@@ -11,7 +12,13 @@ from fastapi.testclient import TestClient
 
 from traceforge.api import _choose_macos_directory, _open_workspace_directory, create_app
 from traceforge.config import Settings
-from traceforge.models import ConversationTurn, ProviderConfig, RunRecord, RunState, ToolCall
+from traceforge.models import (
+    ConversationTurn,
+    ProviderConfig,
+    RunRecord,
+    RunState,
+    ToolCall,
+)
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
 
 
@@ -81,6 +88,40 @@ def test_api_represents_direct_answer_without_completion_evidence(
         assert client.post(f"/api/runs/{answered['id']}/rollback").status_code == 409
 
 
+def test_instance_health_and_ipv6_origins_cover_rest_and_websocket(
+    settings: Settings,
+) -> None:
+    instance_id = "test-instance-identity"
+    config_fingerprint = "a" * 64
+    app = create_app(
+        settings,
+        provider=ScriptedProvider([_answer_response("ok")]),
+        instance_id=instance_id,
+        instance_config_fingerprint=config_fingerprint,
+    )
+    ipv6_origin = "http://[::1]:8765"
+
+    with TestClient(app) as client:
+        assert client.get("/healthz").json() == {
+            "status": "ok",
+            "version": app.version,
+            "instance_id": instance_id,
+        }
+        created = client.post(
+            "/api/runs",
+            headers={"origin": ipv6_origin, "sec-fetch-site": "same-origin"},
+            json={"task": "Answer", "create_direct_workspace": True},
+        )
+        assert created.status_code == 201
+        run_id = created.json()["id"]
+
+        with client.websocket_connect(
+            f"/api/runs/{run_id}/events?after_seq=0",
+            headers={"origin": ipv6_origin},
+        ) as websocket:
+            assert websocket.receive_json()["seq"] == 1
+
+
 def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
     provider = ScriptedProvider(
         [
@@ -90,7 +131,7 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
                     ToolCall(
                         id="finish",
                         name="finish",
-                        arguments={"summary": "Observed", "evidence": ["No mutation required"]},
+                        arguments={"summary": "Observed"},
                     )
                 ]
             ),
@@ -154,7 +195,9 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
                     ToolCall(
                         id="finish-1",
                         name="finish",
-                        arguments={"summary": "Observed the first request"},
+                        arguments={
+                            "summary": "Observed the first request",
+                        },
                     )
                 ]
             ),
@@ -164,7 +207,9 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
                     ToolCall(
                         id="finish-2",
                         name="finish",
-                        arguments={"summary": "Observed the follow-up"},
+                        arguments={
+                            "summary": "Observed the follow-up",
+                        },
                     )
                 ]
             ),
@@ -834,12 +879,254 @@ def test_provider_config_stores_direct_api_key_in_owner_only_file(
         assert payload["reasoning_effort_source"] == "provider_default"
         assert "api_key" not in payload
         assert secret not in updated.text
-        assert credential.parent == settings.data_dir.resolve()
+        assert credential.parent == (
+            settings.data_dir / "provider-credentials"
+        ).resolve()
+        assert credential.parent.stat().st_mode & 0o777 == 0o700
         assert credential.read_text(encoding="utf-8") == f"{secret}\n"
         assert credential.stat().st_mode & 0o777 == 0o600
 
     for database_file in settings.data_dir.glob("traceforge.db*"):
         assert secret.encode() not in database_file.read_bytes()
+
+
+def test_failed_provider_draft_probe_preserves_the_verified_saved_config(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_secret = "api-old-verified-secret"
+    rejected_secret = "api-rejected-draft-secret"
+
+    class ConditionalProbeProvider:
+        def __init__(self, provider_settings) -> None:
+            self.api_key = provider_settings.api_key
+
+        async def complete(self, messages, tools=None) -> ModelResponse:
+            assert messages and tools
+            if self.api_key == rejected_secret:
+                raise ProviderError(f"Rejected {rejected_secret}")
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="probe",
+                        name="report_connection",
+                        arguments={"status": "ok"},
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(
+        "traceforge.runtime.OpenAICompatibleProvider", ConditionalProbeProvider
+    )
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        verified = client.post(
+            "/api/provider/test",
+            json={
+                "model": "verified-model",
+                "base_url": "https://verified.example/v1",
+                "api_key": old_secret,
+            },
+        )
+        assert verified.status_code == 200
+        assert verified.json()["ok"] is True
+        assert old_secret not in verified.text
+        saved_before = verified.json()["provider"]
+        credential_before = Path(saved_before["credential_file"])
+        managed_directory = settings.data_dir / "provider-credentials"
+        files_before = set(managed_directory.glob("provider-credential-*.key"))
+
+        failed = client.post(
+            "/api/provider/test",
+            json={
+                "model": "rejected-model",
+                "base_url": "https://rejected.example/v1",
+                "api_key": rejected_secret,
+            },
+        )
+
+        assert failed.status_code == 200
+        assert failed.json()["ok"] is False
+        assert failed.json()["provider"] == saved_before
+        assert rejected_secret not in failed.text
+        assert client.get("/api/provider").json() == saved_before
+        assert client.get("/api/status").json()["connection_verified"] is True
+        assert credential_before.read_text(encoding="utf-8") == f"{old_secret}\n"
+        assert set(managed_directory.glob("provider-credential-*.key")) == files_before
+
+        saved_only = client.put(
+            "/api/provider",
+            json={
+                "model": saved_before["model"],
+                "base_url": saved_before["base_url"],
+                "credential_file": saved_before["credential_file"],
+            },
+        )
+        assert saved_only.status_code == 200
+        assert saved_only.json()["connection_verified"] is False
+        assert saved_only.json()["verified_at"] is None
+
+    for database_file in settings.data_dir.glob("traceforge.db*"):
+        assert rejected_secret.encode() not in database_file.read_bytes()
+
+
+def test_failed_retest_of_current_provider_revokes_readiness(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reject_probe = False
+
+    class ConditionalProbeProvider:
+        def __init__(self, _provider_settings) -> None:
+            pass
+
+        async def complete(self, messages, tools=None) -> ModelResponse:
+            assert messages and tools
+            if reject_probe:
+                raise ProviderError("The saved provider is unavailable")
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="probe",
+                        name="report_connection",
+                        arguments={"status": "ok"},
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(
+        "traceforge.runtime.OpenAICompatibleProvider", ConditionalProbeProvider
+    )
+    app = create_app(settings)
+    saved_body = {
+        "model": "saved-model",
+        "base_url": "https://saved.example/v1",
+        "credential_file": None,
+        "context_window": None,
+    }
+
+    with TestClient(app) as client:
+        verified = client.post("/api/provider/test", json=saved_body)
+        assert verified.status_code == 200
+        assert verified.json()["provider"]["connection_verified"] is True
+
+        reject_probe = True
+        failed_draft = client.post("/api/provider/test", json=saved_body)
+        assert failed_draft.status_code == 200
+        assert failed_draft.json()["ok"] is False
+        assert failed_draft.json()["provider"]["connection_verified"] is False
+        assert failed_draft.json()["provider"]["verified_at"] is None
+        assert client.get("/api/status").json()["connection_verified"] is False
+
+        reject_probe = False
+        reverified = client.post("/api/provider/test", json=saved_body)
+        assert reverified.json()["provider"]["connection_verified"] is True
+
+        reject_probe = True
+        failed_current = client.post("/api/provider/test")
+        assert failed_current.status_code == 200
+        assert failed_current.json()["ok"] is False
+        assert failed_current.json()["provider"]["connection_verified"] is False
+        assert failed_current.json()["provider"]["verified_at"] is None
+
+
+def test_standard_runs_follow_ups_and_resumes_require_a_verified_connection(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    app.state.storage.create_run(
+        RunRecord(
+            id="unverified-terminal",
+            task="Continue later",
+            workspace=str(settings.workspace),
+            state=RunState.SUCCEEDED,
+        )
+    )
+    app.state.storage.create_run(
+        RunRecord(
+            id="unverified-interrupted",
+            task="Resume later",
+            workspace=str(settings.workspace),
+            state=RunState.INTERRUPTED,
+            interrupted_from=RunState.EXECUTING,
+        )
+    )
+
+    with TestClient(app) as client:
+        status_payload = client.get("/api/status").json()
+        assert status_payload["api_key_configured"] is True
+        assert status_payload["connection_verified"] is False
+
+        created = client.post(
+            "/api/runs",
+            json={"task": "Must be gated", "create_direct_workspace": True},
+        )
+        followed = client.post(
+            "/api/runs/unverified-terminal/turns",
+            json={"prompt": "Continue"},
+        )
+        resumed = client.post("/api/runs/unverified-interrupted/resume")
+
+        for response in (created, followed, resumed):
+            assert response.status_code == 422
+            assert "Test and verify the model connection" in response.json()["detail"]
+
+        saved = client.put(
+            "/api/provider",
+            json={
+                "model": settings.model,
+                "base_url": settings.base_url,
+            },
+        )
+        assert saved.status_code == 200
+        assert saved.json()["connection_verified"] is False
+        assert saved.json()["verified_at"] is None
+
+
+def test_fresh_failed_provider_probe_does_not_create_config_or_managed_key(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rejected_secret = "fresh-rejected-secret"
+
+    class RejectingProbeProvider:
+        def __init__(self, provider_settings) -> None:
+            assert provider_settings.api_key == rejected_secret
+
+        async def complete(self, messages, tools=None) -> ModelResponse:
+            raise ProviderError(f"Rejected {rejected_secret}")
+
+    monkeypatch.setattr(
+        "traceforge.runtime.OpenAICompatibleProvider", RejectingProbeProvider
+    )
+    fresh = replace(settings, api_key="")
+    app = create_app(fresh)
+
+    with TestClient(app) as client:
+        failed = client.post(
+            "/api/provider/test",
+            json={
+                "model": "rejected-model",
+                "base_url": "https://rejected.example/v1",
+                "api_key": rejected_secret,
+            },
+        )
+
+        assert failed.status_code == 200
+        assert failed.json()["ok"] is False
+        assert failed.json()["provider"]["model"] == settings.model
+        assert failed.json()["provider"]["api_key_configured"] is False
+        assert failed.json()["provider"]["connection_verified"] is False
+        assert failed.json()["provider"]["verified_at"] is None
+        assert rejected_secret not in failed.text
+        assert list(
+            (settings.data_dir / "provider-credentials").glob(
+                "provider-credential-*.key"
+            )
+        ) == []
+
+    with sqlite3.connect(settings.data_dir / "traceforge.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM provider_config").fetchone() == (0,)
+    for database_file in settings.data_dir.glob("traceforge.db*"):
+        assert rejected_secret.encode() not in database_file.read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -940,7 +1227,7 @@ def test_api_allows_provider_repair_then_resume_after_transient_outage(
                         ToolCall(
                             id="finish",
                             name="finish",
-                            arguments={"summary": "Recovered", "evidence": ["plan"]},
+                            arguments={"summary": "Recovered"},
                         )
                     ]
                 ),

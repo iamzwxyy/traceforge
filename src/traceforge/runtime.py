@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import stat
-import tempfile
+from contextlib import suppress
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -20,12 +22,15 @@ from traceforge.models import (
     ProviderConfig,
     ReasoningEffort,
     RunRecord,
+    utc_now,
 )
 from traceforge.provider import ModelProvider, OpenAICompatibleProvider, ProviderError
 from traceforge.storage import Storage
 
 _CREDENTIAL_MAX_BYTES = 16 * 1024
-_MANAGED_CREDENTIAL_NAME = "provider-credential.key"
+_MANAGED_CREDENTIAL_DIRECTORY = "provider-credentials"
+_MANAGED_CREDENTIAL_PREFIX = "provider-credential-"
+_LEGACY_MANAGED_CREDENTIAL_NAME = "provider-credential.key"
 _PROBE_TOOL = {
     "type": "function",
     "function": {
@@ -68,22 +73,83 @@ def validate_credential_file(raw: str | Path) -> Path:
     return resolved
 
 
-def store_managed_api_key(settings: Settings, raw: str) -> Path:
-    """Atomically store a provider key without exposing it to persisted config."""
-
+def _normalized_api_key(raw: str) -> tuple[str, bytes]:
     value = raw.strip()
     encoded = value.encode("utf-8")
     if not value or "\n" in value or "\r" in value:
         raise ValueError("API key must contain exactly one non-empty line")
     if len(encoded) > _CREDENTIAL_MAX_BYTES:
         raise ValueError("API key must be smaller than 16 KiB")
+    return value, encoded
 
+
+def _open_managed_credential_directory(settings: Settings) -> tuple[Path, int]:
     data_dir = settings.data_dir.resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
-    destination = data_dir / _MANAGED_CREDENTIAL_NAME
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".provider-credential-", dir=data_dir)
-    temporary = Path(temporary_name)
+    managed_directory = data_dir / _MANAGED_CREDENTIAL_DIRECTORY
     try:
+        managed_directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    try:
+        metadata = managed_directory.lstat()
+    except OSError as exc:
+        raise ValueError("Managed credential directory is not accessible") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError("Managed credential directory must not be a symbolic link")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("Managed credential path must be a directory")
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_descriptor = os.open(managed_directory, flags)
+    except OSError as exc:
+        raise ValueError("Managed credential directory is not safe to open") from exc
+    try:
+        opened_metadata = os.fstat(directory_descriptor)
+        if not stat.S_ISDIR(opened_metadata.st_mode):
+            raise ValueError("Managed credential path must be a directory")
+        if os.name == "posix":
+            if opened_metadata.st_uid != os.getuid():
+                raise ValueError(
+                    "Managed credential directory must be owned by the current user"
+                )
+            os.fchmod(directory_descriptor, 0o700)
+    except BaseException:
+        os.close(directory_descriptor)
+        raise
+    return managed_directory, directory_descriptor
+
+
+def store_managed_api_key(settings: Settings, raw: str) -> Path:
+    """Store a provider key in a dedicated owner-only directory."""
+
+    _, encoded = _normalized_api_key(raw)
+    managed_directory, directory_descriptor = _open_managed_credential_directory(
+        settings
+    )
+    descriptor = -1
+    destination: Path | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        for _attempt in range(100):
+            name = f"{_MANAGED_CREDENTIAL_PREFIX}{secrets.token_hex(16)}.key"
+            try:
+                descriptor = os.open(
+                    name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except FileExistsError:
+                continue
+            destination = managed_directory / name
+            break
+        if destination is None:
+            raise OSError("Could not allocate a unique managed credential file")
         if os.name == "posix":
             os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
@@ -91,20 +157,51 @@ def store_managed_api_key(settings: Settings, raw: str) -> Path:
             handle.write(encoded + b"\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        if os.name == "posix":
-            destination.chmod(0o600)
-            directory_descriptor = os.open(data_dir, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
-    except Exception:
+        os.fsync(directory_descriptor)
+        return validate_credential_file(destination)
+    except BaseException:
         if descriptor >= 0:
             os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        if destination is not None:
+            with suppress(OSError):
+                os.unlink(destination.name, dir_fd=directory_descriptor)
         raise
-    return validate_credential_file(destination)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _managed_credential_path(settings: Settings, raw: str | None) -> Path | None:
+    if not raw:
+        return None
+    data_dir = settings.data_dir.resolve()
+    candidate = Path(raw).expanduser()
+    try:
+        candidate_parent = candidate.parent.resolve(strict=False)
+    except OSError:
+        return None
+    if (
+        candidate_parent == data_dir
+        and candidate.name == _LEGACY_MANAGED_CREDENTIAL_NAME
+    ):
+        return data_dir / _LEGACY_MANAGED_CREDENTIAL_NAME
+
+    managed_directory = data_dir / _MANAGED_CREDENTIAL_DIRECTORY
+    try:
+        managed_metadata = managed_directory.lstat()
+        managed_parent = managed_directory.resolve(strict=True)
+    except OSError:
+        return None
+    if stat.S_ISLNK(managed_metadata.st_mode) or not stat.S_ISDIR(
+        managed_metadata.st_mode
+    ):
+        return None
+    if (
+        candidate_parent == managed_parent
+        and candidate.name.startswith(_MANAGED_CREDENTIAL_PREFIX)
+        and candidate.name.endswith(".key")
+    ):
+        return managed_parent / candidate.name
+    return None
 
 
 def _read_api_key(settings: Settings, config: ProviderConfig) -> str:
@@ -138,6 +235,9 @@ class AgentRuntime:
         self.broker = broker
         self.provider_override = provider_override
         self._managers: dict[Path, AgentManager] = {}
+        self._provider_lock = asyncio.Lock()
+        self._resumed_runs: set[str] = set()
+        self._resume_watchers: set[asyncio.Task[None]] = set()
 
     @property
     def provider_config(self) -> ProviderConfig:
@@ -165,6 +265,24 @@ class AgentRuntime:
             return True
         return bool(self.settings.api_key) or self.provider_override is not None
 
+    def connection_verified(self) -> bool:
+        if self.provider_override is not None:
+            return True
+        return (
+            self.credential_configured()
+            and self.storage.get_provider_verified_at() is not None
+        )
+
+    def require_connection_verified(self) -> None:
+        if not self.credential_configured():
+            raise ValueError(
+                "Configure a credential file or set OPENAI_API_KEY before starting a run"
+            )
+        if not self.connection_verified():
+            raise ValueError(
+                "Test and verify the model connection before starting or continuing a task"
+            )
+
     async def start_run(
         self,
         task: str,
@@ -176,15 +294,65 @@ class AgentRuntime:
         approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
         reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
     ) -> RunRecord:
-        manager = self.manager_for_workspace(workspace)
-        return await manager.start_run(
-            task,
-            verifier_enabled=verifier_enabled,
-            project_id=project_id,
-            mode=mode,
-            approval_mode=approval_mode,
-            reasoning_effort=reasoning_effort,
+        async with self._provider_lock:
+            self.require_connection_verified()
+            manager = self.manager_for_workspace(workspace)
+            return await manager.start_run(
+                task,
+                verifier_enabled=verifier_enabled,
+                project_id=project_id,
+                mode=mode,
+                approval_mode=approval_mode,
+                reasoning_effort=reasoning_effort,
+            )
+
+    async def follow_up(
+        self,
+        run_id: str,
+        prompt: str,
+        *,
+        mode: InteractionMode = InteractionMode.AGENT,
+        approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
+        reasoning_effort: ReasoningEffort = ReasoningEffort.AUTO,
+    ) -> RunRecord:
+        async with self._provider_lock:
+            self.require_connection_verified()
+            return await self.manager_for_run(run_id).follow_up(
+                run_id,
+                prompt,
+                mode=mode,
+                approval_mode=approval_mode,
+                reasoning_effort=reasoning_effort,
+            )
+
+    async def resume_run(self, run_id: str) -> RunRecord:
+        async with self._provider_lock:
+            self.require_connection_verified()
+            manager = self.manager_for_run(run_id)
+            run = await manager.resume(run_id)
+            self._track_resumed_run(manager, run_id)
+            return run
+
+    def _track_resumed_run(self, manager: AgentManager, run_id: str) -> None:
+        self._resumed_runs.add(run_id)
+
+        async def wait_for_completion() -> None:
+            try:
+                await manager.wait(run_id)
+            finally:
+                self._resumed_runs.discard(run_id)
+
+        watcher = asyncio.create_task(
+            wait_for_completion(), name=f"traceforge:resume-watch:{run_id}"
         )
+        self._resume_watchers.add(watcher)
+        watcher.add_done_callback(self._resume_watchers.discard)
+
+    def _require_provider_change_idle(self) -> None:
+        if self.storage.has_live_run() or self._resumed_runs:
+            raise RunConflictError(
+                "Pause, stop, or finish running work before changing model settings"
+            )
 
     def manager_for_run(self, run_id: str) -> AgentManager:
         return self.manager_for_workspace(self.storage.get_run(run_id).workspace)
@@ -227,42 +395,157 @@ class AgentRuntime:
         self._managers[resolved] = manager
         return manager
 
-    async def save_provider_config(
-        self, config: ProviderConfig, *, api_key: str | None = None
-    ) -> ProviderConfig:
-        if self.storage.has_live_run():
-            raise RunConflictError(
-                "Pause, stop, or finish running work before changing model settings"
+    def _normalized_provider_config(self, config: ProviderConfig) -> ProviderConfig:
+        normalized = config.model_copy(deep=True)
+        if normalized.credential_file is not None:
+            normalized.credential_file = normalized.credential_file.strip() or None
+        if normalized.credential_file:
+            normalized.credential_file = str(
+                validate_credential_file(normalized.credential_file)
             )
-        if config.credential_file is not None:
-            config.credential_file = config.credential_file.strip() or None
-        if config.credential_file:
-            config.credential_file = str(validate_credential_file(config.credential_file))
-        config.model = config.model.strip()
-        if not config.model:
+        normalized.model = normalized.model.strip()
+        if not normalized.model:
             raise ValueError("Model must not be empty")
-        if config.base_url is not None:
-            config.base_url = config.base_url.strip() or None
-        if config.base_url is not None:
+        if normalized.base_url is not None:
+            normalized.base_url = normalized.base_url.strip() or None
+        if normalized.base_url is not None:
             try:
-                parsed = urlparse(config.base_url)
+                parsed = urlparse(normalized.base_url)
                 hostname, _port = parsed.hostname, parsed.port
             except ValueError as exc:
                 raise ValueError(
                     "Base URL must be an absolute http:// or https:// URL"
                 ) from exc
             if parsed.scheme not in {"http", "https"} or not hostname:
-                raise ValueError("Base URL must be an absolute http:// or https:// URL")
+                raise ValueError(
+                    "Base URL must be an absolute http:// or https:// URL"
+                )
+        return normalized
+
+    def _probe_api_key(self, config: ProviderConfig, api_key: str | None) -> str:
         if api_key is not None:
             if config.credential_file:
                 raise ValueError("Choose either an API key or a credential file, not both")
-            config.credential_file = str(store_managed_api_key(self.settings, api_key))
-        await self.shutdown()
-        self.storage.save_provider_config(config)
+            return _normalized_api_key(api_key)[0]
+        if self.provider_override is not None:
+            return ""
+        return _read_api_key(self.settings, config)
+
+    @staticmethod
+    def _same_provider_config(left: ProviderConfig, right: ProviderConfig) -> bool:
+        return (
+            left.model,
+            left.base_url,
+            left.credential_file,
+            left.context_window,
+        ) == (
+            right.model,
+            right.base_url,
+            right.credential_file,
+            right.context_window,
+        )
+
+    async def _persist_provider_config(
+        self,
+        config: ProviderConfig,
+        *,
+        api_key: str | None,
+        verified_at: datetime | None,
+    ) -> ProviderConfig:
+        previous = self.provider_config
+        managed_credential: Path | None = None
+        if api_key is not None:
+            if config.credential_file:
+                raise ValueError("Choose either an API key or a credential file, not both")
+            managed_credential = store_managed_api_key(self.settings, api_key)
+            config.credential_file = str(managed_credential)
+        try:
+            await self.shutdown()
+            self.storage.save_provider_config(config, verified_at=verified_at)
+        except BaseException:
+            if managed_credential is not None:
+                await asyncio.to_thread(managed_credential.unlink, missing_ok=True)
+            raise
+        previous_managed_credential = _managed_credential_path(
+            self.settings, previous.credential_file
+        )
+        if (
+            previous.credential_file != config.credential_file
+            and previous_managed_credential is not None
+        ):
+            with suppress(OSError):
+                await asyncio.to_thread(
+                    previous_managed_credential.unlink,
+                    missing_ok=True,
+                )
         return self.provider_config
 
+    async def save_provider_config(
+        self, config: ProviderConfig, *, api_key: str | None = None
+    ) -> ProviderConfig:
+        async with self._provider_lock:
+            self._require_provider_change_idle()
+            normalized = self._normalized_provider_config(config)
+            if api_key is not None:
+                self._probe_api_key(normalized, api_key)
+            return await self._persist_provider_config(
+                normalized,
+                api_key=api_key,
+                verified_at=None,
+            )
+
+    async def test_and_save_provider_config(
+        self, config: ProviderConfig, *, api_key: str | None = None
+    ) -> dict[str, Any]:
+        async with self._provider_lock:
+            self._require_provider_change_idle()
+            normalized = self._normalized_provider_config(config)
+            saved = self.provider_config
+            testing_saved_config = api_key is None and self._same_provider_config(
+                normalized, saved
+            )
+            selected_api_key = self._probe_api_key(normalized, api_key)
+            result = await self._probe_connection(normalized, selected_api_key)
+            if not result["ok"]:
+                if (
+                    testing_saved_config
+                    and self.storage.get_provider_verified_at() is not None
+                ):
+                    self.storage.save_provider_config(saved, verified_at=None)
+                return result
+            await self._persist_provider_config(
+                normalized,
+                api_key=api_key,
+                verified_at=utc_now(),
+            )
+            return result
+
     async def test_connection(self) -> dict[str, Any]:
-        config = self.provider_config
+        async with self._provider_lock:
+            config = self.provider_config
+            if self.provider_override is not None:
+                return {
+                    "ok": True,
+                    "model": config.model,
+                    "latency_ms": 0,
+                    "detail": "Scripted provider is ready.",
+                }
+            self._require_provider_change_idle()
+            api_key = self._probe_api_key(config, None)
+            result = await self._probe_connection(config, api_key)
+            if result["ok"]:
+                await self._persist_provider_config(
+                    config,
+                    api_key=None,
+                    verified_at=utc_now(),
+                )
+            elif self.storage.get_provider_verified_at() is not None:
+                self.storage.save_provider_config(config, verified_at=None)
+            return result
+
+    async def _probe_connection(
+        self, config: ProviderConfig, api_key: str
+    ) -> dict[str, Any]:
         if self.provider_override is not None:
             return {
                 "ok": True,
@@ -270,7 +553,6 @@ class AgentRuntime:
                 "latency_ms": 0,
                 "detail": "Scripted provider is ready.",
             }
-        api_key = _read_api_key(self.settings, config)
         probe_settings = replace(
             self.settings,
             api_key=api_key,
@@ -294,11 +576,14 @@ class AgentRuntime:
                 [_PROBE_TOOL],
             )
         except ProviderError as exc:
+            detail = str(exc)
+            if api_key:
+                detail = detail.replace(api_key, "[REDACTED]")
             return {
                 "ok": False,
                 "model": config.model,
                 "latency_ms": round((monotonic() - started) * 1_000),
-                "detail": str(exc).replace(api_key, "[REDACTED]"),
+                "detail": detail,
             }
         valid = any(
             call.name == "report_connection" and call.arguments.get("status") == "ok"
@@ -320,3 +605,6 @@ class AgentRuntime:
         self._managers.clear()
         if managers:
             await asyncio.gather(*(manager.shutdown() for manager in managers))
+        watchers = list(self._resume_watchers)
+        if watchers:
+            await asyncio.gather(*watchers, return_exceptions=True)

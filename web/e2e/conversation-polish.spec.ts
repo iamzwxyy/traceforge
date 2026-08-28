@@ -19,6 +19,7 @@ function status(workspace: string) {
     model: "deepseek-reasoner",
     base_url: "https://api.deepseek.com/v1",
     api_key_configured: true,
+    connection_verified: true,
     suggested_task: null,
     mode: "standard",
     sandbox: { backend: "seatbelt", enforced: true, detail: "test" },
@@ -34,6 +35,8 @@ function provider(efforts = ["auto", "none", "low", "high", "max"]) {
     credential_file: null,
     credential_env: "DEEPSEEK_API_KEY",
     api_key_configured: true,
+    connection_verified: true,
+    verified_at: createdAt,
     context_window: null,
     resolved_context_window: 64_000,
     context_window_source: "catalog",
@@ -193,4 +196,135 @@ test("reasoning capability loading and a non-default singleton stay truthful", a
   await expect(fixed).toContainText("唯一可用");
   await expect(page.locator('select[aria-label="本轮思考强度"]')).toHaveCount(0);
   await expectNoWcagViolations(page, "fixed reasoning capability");
+});
+
+test("a fresh failed draft probe stays unsaved and cannot enable task submission", async ({ page }) => {
+  const workspace = "/tmp/traceforge-unverified";
+  const savedProvider = {
+    ...provider(["auto"]),
+    credential_source: "missing",
+    credential_file: null,
+    credential_env: "OPENAI_API_KEY",
+    api_key_configured: false,
+    connection_verified: false,
+    verified_at: null,
+  };
+  let testedDraft: Record<string, unknown> | null = null;
+  let saveCalls = 0;
+
+  await page.route("**/api/status", (route) => route.fulfill(json({
+    ...status(workspace),
+    api_key_configured: false,
+    connection_verified: false,
+  })));
+  await page.route("**/api/runs", (route) => route.fulfill(json([])));
+  await page.route("**/api/projects", (route) => route.fulfill(json([])));
+  await page.route("**/api/provider/test", async (route) => {
+    testedDraft = route.request().postDataJSON() as Record<string, unknown>;
+    await route.fulfill(json({
+      ok: false,
+      model: "draft-model",
+      latency_ms: 12,
+      detail: "Model connection failed: unavailable",
+      provider: savedProvider,
+    }));
+  });
+  await page.route("**/api/provider", (route) => {
+    if (route.request().method() === "PUT") saveCalls += 1;
+    return route.fulfill(json(savedProvider));
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: /需要配置模型/ }).click();
+  await page.getByLabel("模型", { exact: true }).fill("draft-model");
+  await page.getByLabel("OpenAI 兼容接口地址").fill("https://draft.example/v1");
+  await page.locator('input[type="password"]').fill("test-browser-rejected-secret");
+  await page.getByRole("button", { name: "测试并保存" }).click();
+
+  await expect(page.getByText("连接检查失败", { exact: true })).toBeVisible();
+  await expect(page.getByText("需要凭证", { exact: true })).toBeVisible();
+  expect(testedDraft).toMatchObject({
+    model: "draft-model",
+    base_url: "https://draft.example/v1",
+    api_key: "test-browser-rejected-secret",
+  });
+  expect(saveCalls).toBe(0);
+
+  await page.getByRole("button", { name: "关闭模型设置" }).click();
+  await page.locator("textarea").fill("This must remain gated");
+  await expect(page.getByRole("button", { name: "发送", exact: true })).toBeDisabled();
+  await expect(page.locator(".connection")).toHaveAttribute(
+    "title",
+    "本地服务已就绪，仍需配置模型",
+  );
+});
+
+test("a saved but unverified credential asks for verification instead of reconfiguration", async ({ page }) => {
+  const workspace = "/tmp/traceforge-awaiting-verification";
+  const unverifiedProvider = {
+    ...provider(["auto"]),
+    connection_verified: false,
+    verified_at: null,
+  };
+
+  await page.route("**/api/status", (route) => route.fulfill(json({
+    ...status(workspace),
+    connection_verified: false,
+  })));
+  await page.route("**/api/runs", (route) => route.fulfill(json([])));
+  await page.route("**/api/projects", (route) => route.fulfill(json([])));
+  await page.route("**/api/provider", (route) => route.fulfill(json(unverifiedProvider)));
+
+  await page.goto("/");
+
+  await expect(page.getByText("需要验证模型连接", { exact: true })).toBeVisible();
+  await expect(page.locator(".connection")).toHaveAttribute(
+    "title",
+    "本地服务已就绪，需要验证模型连接",
+  );
+  await expect(page.getByRole("button", { name: "发送", exact: true })).toBeDisabled();
+
+  await page.getByText("需要验证模型连接", { exact: true }).click();
+  await expect(page.getByText("凭证已保存，等待验证", { exact: true })).toBeVisible();
+});
+
+test("a failed draft probe preserves an older verified connection", async ({ page }) => {
+  const workspace = "/tmp/traceforge-verified";
+  const savedProvider = provider();
+  let saveCalls = 0;
+
+  await page.route("**/api/status", (route) => route.fulfill(json(status(workspace))));
+  await page.route("**/api/runs", (route) => route.fulfill(json([])));
+  await page.route("**/api/projects", (route) => route.fulfill(json([])));
+  await page.route("**/api/provider/test", (route) => route.fulfill(json({
+    ok: false,
+    model: "rejected-draft-model",
+    latency_ms: 9,
+    detail: "Model connection failed: unavailable",
+    provider: savedProvider,
+  })));
+  await page.route("**/api/provider", (route) => {
+    if (route.request().method() === "PUT") saveCalls += 1;
+    return route.fulfill(json(savedProvider));
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "模型设置" }).click();
+  await page.getByLabel("模型", { exact: true }).fill("rejected-draft-model");
+  await page.locator('input[type="password"]').fill("rejected-draft-secret");
+  await page.getByRole("button", { name: "测试并保存" }).click();
+
+  await expect(page.getByText("草稿检查失败，已保存连接仍有效", { exact: true }))
+    .toBeVisible();
+  await expect(page.getByText("连接已验证", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("模型", { exact: true })).toHaveValue("rejected-draft-model");
+  expect(saveCalls).toBe(0);
+
+  await page.getByRole("button", { name: "关闭模型设置" }).click();
+  await page.locator("textarea").fill("The saved provider should remain usable");
+  await expect(page.getByRole("button", { name: "发送" })).toBeEnabled();
+  await expect(page.locator(".connection")).toHaveAttribute(
+    "title",
+    "本地服务已就绪，模型连接已验证",
+  );
 });

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 
@@ -231,6 +232,43 @@ def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:
         assert loaded.approval_mode is ApprovalMode.AUTOMATIC
         assert loaded.reasoning_effort is ReasoningEffort.AUTO
         assert loaded.provider_reasoning_cleanup_pending is False
+    finally:
+        migrated.close()
+
+
+def test_storage_migrates_and_clears_provider_verification(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-provider.db"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TABLE provider_config (
+            id INTEGER PRIMARY KEY CHECK(id = 1), model TEXT NOT NULL,
+            base_url TEXT, credential_file TEXT, context_window INTEGER,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO provider_config(
+            id, model, base_url, credential_file, context_window, updated_at
+        ) VALUES (1, 'legacy-model', NULL, NULL, NULL, '2026-01-01T00:00:00+00:00')
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = Storage(database)
+    try:
+        assert migrated.get_provider_verified_at() is None
+        config = migrated.get_provider_config(ProviderConfig(model="fallback"))
+        verified_at = datetime(2026, 8, 28, tzinfo=UTC)
+
+        migrated.save_provider_config(config, verified_at=verified_at)
+        assert migrated.get_provider_verified_at() == verified_at
+
+        migrated.save_provider_config(config)
+        assert migrated.get_provider_verified_at() is None
     finally:
         migrated.close()
 

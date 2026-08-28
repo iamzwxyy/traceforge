@@ -93,6 +93,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
 
   await page.reload();
   await expect(page.getByText("本轮已完成", { exact: true })).toBeVisible();
+  await expect(page.getByText(/\d+ 本轮动作/)).toBeVisible();
   await expect(page.getByText("实时", { exact: true })).toBeVisible();
   await expect(page.getByText("1 项检查通过", { exact: false })).toBeVisible();
   await page.getByRole("button", { name: "查看证据" }).click();
@@ -103,6 +104,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(proofDialog).toContainText("4 passed");
   await expect(proofDialog.getByText("命令沙箱")).toBeVisible();
   await expect(proofDialog.getByText("思考强度")).toBeVisible();
+  await expect(proofDialog.getByText(/当前轮 \d+ 个工具动作 · \d+ 轮修复/)).toBeVisible();
   await expect(proofDialog.getByText(/\d+ 个已强制隔离 · 0 个运行前拦截/)).toBeVisible();
   await expectNoWcagViolations(page, "proof pack dialog");
   await expect(page.getByRole("link", { name: "下载 Markdown" }))

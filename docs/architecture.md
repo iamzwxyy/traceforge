@@ -148,14 +148,19 @@ another prompt, but only the exact planned argv refreshes acceptance evidence.
 In Automatic mode, approving a base-policy unknown command grants one visibly recorded
 unsandboxed invocation for compatibility. Manual confirmations retain the sandbox. Workspace Full
 access auto-runs an unknown command only when OS enforcement is real and passes
-`sandbox_bypass=False`; on a policy-only host it falls back to human approval. `finish` is rejected until
-every command-backed acceptance check has a fresh passing result.
+`sandbox_bypass=False`; on a policy-only host it falls back to human approval. `finish` has a strict,
+extra-forbidden schema, must be the only call in its model response, and is rejected until every
+command-backed acceptance check has a fresh passing result. A response that mixes `finish` with an
+action is rejected as one atomic batch, so call order cannot create partial side effects.
 
 The loop has three independent brakes:
 
-1. 30 tool steps by default.
+1. 30 non-terminal tool actions by default. Reaching the exact boundary leaves only `finish`
+   available; an oversized batch is rejected before any call executes. If independent verification
+   then rejects the result, the run fails explicitly because no repair action remains.
 2. Two identical failures trigger a recovery instruction; a third ends the run.
-3. A builder that twice responds without a tool or `finish` fails explicitly.
+3. A builder that twice responds without a tool or `finish` fails explicitly; three consecutive
+   malformed, mixed, or over-budget batches also fail instead of looping indefinitely.
 
 ### Verifying
 
@@ -165,7 +170,8 @@ errors for correction. Mixed read-and-submit turns must finish the reads and sub
 a later turn, keeping Chat Completions tool-call/result ordering valid.
 
 A `pass` completes the run. `fail` or `inconclusive` becomes a builder repair instruction. The
-default repair budget is two; exhaustion produces an honest failed state.
+default repair budget is two; exhaustion produces an honest failed state. Repair cycles share the
+same per-turn action budget rather than silently receiving unbounded extra tools.
 
 ## Evidence freshness
 
@@ -287,15 +293,26 @@ SQLite uses WAL mode and six tables:
 - `events`: per-run monotonically increasing sequence and JSON payload;
 - `snapshots`: original bytes, mode, original hash, and last agent-written hash per path.
 - `projects`: reusable display names and canonical local root directories;
-- `provider_config`: one model/base-URL/credential-file reference, never the secret value; direct
-  key entry is atomically materialized as an owner-only managed file before this row is updated;
+- `provider_config`: one model/base-URL/credential-file reference plus the last successful native
+  tool-call verification time, never the secret value. In the atomic test-and-save path, a draft
+  raw key remains in request memory during its probe and is materialized as a new owner-only
+  managed file inside a dedicated owner-only directory only after success; the explicit save-only
+  path persists it as unverified;
 - `preferences`: small local UI choices such as the last direct-task workspace.
 
 Startup migrations add compatible columns to early v0.1 databases. WebSocket clients request
 events after their last sequence; the server replays persisted rows before subscribing to new
 ones. One workspace permits one active or interrupted run to avoid overlapping writes; different
-workspaces use separate managers and may run concurrently. On process startup, every unfinished
-run is marked interrupted before any workspace manager is created. The same SQLite transaction
+workspaces use separate managers and may run concurrently. Before constructing FastAPI or opening
+SQLite, `serve` takes an owner-only non-following lock for the data directory and pre-binds its
+listener. The owner publishes a random instance identity, local URL, version, and a fingerprint of
+the canonical workspace/host/port configuration. A second launch reuses the holder only when all
+of those fields and the identity returned by `/healthz` match. It waits for a bounded interval
+across the owner's pre-publish and pre-health windows, and can take over after an owner exits. An
+unreachable or mismatched holder, a detected older instance without this lock protocol, or an
+occupied port fails without touching run state. Only the lock owner proceeds to startup recovery,
+where every unfinished run is marked interrupted before any workspace manager is created. The same
+SQLite transaction
 appends a `state.changed` event with the previous phase and `cause=process_restart`, so the recovery
 audit cannot disagree with the run row. Resume appends a `run.resumed` event with its
 application-selected strategy and the number of incomplete tool calls closed without replay. A
@@ -319,14 +336,18 @@ post-agent user change.
 ## HTTP and event surface
 
 The same-origin service defaults to `127.0.0.1`. REST manages direct-task directories, projects,
-provider references, exact reasoning-capability metadata, connection probes, and run controls; it returns current state/diff/events,
+provider references, exact reasoning-capability metadata, atomic draft connection probes, and run controls; it returns current state/diff/events,
 adds follow-up turns, downloads Markdown plans, and resolves plan or action decisions. The
+provider probe persists its draft only after native tool calling succeeds. Ordinary configuration
+saves clear verification, and runtime methods serialize provider changes with starting, following
+up, or resuming work; all three task entry points reject an unverified saved connection.
 run-scoped `POST /api/runs/{id}/open-workspace` accepts no path from the browser: it re-resolves the
 persisted canonical workspace, rejects symlink retargeting, and invokes Finder or `xdg-open` with a
 fixed argv and scrubbed environment. JSON and Markdown Proof Pack routes expose the evidence
 projection. WebSocket pushes the persisted event stream. Mutating HTTP requests reject untrusted
 origins and cross-site fetch metadata; WebSocket origins are restricted to localhost, and
-responses include CSP, frame denial, referrer, and MIME-sniffing headers. The React production
+IPv4/IPv6 loopback origins share the same policy. Responses include CSP, frame denial, referrer,
+and MIME-sniffing headers. The React production
 build is part of the Python wheel.
 
 ## Why one agent loop

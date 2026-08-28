@@ -96,7 +96,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(config),
     }),
-  testProvider: () => request<ProviderProbe>("/api/provider/test", { method: "POST" }),
+  testProvider: (config: ProviderUpdate) =>
+    request<ProviderProbe>("/api/provider/test", {
+      method: "POST",
+      body: JSON.stringify(config),
+    }),
   answerQuestions: (runId: string, answers: ClarificationAnswer[]) =>
     request<{ accepted: boolean }>(`/api/runs/${runId}/answers`, {
       method: "POST",

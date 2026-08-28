@@ -195,7 +195,8 @@ class Storage:
                     base_url TEXT,
                     credential_file TEXT,
                     context_window INTEGER,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    verified_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS preferences (
@@ -237,6 +238,10 @@ class Storage:
             if "context_window" not in provider_columns:
                 self._connection.execute(
                     "ALTER TABLE provider_config ADD COLUMN context_window INTEGER"
+                )
+            if "verified_at" not in provider_columns:
+                self._connection.execute(
+                    "ALTER TABLE provider_config ADD COLUMN verified_at TEXT"
                 )
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_runs_project_updated "
@@ -501,21 +506,34 @@ class Storage:
             updated_at=datetime.fromisoformat(row["updated_at"]).astimezone(UTC),
         )
 
-    def save_provider_config(self, config: ProviderConfig) -> None:
+    def get_provider_verified_at(self) -> datetime | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT verified_at FROM provider_config WHERE id = 1"
+            ).fetchone()
+        if row is None or row["verified_at"] is None:
+            return None
+        return datetime.fromisoformat(row["verified_at"]).astimezone(UTC)
+
+    def save_provider_config(
+        self, config: ProviderConfig, *, verified_at: datetime | None = None
+    ) -> None:
         config.updated_at = utc_now()
         with self._lock, self._connection:
             self._connection.execute(
                 """
                 INSERT INTO provider_config(
-                    id, model, base_url, credential_file, context_window, updated_at
+                    id, model, base_url, credential_file, context_window,
+                    updated_at, verified_at
                 )
-                VALUES (1, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     model = excluded.model,
                     base_url = excluded.base_url,
                     credential_file = excluded.credential_file,
                     context_window = excluded.context_window,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    verified_at = excluded.verified_at
                 """,
                 (
                     config.model,
@@ -523,6 +541,7 @@ class Storage:
                     config.credential_file,
                     config.context_window,
                     config.updated_at.isoformat(),
+                    verified_at.isoformat() if verified_at is not None else None,
                 ),
             )
 

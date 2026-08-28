@@ -132,8 +132,18 @@ request field, atomically written with `0600` permissions, and never placed in S
 errors omit request inputs so a rejected key cannot be reflected in a 422 response. Every file
 reference must resolve to a regular file smaller than 16 KiB; on POSIX it must be owner-only, and
 its content must be exactly one non-empty line. Public status/configuration responses expose the
-source and readiness flag, never the value. The connection check verifies native tool calling
-rather than only endpoint reachability.
+source and readiness flag, never the value. A draft connection check resolves the key in memory and
+verifies native tool calling rather than only endpoint reachability. In test-and-save, only success
+creates a new managed credential file and swaps the configuration row; a failed draft leaves neither
+its key nor its route in persistent state. The explicit save-only path may retain a draft for later
+testing but always clears the verification timestamp. New runs,
+follow-ups, and resumes are gated on both a readable credential and a successful probe of the saved
+configuration; a failed recheck of that same saved configuration clears readiness.
+
+New managed keys live beneath a dedicated `0700` directory opened without following symbolic
+links; files are created relative to that verified directory descriptor with exclusive `0600`
+creation. Cleanup recognizes only that directory and the exact legacy managed filename, so a
+user-supplied credential with a similar name is never deleted as application-owned state.
 
 Before any model-proposed child command or local file-manager launcher starts, TraceForge removes environment variables whose
 names indicate keys, passwords, passphrases, secrets, tokens, or credentials, as well as common
@@ -200,7 +210,18 @@ rewrite the database can also recompute the hashes.
 
 ## Local web service
 
-The CLI binds to `127.0.0.1` by default. WebSocket origins must be `localhost` or `127.0.0.1`.
+The CLI binds to `127.0.0.1` by default. WebSocket and mutating HTTP origins may use `localhost`
+or the IPv4/IPv6 loopback address corresponding to the listener.
+Before application construction, `serve` opens an owner-only regular lock file with symlink
+following disabled, rejects unsafe ownership or hard links, holds a POSIX advisory lock for the
+server lifetime, and pre-binds the requested listener. The file contains only PID, local URL,
+application version, a random per-process identity, and a SHA-256 fingerprint of the canonical
+workspace/host/port configuration—no task or credential data. Health exposes the random identity,
+but not the configuration fingerprint. Reuse requires exact version, fingerprint, and health
+identity equality after a bounded readiness wait. A legacy process without this protocol is
+detected on both the requested URL and the historical default port and refused rather than bypassed
+on a parallel port. This orders crash recovery after exclusive ownership and prevents a losing or
+port-conflicted launch from marking the live instance's work as interrupted.
 State-changing HTTP requests reject a non-local `Origin` and `Sec-Fetch-Site: cross-site`, which is
 important because opening a local file manager is a host-side effect even though it does not edit
 files. That endpoint accepts only a run id, never a browser-supplied path; it re-resolves the

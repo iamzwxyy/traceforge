@@ -317,10 +317,13 @@ export function useTraceForge() {
     [],
   );
 
-  const testProvider = useCallback(async (): Promise<ProviderProbe> => {
+  const testProvider = useCallback(async (config: ProviderUpdate): Promise<ProviderProbe> => {
     setError(null);
     try {
-      return await api.testProvider();
+      const result = await api.testProvider(config);
+      setProvider(result.provider);
+      setStatus(await api.status());
+      return result;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       throw reason;

@@ -22,6 +22,7 @@ from traceforge.models import (
     ConversationTurn,
     DirectResponse,
     EventType,
+    FinishRequest,
     InteractionMode,
     PlanGate,
     ReasoningEffort,
@@ -434,6 +435,13 @@ class AgentManager:
                                 check.evidence = "Confirmed by the independent verifier."
                     await self._complete(run, report)
                     return
+                if run.step_count >= self.settings.max_steps:
+                    await self._fail(
+                        run,
+                        "Independent verification did not pass, and the Builder exhausted the "
+                        "total non-terminal tool action budget before a repair could start.",
+                    )
+                    return
                 if run.repair_cycles >= self.settings.max_repair_cycles:
                     await self._fail(
                         run,
@@ -785,8 +793,37 @@ class AgentManager:
                 PlanUpdateRequest.model_json_schema(),
             ),
         ]
-        while run.step_count < self.settings.max_steps:
-            response = await self._complete_model(run, builder_tools)
+        finish_tools = [
+            schema
+            for schema in builder_tools
+            if schema["function"]["name"] == "finish"
+        ]
+        consecutive_rejected_batches = 0
+
+        async def reject_batch(
+            calls: list[ToolCall],
+            *,
+            error: str,
+            correction: str,
+            fatal_error: str | None = None,
+        ) -> None:
+            nonlocal consecutive_rejected_batches
+            await self._reject_builder_batch(
+                run, calls, error=error, correction=correction
+            )
+            if fatal_error is not None:
+                raise RuntimeError(fatal_error)
+            consecutive_rejected_batches += 1
+            if consecutive_rejected_batches >= 3:
+                raise RuntimeError(
+                    "Builder returned three consecutive rejected tool-call batches"
+                )
+
+        while True:
+            action_budget_exhausted = run.step_count >= self.settings.max_steps
+            response = await self._complete_model(
+                run, finish_tools if action_budget_exhausted else builder_tools
+            )
             run.messages.append(self._assistant_message_for_storage(response))
             if not response.tool_calls:
                 no_tool_responses += 1
@@ -795,41 +832,98 @@ class AgentManager:
                 run.messages.append(
                     {
                         "role": "user",
-                        "content": "Continue with tools, or call finish with concrete evidence.",
+                        "content": (
+                            "The non-terminal tool action budget is exhausted. Call finish alone "
+                            "with a concise summary."
+                            if action_budget_exhausted
+                            else "Continue with tools, or call finish alone with a concise summary."
+                        ),
                     }
                 )
                 self.storage.save_run(run)
                 continue
             no_tool_responses = 0
-            publish_progress = bool(response.content) and not any(
-                call.name == "finish" for call in response.tool_calls
-            )
-            for call in response.tool_calls:
-                if call.name == "finish":
-                    missing = self._missing_command_checks(run.plan)
-                    if missing:
-                        self._append_tool_error(
-                            run,
-                            call,
-                            "Command checks need fresh passing evidence: " + ", ".join(missing),
-                        )
-                        continue
-                    self._set_turn_summary(run, str(call.arguments.get("summary", "")).strip())
-                    self._append_tool_result(
-                        run,
-                        ToolResult(
-                            tool_call_id=call.id,
-                            name=call.name,
-                            ok=True,
-                            output="Completion request accepted for independent verification.",
+            finish_calls = [call for call in response.tool_calls if call.name == "finish"]
+            if finish_calls and (len(finish_calls) != 1 or len(response.tool_calls) != 1):
+                await reject_batch(
+                    response.tool_calls,
+                    error=(
+                        "finish must be called exactly once and alone. No tool call in this "
+                        "response was executed."
+                    ),
+                    correction=(
+                        "Review the rejected batch, then call finish alone or issue only the "
+                        "non-terminal tools still needed in a new turn."
+                    ),
+                )
+                continue
+            if finish_calls:
+                call = finish_calls[0]
+                try:
+                    finish = FinishRequest.model_validate(call.arguments)
+                except ValidationError as exc:
+                    details = json.dumps(
+                        exc.errors(include_url=False, include_input=False), ensure_ascii=False
+                    )
+                    await reject_batch(
+                        [call],
+                        error=f"Invalid finish schema: {details}",
+                        correction=(
+                            "Correct finish to match the supplied schema, then call it alone."
                         ),
                     )
-                    await self._transition(run, RunState.VERIFYING)
-                    return
+                    continue
+                missing = self._missing_command_checks(run.plan)
+                if missing:
+                    await reject_batch(
+                        [call],
+                        error=(
+                            "Command checks need fresh passing evidence: " + ", ".join(missing)
+                        ),
+                        correction=(
+                            "Run every missing approved command check before calling finish alone."
+                        ),
+                        fatal_error=(
+                            "Builder exhausted the non-terminal tool action budget before all "
+                            "command checks had fresh passing evidence"
+                            if action_budget_exhausted
+                            else None
+                        ),
+                    )
+                    continue
+                self._set_turn_summary(run, finish.summary)
+                self._append_tool_result(
+                    run,
+                    ToolResult(
+                        tool_call_id=call.id,
+                        name=call.name,
+                        ok=True,
+                        output="Completion request accepted for independent verification.",
+                    ),
+                )
+                await self._transition(run, RunState.VERIFYING)
+                return
+
+            remaining_actions = max(0, self.settings.max_steps - run.step_count)
+            if len(response.tool_calls) > remaining_actions:
+                await reject_batch(
+                    response.tool_calls,
+                    error=(
+                        "This batch would exceed the non-terminal tool action budget "
+                        f"({remaining_actions} remaining, {len(response.tool_calls)} requested). "
+                        "No tool call in this response was executed."
+                    ),
+                    correction=(
+                        "Submit a smaller non-terminal tool batch within the remaining budget, "
+                        "or call finish alone with the current result."
+                    ),
+                )
+                continue
+
+            publish_progress = bool(response.content)
+            batch_succeeded = True
+            for call in response.tool_calls:
                 run.step_count += 1
-                if run.step_count > self.settings.max_steps:
-                    publish_progress = False
-                    break
                 await self.broker.emit(
                     run.id, EventType.TOOL_REQUESTED, call.model_dump(mode="json")
                 )
@@ -896,6 +990,7 @@ class AgentManager:
                             )
                 result = self._redact_result(result)
                 publish_progress = publish_progress and result.ok
+                batch_succeeded = batch_succeeded and result.ok
                 self._append_tool_result(run, result)
                 await self._update_checks_and_diff(run, call, result)
                 await self._emit_tool_result(run, call, result)
@@ -918,9 +1013,10 @@ class AgentManager:
                     elif repeated_failures[fingerprint] >= 3:
                         raise RuntimeError("The same tool call failed three times")
                 self.storage.save_run(run)
+            if batch_succeeded:
+                consecutive_rejected_batches = 0
             if publish_progress and response.content:
                 await self._emit_message(run, response.content, phase="building")
-        raise RuntimeError(f"Builder exceeded the {self.settings.max_steps}-step limit")
 
     def _builder_messages(
         self, run: RunRecord, plan: TaskPlan
@@ -1541,6 +1637,38 @@ class AgentManager:
             ToolResult(tool_call_id=call.id, name=call.name, ok=False, error=error),
         )
 
+    async def _reject_builder_batch(
+        self,
+        run: RunRecord,
+        calls: list[ToolCall],
+        *,
+        error: str,
+        correction: str,
+    ) -> None:
+        results: list[tuple[ToolCall, ToolResult]] = []
+        for call in calls:
+            result = self._redact_result(
+                ToolResult(
+                    tool_call_id=call.id,
+                    name=call.name,
+                    ok=False,
+                    error=error,
+                    metadata={
+                        "outcome": "protocol_rejected",
+                        "execution": "not_started",
+                    },
+                )
+            )
+            self._append_tool_result(run, result)
+            results.append((call, result))
+        run.messages.append({"role": "user", "content": correction})
+        self.storage.save_run(run)
+        for call, result in results:
+            await self.broker.emit(
+                run.id, EventType.TOOL_REQUESTED, call.model_dump(mode="json")
+            )
+            await self._emit_tool_result(run, call, result)
+
     async def _reject_invalid_planning_call(
         self,
         run: RunRecord,
@@ -1781,10 +1909,24 @@ class AgentManager:
     def _repair_incomplete_tool_protocol(run: RunRecord) -> int:
         if not run.messages:
             return 0
-        last = run.messages[-1]
-        if last.get("role") != "assistant" or not last.get("tool_calls"):
+        assistant_index: int | None = None
+        for index in range(len(run.messages) - 1, -1, -1):
+            message = run.messages[index]
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                assistant_index = index
+                break
+        if assistant_index is None:
             return 0
-        for call in last["tool_calls"]:
+        batch = run.messages[assistant_index]["tool_calls"]
+        completed_ids = {
+            str(message.get("tool_call_id"))
+            for message in run.messages[assistant_index + 1 :]
+            if message.get("role") == "tool" and message.get("tool_call_id")
+        }
+        repaired = 0
+        for call in batch:
+            if str(call["id"]) in completed_ids:
+                continue
             run.messages.append(
                 {
                     "role": "tool",
@@ -1798,7 +1940,8 @@ class AgentManager:
                     ),
                 }
             )
-        return len(last["tool_calls"])
+            repaired += 1
+        return repaired
 
 
 def _model_tool(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:

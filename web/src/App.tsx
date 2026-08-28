@@ -247,6 +247,10 @@ export default function App() {
   ));
   const leftDrawerMode = viewportWidth <= 680;
   const rightDrawerMode = viewportWidth <= 980;
+  const providerReady = Boolean(
+    forge.provider?.api_key_configured && forge.provider.connection_verified,
+  );
+  const providerConfigured = Boolean(forge.provider?.api_key_configured);
 
   useEffect(() => {
     if (forge.run?.state === "verifying") setInspectorTab("verifier");
@@ -345,7 +349,8 @@ export default function App() {
         status={forge.status}
         connected={forge.connected}
         run={forge.run}
-        providerReady={Boolean(forge.provider?.api_key_configured)}
+        providerReady={providerReady}
+        providerConfigured={providerConfigured}
         historyExpanded={leftDrawerMode ? mobilePane === "sidebar" : !leftCollapsed}
         inspectorExpanded={rightDrawerMode ? mobilePane === "inspector" : !rightCollapsed}
         onHistory={toggleHistory}
@@ -385,7 +390,7 @@ export default function App() {
               project={composerProject}
               demoMode={forge.status?.mode === "demo"}
               provider={forge.provider}
-              providerReady={Boolean(forge.provider?.api_key_configured)}
+              providerReady={providerReady}
               onOpenSettings={() => setShowSettings(true)}
               onCancel={() => setShowComposer(false)}
               onSubmit={async (task, mode, approvalMode, reasoningEffort, target) => {
@@ -406,6 +411,7 @@ export default function App() {
               run={forge.run}
               events={forge.events}
               provider={forge.provider}
+              providerReady={providerReady}
               followUpEnabled={forge.status?.mode !== "demo"}
               onAnswer={(answers) => {
                 void forge.answerQuestions(answers)?.catch(() => undefined);
@@ -493,6 +499,7 @@ function Header({
   connected,
   run,
   providerReady,
+  providerConfigured,
   historyExpanded,
   inspectorExpanded,
   onHistory,
@@ -503,6 +510,7 @@ function Header({
   connected: boolean;
   run: Run | null;
   providerReady: boolean;
+  providerConfigured: boolean;
   historyExpanded: boolean;
   inspectorExpanded: boolean;
   onHistory: () => void;
@@ -518,8 +526,10 @@ function Header({
     ? connected ? "已连接实时运行事件" : "正在重连持久化运行事件"
     : localReady
       ? providerReady
-        ? "本地服务已就绪，模型凭证已配置"
-        : "本地服务已就绪，仍需配置模型"
+        ? "本地服务已就绪，模型连接已验证"
+        : providerConfigured
+          ? "本地服务已就绪，需要验证模型连接"
+          : "本地服务已就绪，仍需配置模型"
       : "正在连接本地 TraceForge 服务";
   return (
     <header className="topbar">
@@ -557,7 +567,11 @@ function Header({
           <ShieldCheck size={13} />
           <span>{!status ? "检测中" : status.sandbox.enforced ? status.sandbox.backend : "仅策略限制"}</span>
         </div>
-        {run && <div className="context-item"><Wrench size={14} /><span>{run.step_count} 步</span></div>}
+        {run && (
+          <div className="context-item" title="当前轮已计入预算的非终态工具动作">
+            <Wrench size={14} /><span>{run.step_count} 本轮动作</span>
+          </div>
+        )}
         {run && (
           <div
             className="context-item"
@@ -578,7 +592,7 @@ function Header({
           className={`icon-button settings-button ${providerReady ? "" : "needs-attention"}`}
           type="button"
           onClick={onSettings}
-          title={providerReady ? "模型设置" : "配置模型凭证"}
+          title={providerReady ? "模型设置" : providerConfigured ? "验证模型连接" : "配置模型凭证"}
           aria-label="模型设置"
         >
           <Settings size={16} />
@@ -915,7 +929,14 @@ function TaskComposer({
         {!providerReady && (
           <button className="setup-callout" type="button" onClick={onOpenSettings}>
             <AlertTriangle size={15} />
-            <span><strong>需要配置模型</strong><small>填写 API Key，并验证原生工具调用。</small></span>
+            <span>
+              <strong>{provider?.api_key_configured ? "需要验证模型连接" : "需要配置模型"}</strong>
+              <small>
+                {provider?.api_key_configured
+                  ? "已保存凭证；重新测试原生工具调用后即可发送。"
+                  : "填写 API Key，并验证原生工具调用。"}
+              </small>
+            </span>
             <ArrowRight size={15} />
           </button>
         )}
@@ -1294,7 +1315,7 @@ function ProviderDialog({
   provider: ProviderConfig;
   onClose: () => void;
   onSave: (config: ProviderUpdate) => Promise<ProviderConfig>;
-  onTest: () => Promise<ProviderProbe>;
+  onTest: (config: ProviderUpdate) => Promise<ProviderProbe>;
 }) {
   const [model, setModel] = useState(provider.model);
   const [baseUrl, setBaseUrl] = useState(provider.base_url ?? "");
@@ -1324,6 +1345,17 @@ function ProviderDialog({
   };
   const routeDraftChanged = model.trim() !== provider.model
     || (baseUrl.trim() || null) !== provider.base_url;
+  const connectionReady = provider.api_key_configured && provider.connection_verified;
+  const credentialDescription = provider.credential_source === "file"
+    ? "已安全保存在仅当前用户可读的本地文件"
+    : provider.credential_source === "environment"
+      ? provider.credential_env
+      : "在下方输入 API Key，或设置 OPENAI_API_KEY";
+  const verificationDescription = provider.verified_at
+    ? `${new Date(provider.verified_at).toLocaleString("zh-CN")} 已验证原生工具调用`
+    : provider.connection_verified
+      ? "当前运行模式已验证原生工具调用"
+      : "需要测试原生工具调用后才能开始或继续任务";
 
   return (
     <div className="modal-backdrop" role="presentation">
@@ -1332,32 +1364,32 @@ function ProviderDialog({
           <div><p className="eyebrow">模型服务</p><h2 id="provider-title">连接设置</h2></div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="关闭模型设置"><X size={17} /></button>
         </div>
-        <div className={`credential-status ${provider.api_key_configured ? "ready" : "missing"}`}>
-          {provider.api_key_configured ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}
+        <div className={`credential-status ${connectionReady ? "ready" : "missing"}`}>
+          {connectionReady ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}
           <div>
-            <strong>{provider.api_key_configured ? "凭证来源已就绪" : "需要凭证"}</strong>
-            <small>{provider.credential_source === "file" ? "已安全保存在仅当前用户可读的本地文件" : provider.credential_source === "environment" ? provider.credential_env : "在下方输入 API Key，或设置 OPENAI_API_KEY"}</small>
+            <strong>{connectionReady ? "连接已验证" : provider.api_key_configured ? "凭证已保存，等待验证" : "需要凭证"}</strong>
+            <small>{credentialDescription} · {verificationDescription}</small>
           </div>
         </div>
-        <label className="field-label"><span>模型</span><input value={model} onChange={(event) => setModel(event.target.value)} data-dialog-initial-focus /></label>
-        <label className="field-label"><span>OpenAI 兼容接口地址</span><input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.deepseek.com" /></label>
+        <label className="field-label"><span>模型</span><input value={model} onChange={(event) => { setModel(event.target.value); setProbe(null); }} data-dialog-initial-focus /></label>
+        <label className="field-label"><span>OpenAI 兼容接口地址</span><input value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setProbe(null); }} placeholder="https://api.deepseek.com" /></label>
         <div className={`reasoning-capability-note ${provider.reasoning_effort_source}`}>
           <Gauge size={16} />
           <span>
             <strong>当前已保存配置 · 思考强度：{provider.supported_reasoning_efforts.length > 1 ? "精确模型能力已识别" : "仅跟随模型默认"}</strong>
-            <small>{routeDraftChanged ? "模型或接口草稿已变化；保存后才会重新解析能力。 · " : ""}{reasoningCapabilityDescription(provider)} · 目录 {provider.reasoning_effort_catalog_version}</small>
+            <small>{routeDraftChanged ? "模型或接口草稿已变化；测试并保存后才会重新解析能力。 · " : ""}{reasoningCapabilityDescription(provider)} · 目录 {provider.reasoning_effort_catalog_version}</small>
           </span>
         </div>
         <label className="field-label">
           <span>API Key</span>
-          <input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={provider.api_key_configured ? "已配置；留空则保持不变" : "输入模型服务的 API Key"} />
+          <input type="password" autoComplete="off" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setProbe(null); }} placeholder={provider.api_key_configured ? "已配置；留空则保持不变" : "输入模型服务的 API Key"} />
           <small>只写入本机仅当前用户可读的私密文件；页面、数据库与运行记录都不会保存或回显 Key。</small>
         </label>
         <details className="advanced-settings">
           <summary>高级设置</summary>
           <label className="field-label">
             <span>凭证文件路径</span>
-            <input value={credentialFile} onChange={(event) => setCredentialFile(event.target.value)} placeholder="/absolute/path/to/owner-only-key-file" disabled={Boolean(apiKey.trim())} />
+            <input value={credentialFile} onChange={(event) => { setCredentialFile(event.target.value); setProbe(null); }} placeholder="/absolute/path/to/owner-only-key-file" disabled={Boolean(apiKey.trim())} />
             <small>文件必须只有一行，并使用仅所有者权限（chmod 600）。输入 API Key 时会忽略此路径。</small>
           </label>
           <label className="field-label">
@@ -1368,7 +1400,7 @@ function ProviderDialog({
               max={10_000_000}
               step={1}
               value={contextWindow}
-              onChange={(event) => setContextWindow(event.target.value)}
+              onChange={(event) => { setContextWindow(event.target.value); setProbe(null); }}
               placeholder="留空自动识别"
               aria-invalid={!contextWindowValid}
             />
@@ -1382,11 +1414,20 @@ function ProviderDialog({
         {probe && (
           <div className={`probe-result ${probe.ok ? "ready" : "failed"}`} role="status">
             {probe.ok ? <CheckCircle2 size={16} /> : <OctagonX size={16} />}
-            <span><strong>{probe.ok ? "原生工具调用已验证" : "连接检查失败"}</strong><small>{systemMessageLabel(probe.detail)} · {probe.latency_ms} 毫秒</small></span>
+            <span>
+              <strong>
+                {probe.ok
+                  ? "原生工具调用已验证"
+                  : probe.provider.connection_verified
+                    ? "草稿检查失败，已保存连接仍有效"
+                    : "连接检查失败"}
+              </strong>
+              <small>{systemMessageLabel(probe.detail)} · {probe.latency_ms} 毫秒</small>
+            </span>
           </div>
         )}
         <div className="modal-actions">
-          <span className="muted">任务停止或安全暂停时可以修改设置；继续任务会使用新连接。</span>
+          <span className="muted">测试成功才会保存并启用连接；单独保存会要求重新测试。</span>
           <div className="button-row">
             <button
               className="button"
@@ -1395,14 +1436,21 @@ function ProviderDialog({
               onClick={() => {
                 setWorking("test");
                 setProbe(null);
-                void onSave(config)
-                  .then(() => onTest())
-                  .then(setProbe)
+                void onTest(config)
+                  .then((result) => {
+                    setProbe(result);
+                    if (!result.ok) return;
+                    setModel(result.provider.model);
+                    setBaseUrl(result.provider.base_url ?? "");
+                    setApiKey("");
+                    setCredentialFile(result.provider.credential_file ?? "");
+                    setContextWindow(result.provider.context_window?.toString() ?? "");
+                  })
                   .catch(() => undefined)
                   .finally(() => setWorking(null));
               }}
             >
-              {working === "test" ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />} 测试连接
+              {working === "test" ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />} 测试并保存
             </button>
             <button
               className="button primary"
@@ -1429,6 +1477,7 @@ function RunStage({
   run,
   events,
   provider,
+  providerReady,
   onAnswer,
   onPlan,
   onAction,
@@ -1443,6 +1492,7 @@ function RunStage({
   run: Run;
   events: RunEvent[];
   provider: ProviderConfig | null;
+  providerReady: boolean;
   followUpEnabled: boolean;
   onAnswer: (answers: ClarificationAnswer[]) => void;
   onPlan: (decision: "approve" | "revise", feedback?: string) => void;
@@ -1495,7 +1545,13 @@ function RunStage({
             <button className="button danger-ghost" type="button" onClick={onCancel}><Square size={14} /> 停止</button>
           )}
           {run.state === "interrupted" && (
-            <button className="button" type="button" onClick={onResume}><Play size={14} /> 继续</button>
+            <button
+              className="button"
+              type="button"
+              onClick={onResume}
+              disabled={!providerReady}
+              title={providerReady ? "继续安全暂停的任务" : "请先测试并验证模型连接"}
+            ><Play size={14} /> 继续</button>
           )}
           {(["succeeded", "failed", "cancelled", "interrupted"].includes(run.state) || answeredTaskHasEdits) && (
             <button className="button ghost" type="button" onClick={() => setConfirmRollback(true)}><RotateCcw size={14} /> 回滚</button>
@@ -1538,6 +1594,7 @@ function RunStage({
             defaultApprovalMode={run.approval_mode}
             defaultReasoningEffort={run.reasoning_effort}
             provider={provider}
+            providerReady={providerReady}
             onSubmit={onFollowUp}
           />
         )}
@@ -1843,11 +1900,13 @@ function FollowUpComposer({
   defaultApprovalMode,
   defaultReasoningEffort,
   provider,
+  providerReady,
   onSubmit,
 }: {
   defaultApprovalMode: ApprovalMode;
   defaultReasoningEffort: ReasoningEffort;
   provider: ProviderConfig | null;
+  providerReady: boolean;
   onSubmit: (
     prompt: string,
     mode: InteractionMode,
@@ -1884,7 +1943,7 @@ function FollowUpComposer({
       onSubmit={(event) => {
         event.preventDefault();
         const request = prompt.trim();
-        if (!request || submitting) return;
+        if (!request || submitting || !providerReady) return;
         setSubmitting(true);
         persistApprovalMode(approvalMode);
         void onSubmit(
@@ -1906,7 +1965,7 @@ function FollowUpComposer({
             key: event.key,
             shiftKey: event.shiftKey,
             isComposing: event.nativeEvent.isComposing,
-          }) && !submitting) {
+          }) && providerReady && !submitting) {
             event.preventDefault();
             event.currentTarget.form?.requestSubmit();
           }
@@ -1942,8 +2001,14 @@ function FollowUpComposer({
           onChange={setReasoningEffort}
           provider={provider}
         />
-        <span className="follow-up-hint">Enter 发送 · Shift+Enter 换行</span>
-        <button className="button primary" type="submit" disabled={!prompt.trim() || submitting}>
+        <span className="follow-up-hint">
+          {providerReady
+            ? "Enter 发送 · Shift+Enter 换行"
+            : provider?.api_key_configured
+              ? "需要验证模型连接：请在模型设置中重新测试"
+              : "需要配置模型：请先填写凭证并测试连接"}
+        </span>
+        <button className="button primary" type="submit" disabled={!prompt.trim() || submitting || !providerReady}>
           {submitting ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}
           继续任务
         </button>
@@ -2076,7 +2141,7 @@ function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; run
         <div className="modal-heading"><div><p className="eyebrow">可审计完成记录</p><h2 id="proof-title">证据包</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭证据包"><X size={17} /></button></div>
         {!visiblePack ? <div className="proof-loading"><LoaderCircle className="spin" size={18} /> 正在汇总持久化证据…</div> : <>
           <div className={`proof-verdict ${visiblePack.proof_status}`}><div className="evidence-seal"><Fingerprint size={22} /></div><div><span>证明状态</span><strong>{proofStatusLabel(visiblePack.proof_status)}</strong><small>{visiblePack.verification?.summary ?? "仍在汇总证据。"}</small></div><div><span>新鲜检查</span><strong>{visiblePack.checks_fresh ? "是" : "否"}</strong></div></div>
-          <div className="proof-grid"><article><span>工作边界</span><strong>{visiblePack.plan_gate ? planDecisionLabel(visiblePack.plan_gate.decision) : "未评估"}</strong><small>{visiblePack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>动作权限</span><strong>{approvalModeLabel(visiblePack.turns.at(-1)?.approval_mode ?? "automatic")}</strong><small>逐轮冻结 · 实际授权与 bypass 写入工具事件</small></article><article><span>思考强度</span><strong>{reasoningEffortLabel(visiblePack.turns.at(-1)?.reasoning_effort ?? "auto")}</strong><small>逐轮冻结 · 仅记录请求档位，不展示隐藏推理</small></article><article><span>变更范围</span><strong>{visiblePack.changed_files.length} 个文件</strong><small>{visiblePack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(visiblePack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(visiblePack.command_sandbox.status)}</strong><small>{visiblePack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {visiblePack.command_sandbox.sandboxed_commands} 个已强制隔离 · {visiblePack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(visiblePack.rollback.status)}</strong><small>{visiblePack.rollback.conflicts.length ? `保留 ${visiblePack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>{visiblePack.event_count} 条事件</strong><small>{visiblePack.step_count} 个工具步骤 · {visiblePack.repair_cycles} 轮修复</small></article></div>
+          <div className="proof-grid"><article><span>工作边界</span><strong>{visiblePack.plan_gate ? planDecisionLabel(visiblePack.plan_gate.decision) : "未评估"}</strong><small>{visiblePack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>动作权限</span><strong>{approvalModeLabel(visiblePack.turns.at(-1)?.approval_mode ?? "automatic")}</strong><small>逐轮冻结 · 实际授权与 bypass 写入工具事件</small></article><article><span>思考强度</span><strong>{reasoningEffortLabel(visiblePack.turns.at(-1)?.reasoning_effort ?? "auto")}</strong><small>逐轮冻结 · 仅记录请求档位，不展示隐藏推理</small></article><article><span>变更范围</span><strong>{visiblePack.changed_files.length} 个文件</strong><small>{visiblePack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(visiblePack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(visiblePack.command_sandbox.status)}</strong><small>{visiblePack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {visiblePack.command_sandbox.sandboxed_commands} 个已强制隔离 · {visiblePack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(visiblePack.rollback.status)}</strong><small>{visiblePack.rollback.conflicts.length ? `保留 ${visiblePack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>全任务 {visiblePack.event_count} 条事件</strong><small>当前轮 {visiblePack.step_count} 个工具动作 · {visiblePack.repair_cycles} 轮修复</small></article></div>
           <div className="proof-section"><div className="section-kicker">原始任务</div><p>{visiblePack.task}</p></div>
           <div className="proof-section"><div className="section-kicker">验收证据</div>{visiblePack.plan?.acceptance_checks.map((check) => <div className="proof-check" key={check.id}><CheckCircle2 size={14} /><span><strong>{check.label}</strong><small>{check.evidence || check.command?.join(" ") || "等待证据"}</small></span><em>{checkStatusLabel(check.status)}</em></div>) ?? <p className="muted">尚无完成契约。</p>}</div>
           <div className="digest-card"><Fingerprint size={15} /><span><small>稳定证据 SHA-256</small><code>{visiblePack.evidence_sha256}</code></span></div>
@@ -2300,6 +2365,7 @@ function systemMessageLabel(message: string): string {
     "Credential file could not be read as UTF-8": "无法按 UTF-8 读取凭证文件",
     "Credential file must contain exactly one non-empty line": "凭证文件必须恰好包含一行非空内容",
     "Configure a credential file or set OPENAI_API_KEY before starting a run": "开始任务前，请配置凭证文件或设置 OPENAI_API_KEY",
+    "Test and verify the model connection before starting or continuing a task": "开始或继续任务前，请先测试并验证模型连接",
     "Model must not be empty": "模型不能为空",
     "Base URL must be an absolute http:// or https:// URL": "接口地址必须是以 http:// 或 https:// 开头的绝对 URL",
     "Pause, stop, or finish running work before changing model settings": "请先暂停、停止或完成当前任务，再修改模型设置",

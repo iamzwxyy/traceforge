@@ -98,7 +98,7 @@ SCENARIOS = (
                 "tests/test_agent.py::"
                 "test_transient_model_outage_pauses_and_resumes_without_losing_run"
             ),
-            "tests/test_agent.py::test_resume_closes_an_incomplete_tool_call_without_replaying_it",
+            "tests/test_agent.py::test_resume_repairs_only_the_missing_result_in_a_partial_tool_batch",
             (
                 "tests/test_workspace.py::"
                 "test_rollback_restores_safe_files_while_preserving_one_conflict"
