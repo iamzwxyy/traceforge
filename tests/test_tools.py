@@ -336,6 +336,9 @@ async def test_command_scrubs_ambient_credentials_from_child_environment(
     monkeypatch.setenv("TRACEFORGE_TEST_PASSPHRASE", "passphrase-probe")
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent-probe.sock")
     monkeypatch.setenv("TRACEFORGE_TEST_PLAIN", "visible")
+    monkeypatch.setenv("VIRTUAL_ENV", "/outside/traceforge-runtime")
+    monkeypatch.setenv("VIRTUAL_ENV_PROMPT", "traceforge")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/outside/shared-environment")
 
     result = await registry.execute(
         "run-1",
@@ -349,7 +352,8 @@ async def test_command_scrubs_ambient_credentials_from_child_environment(
                     (
                         "import os; print('|'.join(os.getenv(name, 'absent') for name in "
                         "['TRACEFORGE_TEST_API_KEY', 'TRACEFORGE_TEST_PASSPHRASE', "
-                        "'SSH_AUTH_SOCK', 'TRACEFORGE_TEST_PLAIN']))"
+                        "'SSH_AUTH_SOCK', 'TRACEFORGE_TEST_PLAIN', 'VIRTUAL_ENV', "
+                        "'VIRTUAL_ENV_PROMPT', 'UV_PROJECT_ENVIRONMENT']))"
                     ),
                 ]
             },
@@ -357,7 +361,7 @@ async def test_command_scrubs_ambient_credentials_from_child_environment(
     )
 
     assert result.ok
-    assert result.output.strip() == "absent|absent|absent|visible"
+    assert result.output.strip() == "absent|absent|absent|visible|absent|absent|absent"
 
 
 @pytest.mark.asyncio

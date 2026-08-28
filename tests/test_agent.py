@@ -3707,6 +3707,76 @@ async def test_three_identical_tool_failures_stop_builder(
 
 
 @pytest.mark.asyncio
+async def test_recovery_guidance_follows_every_result_in_a_parallel_tool_batch(
+    settings: Settings, storage: Storage
+) -> None:
+    repeated_arguments = {"path": "missing.txt"}
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="first-failure",
+                        name="read_file",
+                        arguments=repeated_arguments,
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="second-failure",
+                        name="read_file",
+                        arguments=repeated_arguments,
+                    ),
+                    ToolCall(
+                        id="list-after-failure",
+                        name="list_files",
+                        arguments={"path": "."},
+                    ),
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "已检查工作区并完成恢复。"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("检查空工作区", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    finish_request = provider.requests[-1][0]
+    second_batch = next(
+        index
+        for index, message in enumerate(finish_request)
+        if any(
+            call.get("id") == "second-failure"
+            for call in message.get("tool_calls", [])
+        )
+    )
+    tail = finish_request[second_batch + 1 :]
+    assert [message.get("tool_call_id") for message in tail[:2]] == [
+        "second-failure",
+        "list-after-failure",
+    ]
+    assert tail[2]["role"] == "system"
+    assert "recovery mode" in tail[2]["content"]
+
+
+@pytest.mark.asyncio
 async def test_approved_unknown_command_runs_once(
     settings: Settings, storage: Storage
 ) -> None:

@@ -62,6 +62,14 @@ before finish. Call finish only when
 command-based acceptance checks have fresh passing evidence. The final summary must cite concrete
 changed files and checks, not hidden reasoning.
 
+For a new or empty workspace, produce the planned project files before broad environment
+investigation. Do not enumerate the host environment, installed modules, system paths, or
+directories outside the workspace to hunt for dependencies. At most one focused dependency
+availability check is useful before implementation. If a preferred dependency is unavailable,
+use an already available viable stack or create the declared project environment through its
+normal workspace-local package workflow; do not spend the task budget repeatedly probing the
+TraceForge host runtime.
+
 Use Simplified Chinese for all user-facing progress and the final summary. Preserve code,
 commands, identifiers, paths, API names, and quoted user text exactly when needed.
 """

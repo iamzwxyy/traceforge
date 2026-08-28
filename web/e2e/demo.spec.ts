@@ -29,10 +29,8 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByRole("radio", { name: /完全访问（工作区）/ })).toBeDisabled();
   await expect(page.getByRole("group", { name: /本轮思考强度：模型默认，唯一可用/ }))
     .toContainText("模型默认");
-  await expect(page.getByText(/当前模型仅提供这个档位/).first()).toBeVisible();
-  await expect(page.getByText("与计划模式独立", { exact: true })).toBeVisible();
-  await expect(page.getByText("本地就绪", { exact: true })).toBeVisible();
-  await expect(page.locator(".sandbox-status")).toContainText(/seatbelt|bubblewrap|仅策略限制/i);
+  await expect(page.getByRole("heading", { name: "固定演示" })).toBeVisible();
+  await expect(page.getByLabel("本地就绪")).toBeVisible();
 
   await page.getByRole("button", { name: "模型设置" }).click();
   await expect(page.locator('input[type="password"]')).toHaveAttribute("type", "password");
@@ -94,8 +92,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByLabel("继续此任务")).toHaveCount(0);
   await expectNoWcagViolations(page, "completed run");
   await expect(page.getByText("1 项检查通过", { exact: false })).toBeVisible();
-  await expect(page.getByText(/\d+(\.\d+)?k? \/ 64k 上下文/)).toBeVisible();
-  await expect(page.getByText("实时", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("实时")).toBeVisible();
   const trace = page.locator(".trace-details");
   await expect(trace).toBeVisible();
   await expect(trace).not.toHaveAttribute("open", "");
@@ -107,8 +104,8 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
 
   await page.reload();
   await expect(page.getByText("本轮已完成", { exact: true })).toBeVisible();
-  await expect(page.getByText(/\d+ 本轮动作/)).toBeVisible();
-  await expect(page.getByText("实时", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("实时")).toBeVisible();
+  await expect(page.getByText("第 1 轮", { exact: true })).toBeVisible();
   await expect(page.getByText("1 项检查通过", { exact: false })).toBeVisible();
   await page.getByRole("button", { name: "查看证据" }).click();
   const proofDialog = page.getByRole("dialog", { name: /截至第 \d+ 轮的累计证据包/ });
@@ -141,7 +138,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByText("已回滚", { exact: true }).first()).toBeVisible();
 
   await page.getByRole("button", { name: "新建任务" }).click();
-  await expect(page.getByRole("heading", { name: "你想让 TraceForge 帮你做什么？" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "固定演示" })).toBeVisible();
   await page.locator(".run-item").first().click();
   await expect(page.getByText("已回滚", { exact: true }).first()).toBeVisible();
   await page.getByRole("button", { name: "新建任务" }).click();

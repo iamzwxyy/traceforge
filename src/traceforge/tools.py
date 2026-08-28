@@ -585,7 +585,9 @@ class ToolRegistry:
         if hard_denial is not None:
             raise ValueError(hard_denial)
         command_temp = tempfile.TemporaryDirectory(prefix="traceforge-command-")
-        command_temp_path = Path(command_temp.name)
+        # macOS exposes /var as a symlink to /private/var. Seatbelt matches canonical
+        # paths, so pass the resolved directory to both the profile and child environment.
+        command_temp_path = await asyncio.to_thread(Path(command_temp.name).resolve)
         sandbox_home = command_temp_path / "home"
         sandbox_tmp = command_temp_path / "tmp"
         sandbox_cache = command_temp_path / "cache"
@@ -788,6 +790,11 @@ def _command_environment(
     workspace: Path, *, home: Path, temp: Path, cache: Path
 ) -> dict[str, str]:
     environment = scrubbed_environment()
+    # A TraceForge process commonly runs from its own virtual environment. Do not make
+    # project package managers treat that private runtime as the selected project env.
+    environment.pop("VIRTUAL_ENV", None)
+    environment.pop("VIRTUAL_ENV_PROMPT", None)
+    environment.pop("UV_PROJECT_ENVIRONMENT", None)
     runtime_dirs = [
         workspace / ".venv" / "bin",
         workspace / "venv" / "bin",

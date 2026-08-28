@@ -613,7 +613,7 @@ test("adding a project lands directly in that project's task composer", async ({
   await page.getByRole("button", { name: "添加项目" }).click();
 
   await expect(page.getByRole("heading", {
-    name: "你想在 billing-service 中处理什么？",
+    name: "billing-service",
   })).toBeVisible();
   await expect(page.locator(".composer-target")).toContainText(project.root);
   await expect(page.locator("textarea")).toBeFocused();

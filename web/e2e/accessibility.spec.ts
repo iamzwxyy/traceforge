@@ -4,7 +4,7 @@ import { expectNoWcagViolations } from "./a11y";
 test("new-task and setup dialogs meet the automated WCAG A/AA baseline", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "新建任务" }).click();
-  await expect(page.getByRole("heading", { name: "你想让 TraceForge 帮你做什么？" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /开始一个任务|固定演示/ })).toBeVisible();
   await expectNoWcagViolations(page, "new task");
 
   const settingsTrigger = page.getByRole("button", { name: "模型设置" });

@@ -150,6 +150,42 @@ async def test_enforced_sandbox_allows_workspace_write_and_blocks_escape(
 
 
 @pytest.mark.asyncio
+async def test_enforced_sandbox_allows_isolated_command_cache_writes(
+    settings: Settings, storage: Storage, workspace: Workspace
+) -> None:
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="cache-run", task="Probe cache", workspace=str(workspace.root)),
+    )
+    if not registry.sandbox_status.enforced:
+        pytest.skip(registry.sandbox_status.detail)
+
+    result = await registry.execute(
+        "cache-run",
+        ToolCall(
+            id="cache",
+            name="run_command",
+            arguments={
+                "argv": [
+                    "python3",
+                    "-c",
+                    (
+                        "import os; from pathlib import Path; "
+                        "cache = Path(os.environ['UV_CACHE_DIR']); "
+                        "cache.mkdir(parents=True); (cache / 'probe').write_text('ok')"
+                    ),
+                ]
+            },
+        ),
+    )
+
+    assert result.ok, result.output
+    assert result.metadata["sandbox"]["status"] == "enforced"
+
+
+@pytest.mark.asyncio
 async def test_enforced_sandbox_blocks_secret_file_contents(
     settings: Settings, storage: Storage, workspace: Workspace
 ) -> None:

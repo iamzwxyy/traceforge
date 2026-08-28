@@ -1578,6 +1578,7 @@ class AgentManager:
 
             publish_progress = bool(response.content)
             batch_succeeded = True
+            recovery_messages: list[dict[str, str]] = []
             for call in response.tool_calls:
                 run.step_count += 1
                 persisted_action_result: ToolResult | None = None
@@ -1659,7 +1660,7 @@ class AgentManager:
                     )
                     repeated_failures[fingerprint] = repeated_failures.get(fingerprint, 0) + 1
                     if repeated_failures[fingerprint] == 2:
-                        run.messages.append(
+                        recovery_messages.append(
                             {
                                 "role": "system",
                                 "content": (
@@ -1671,6 +1672,11 @@ class AgentManager:
                         )
                     elif repeated_failures[fingerprint] >= 3:
                         raise RuntimeError("The same tool call failed three times")
+                self.storage.save_run(run)
+            # OpenAI-compatible protocols require every result for one assistant tool-call
+            # batch to remain contiguous. Recovery guidance belongs after the complete batch.
+            run.messages.extend(recovery_messages)
+            if recovery_messages:
                 self.storage.save_run(run)
             if batch_succeeded:
                 consecutive_rejected_batches = 0

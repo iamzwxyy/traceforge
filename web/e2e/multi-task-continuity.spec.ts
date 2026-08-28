@@ -373,14 +373,14 @@ test("late create and follow-up responses cannot steal navigation or enable dupl
   await expect(send).toBeDisabled();
   await page.getByRole("button", { name: "在 background-project 中新建任务" }).click();
   await expect(page.getByRole("heading", {
-    name: "你想在 background-project 中处理什么？",
+    name: "background-project",
   })).toBeVisible();
   await expect(taskComposer.getByRole("radio", { name: /自动审批/ })).toBeChecked();
   createSuccess.resolve();
 
   await expect(runItem(page, "Create in background")).toBeVisible();
   await expect(page.getByRole("heading", {
-    name: "你想在 background-project 中处理什么？",
+    name: "background-project",
   })).toBeVisible();
   await expect(taskComposer.getByRole("radio", { name: /自动审批/ })).toBeChecked();
   await runItem(page, "Stable Beta").click();

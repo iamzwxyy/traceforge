@@ -102,7 +102,7 @@ const viewports = [
 test("new-task layout stays operable without horizontal overflow", async ({ page }) => {
   await page.setViewportSize({ width: viewports[0].width, height: 768 });
   await page.goto("/");
-  const heading = page.getByRole("heading", { name: "你想让 TraceForge 帮你做什么？" });
+  const heading = page.getByRole("heading", { name: /开始一个任务|固定演示/ });
   await page.getByRole("button", { name: "新建任务" }).click();
   await expect(heading).toBeVisible();
   for (const viewport of viewports) {

@@ -712,10 +712,7 @@ function Header({
       ><PanelLeft size={18} /></button>
       <div className="brand">
         <div className="brand-mark"><Hammer size={18} /></div>
-        <div>
-          <strong>TraceForge</strong>
-          <span>证据驱动的编程智能体</span>
-        </div>
+        <strong>TraceForge</strong>
       </div>
       <div className="topbar-context">
         <button
@@ -729,40 +726,19 @@ function Header({
           <GitBranch size={14} />
           <span>{run?.workspace ?? status?.workspace ?? "正在连接…"}</span>
         </div>
-        <div className="context-item"><Sparkles size={14} /><span>{status?.model ?? "—"}</span></div>
-        <div
-          className={`sandbox-status ${status?.sandbox.enforced ? "enforced" : status ? "degraded" : "pending"}`}
-          title={status ? sandboxDetailLabel(status.sandbox.detail) : "正在检测命令沙箱…"}
-        >
-          <ShieldCheck size={13} />
-          <span>{!status ? "检测中" : status.sandbox.enforced ? status.sandbox.backend : "仅策略限制"}</span>
-        </div>
-        {run && (
-          <div className="context-item" title="当前轮已计入预算的非终态工具动作">
-            <Wrench size={14} /><span>{run.step_count} 本轮动作</span>
-          </div>
-        )}
-        {run && (
-          <div
-            className="context-item"
-            title={`预计已使用 ${run.context_tokens.toLocaleString()} / ${run.context_limit.toLocaleString()} 个上下文 token`}
-          >
-            <Gauge size={14} />
-            <span>{formatTokens(run.context_tokens)} / {formatTokens(run.context_limit)} 上下文</span>
-          </div>
-        )}
         <div
           className={`connection ${connectionOnline ? "online" : "offline"}`}
           title={connectionTitle}
+          aria-label={connectionLabel}
+          role="status"
         >
           {connectionOnline ? <Wifi size={14} /> : <WifiOff size={14} />}
-          {connectionLabel}
         </div>
         <button
           className={`icon-button settings-button ${providerReady ? "" : "needs-attention"}`}
           type="button"
           onClick={onSettings}
-          title={providerReady ? "模型设置" : providerConfigured ? "验证模型连接" : "配置模型凭证"}
+          title={`${status?.model ?? "模型"} · ${providerReady ? "设置" : providerConfigured ? "验证连接" : "配置凭证"}`}
           aria-label="模型设置"
         >
           <Settings size={16} />
@@ -892,10 +868,6 @@ function Sidebar({
             </section>
           );
         })}
-      </div>
-      <div className="sidebar-footer">
-        <ShieldCheck size={14} />
-        <span>仅在本地 · 受工作区边界保护</span>
       </div>
       <PanelResizer
         side="left"
@@ -1064,16 +1036,7 @@ function TaskComposer({
   const targetLabel = project ? project.name : demoMode ? "固定演示" : "直接任务";
   return (
     <div className="composer-wrap">
-      <div className="hero-symbol"><Code2 size={30} /></div>
-      <p className="eyebrow">{targetLabel} · 新建对话</p>
-      <h1>{project ? `你想在 ${project.name} 中处理什么？` : "你想让 TraceForge 帮你做什么？"}</h1>
-      <p className="hero-copy">
-        {project
-          ? `任务会在 ${project.root} 中执行，并归入这个项目。`
-          : demoMode
-            ? "这是可重复的固定导览，只接受下方预置案例；真实任务请运行 traceforge。"
-            : "可以直接提问，也可以描述要实现的结果；需要实施时，TraceForge 会在独立目录中工作并提供完成证据。"}
-      </p>
+      <h1>{project ? project.name : demoMode ? "固定演示" : "开始一个任务"}</h1>
       <form
         className="task-composer"
         onSubmit={(event) => {
@@ -1114,12 +1077,10 @@ function TaskComposer({
         )}
         <div className="composer-target" title={project?.root ?? defaultWorkspace}>
           {project ? <FolderOpen size={16} /> : <Code2 size={16} />}
-          <span>
-            <strong>{targetLabel}</strong>
-            <small>
-              {project?.root ?? (demoMode ? defaultWorkspace : `在 ${defaultWorkspace} 下自动创建独立目录`)}
-            </small>
-          </span>
+          <strong>{targetLabel}</strong>
+          <small>
+            {project?.root ?? (demoMode ? defaultWorkspace : "自动创建独立目录")}
+          </small>
         </div>
         <textarea
           autoFocus
@@ -1143,8 +1104,8 @@ function TaskComposer({
               event.currentTarget.form?.requestSubmit();
             }
           }}
-          placeholder="例如：解释这个项目的结构；或修复多租户缓存串读，补充回归测试并确保检查通过。"
-          rows={6}
+          placeholder="描述要完成的任务…"
+          rows={5}
         />
         <ApprovalModePicker
           value={draft.approvalMode}
@@ -1157,7 +1118,7 @@ function TaskComposer({
           <label className="toggle-row plan-mode-toggle">
             <input type="checkbox" checked={draft.planMode} onChange={(event) => onDraftChange({ ...draft, planMode: event.target.checked })} disabled={demoMode || submitting} />
             <span className="toggle" />
-            <span><strong>计划模式</strong><small>先生成完整方案，确认后再实施</small></span>
+            <span><strong>计划模式</strong></span>
           </label>
           <ReasoningEffortPicker
             value={effectiveReasoningEffort}
@@ -1165,19 +1126,16 @@ function TaskComposer({
             provider={provider}
             disabled={demoMode || submitting}
           />
-          <div className="composer-safeguards" aria-label="任务保障">
-            <span><ShieldCheck size={13} /><strong>{approvalModeLabel(draft.approvalMode)}</strong> · {approvalModeShortDescription(draft.approvalMode)}</span>
-            <span><CheckCircle2 size={13} /><strong>完成后复核</strong> · 独立只读审查</span>
-          </div>
           <div className="button-row">
             {canCancel && <button className="button ghost" type="button" onClick={onCancel} disabled={submitting}>取消</button>}
             <button
-              className="button primary"
+              className="button primary send-button"
               type="submit"
               disabled={!draft.task.trim() || !providerReady || submitting}
+              aria-label="发送"
+              title="发送"
             >
-              {submitting ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={16} />}
-              发送
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}
             </button>
           </div>
         </div>
@@ -1218,12 +1176,13 @@ function ApprovalModePicker({
   ];
   return (
     <fieldset className="approval-mode-picker">
-      <legend>权限模式 <small>与计划模式独立</small></legend>
+      <legend>权限</legend>
       <div>
         {options.map((option) => (
           <label
             className={`${value === option.value ? "selected" : ""} ${option.value}`}
             key={option.value}
+            title={option.description}
           >
             <input
               type="radio"
@@ -1233,8 +1192,7 @@ function ApprovalModePicker({
               disabled={disabled}
               onChange={() => onChange(option.value)}
             />
-            <span className="radio-dot" />
-            <span><strong>{option.label}</strong><small>{option.description}</small></span>
+            <span>{option.label}</span>
           </label>
         ))}
       </div>
@@ -1260,7 +1218,7 @@ function ReasoningEffortPicker({
     : `${reasoningEffortDescription(effectiveValue)} ${reasoningCapabilityDescription(provider)}`;
   return (
     <div className="reasoning-effort-picker">
-      <span><Gauge size={13} /> 思考强度</span>
+      <span><Gauge size={13} /> 思考</span>
       {!provider ? (
         <div
           className="reasoning-effort-fixed"
@@ -1299,7 +1257,6 @@ function ReasoningEffortPicker({
           <ChevronDown aria-hidden="true" size={13} />
         </label>
       )}
-      <small>{description}</small>
     </div>
   );
 }
@@ -1840,8 +1797,7 @@ function RunStage({
             <ApprovalModeBadge mode={run.approval_mode} />
             <ReasoningEffortBadge effort={run.reasoning_effort} />
             {workspaceRules && <WorkspaceRulesBadge manifest={workspaceRules} />}
-            <span>{run.mode === "plan" ? "计划模式" : "普通 Agent"} · 第 {currentTurnIndex} 轮</span>
-            <span>任务 {run.id.slice(0, 8).toUpperCase()}</span>
+            <span>第 {currentTurnIndex} 轮</span>
             {run.parent_run_id && (
               <span title={`回滚前任务 ${run.parent_run_id}`}>续自回滚任务 {run.parent_run_id.slice(0, 8).toUpperCase()}</span>
             )}
@@ -3039,14 +2995,6 @@ function approvalModeLabel(mode: string): string {
   });
 }
 
-function approvalModeShortDescription(mode: ApprovalMode): string {
-  return {
-    manual: "编辑与命令逐项确认",
-    automatic: "计划内自动，未知项询问",
-    full_access: "沙箱内免询问",
-  }[mode];
-}
-
 function approvalModeDescription(mode: ApprovalMode): string {
   return {
     manual: "读取自动执行；每次编辑和命令均等待你的确认。",
@@ -3179,18 +3127,6 @@ function sandboxStatusLabel(status: string): string {
     mixed: "混合模式",
     not_used: "未使用",
   });
-}
-
-function sandboxDetailLabel(detail: string): string {
-  const labels: Record<string, string> = {
-    "Seatbelt limits writes to the workspace and isolated command temp, with loopback-only network.": "Seatbelt 将写入限制在工作区和隔离的命令临时目录中，网络仅允许环回访问。",
-    "Seatbelt is unavailable; command safety is policy-only.": "Seatbelt 不可用；命令安全当前仅由策略限制。",
-    "Setuid bubblewrap is rejected; install a current non-setuid build.": "已拒绝 setuid Bubblewrap；请安装当前版本的非 setuid 构建。",
-    "Bubblewrap limits writes to the workspace and isolated command temp, with isolated processes and network.": "Bubblewrap 将写入限制在工作区和隔离的命令临时目录中，并隔离进程与网络。",
-    "Install working bubblewrap for OS enforcement; command safety is policy-only.": "请安装可用的 Bubblewrap 以启用系统级隔离；命令安全当前仅由策略限制。",
-    "This operating system has no TraceForge sandbox backend; safety is policy-only.": "当前操作系统没有 TraceForge 沙箱后端；安全性仅由策略限制。",
-  };
-  return labels[detail] ?? detail;
 }
 
 function systemMessageLabel(message: string): string {
@@ -3355,12 +3291,6 @@ function relativeTime(value: string): string {
 
 function projectNameFromPath(path: string): string {
   return path.replace(/\/$/, "").split("/").filter(Boolean).at(-1) ?? "本地项目";
-}
-
-function formatTokens(value: number): string {
-  if (value < 1_000) return String(value);
-  const compact = value / 1_000;
-  return `${compact >= 10 ? Math.round(compact) : compact.toFixed(1).replace(/\.0$/, "")}k`;
 }
 
 function clockTime(value: string): string {
