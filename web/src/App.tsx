@@ -51,6 +51,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import { isActiveState, parseDiff, presentState, shouldSubmitPrompt } from "./lib";
 import type {
+  ApprovalMode,
   ClarificationAnswer,
   DirectoryListing,
   InteractionMode,
@@ -77,6 +78,27 @@ const LEFT_PANEL_DEFAULT = 276;
 const RIGHT_PANEL_MIN = 300;
 const RIGHT_PANEL_MAX = 560;
 const RIGHT_PANEL_DEFAULT = 390;
+const APPROVAL_MODE_PREFERENCE_KEY = "traceforge:approval-mode:v1";
+
+function storedApprovalMode(): ApprovalMode {
+  try {
+    const value = window.localStorage.getItem(APPROVAL_MODE_PREFERENCE_KEY);
+    return value === "manual" ? value : "automatic";
+  } catch {
+    return "automatic";
+  }
+}
+
+function persistApprovalMode(value: ApprovalMode): void {
+  try {
+    window.localStorage.setItem(
+      APPROVAL_MODE_PREFERENCE_KEY,
+      value === "full_access" ? "automatic" : value,
+    );
+  } catch {
+    // Permission preference persistence is best-effort; every run also stores its mode.
+  }
+}
 
 function panelPreferenceKey(name: string): string {
   return `traceforge:layout:${PANEL_PREFERENCE_VERSION}:${name}`;
@@ -355,8 +377,8 @@ export default function App() {
               providerReady={Boolean(forge.provider?.api_key_configured)}
               onOpenSettings={() => setShowSettings(true)}
               onCancel={() => setShowComposer(false)}
-              onSubmit={async (task, mode, target) => {
-                await forge.createRun(task, mode, target);
+              onSubmit={async (task, mode, approvalMode, target) => {
+                await forge.createRun(task, mode, approvalMode, target);
                 setShowComposer(false);
               }}
               canCancel={Boolean(forge.run)}
@@ -377,8 +399,8 @@ export default function App() {
                 void forge.loadProofPack(forge.run!.id);
               }}
               onOpenWorkspace={() => forge.openWorkspace(forge.run!.id)}
-              onFollowUp={async (prompt, mode) => {
-                await forge.followUp(prompt, mode);
+              onFollowUp={async (prompt, mode, approvalMode) => {
+                await forge.followUp(prompt, mode, approvalMode);
               }}
             />
           )}
@@ -793,12 +815,20 @@ function TaskComposer({
   demoMode: boolean;
   providerReady: boolean;
   onOpenSettings: () => void;
-  onSubmit: (task: string, mode: InteractionMode, target: RunTarget) => Promise<void>;
+  onSubmit: (
+    task: string,
+    mode: InteractionMode,
+    approvalMode: ApprovalMode,
+    target: RunTarget,
+  ) => Promise<void>;
   onCancel: () => void;
   canCancel: boolean;
 }) {
   const [task, setTask] = useState(suggestedTask);
   const [planMode, setPlanMode] = useState(demoMode);
+  const [approvalMode, setApprovalMode] = useState<ApprovalMode>(
+    demoMode ? "automatic" : storedApprovalMode,
+  );
   const [submitting, setSubmitting] = useState(false);
   const targetLabel = project ? project.name : demoMode ? "固定演示" : "直接任务";
   return (
@@ -824,7 +854,13 @@ function TaskComposer({
             : demoMode
               ? {}
               : { create_direct_workspace: true };
-          void onSubmit(task.trim(), planMode ? "plan" : "agent", target)
+          persistApprovalMode(approvalMode);
+          void onSubmit(
+            task.trim(),
+            planMode ? "plan" : "agent",
+            demoMode ? "automatic" : approvalMode,
+            target,
+          )
             .catch(() => undefined)
             .finally(() => setSubmitting(false));
         }}
@@ -868,6 +904,14 @@ function TaskComposer({
           placeholder="例如：解释这个项目的结构；或修复多租户缓存串读，补充回归测试并确保检查通过。"
           rows={6}
         />
+        <ApprovalModePicker
+          value={approvalMode}
+          onChange={(value) => {
+            setApprovalMode(value);
+            persistApprovalMode(value);
+          }}
+          disabled={demoMode}
+        />
         <div className="composer-actions">
           <label className="toggle-row plan-mode-toggle">
             <input type="checkbox" checked={planMode} onChange={(event) => setPlanMode(event.target.checked)} disabled={demoMode} />
@@ -875,7 +919,7 @@ function TaskComposer({
             <span><strong>计划模式</strong><small>先生成完整方案，确认后再实施</small></span>
           </label>
           <div className="composer-safeguards" aria-label="任务保障">
-            <span><ShieldCheck size={13} /><strong>工作区内自动</strong> · 越界询问</span>
+            <span><ShieldCheck size={13} /><strong>{approvalModeLabel(approvalMode)}</strong> · {approvalModeShortDescription(approvalMode)}</span>
             <span><CheckCircle2 size={13} /><strong>完成后复核</strong> · 独立只读审查</span>
           </div>
           <div className="button-row">
@@ -892,6 +936,62 @@ function TaskComposer({
         </div>
       </form>
     </div>
+  );
+}
+
+function ApprovalModePicker({
+  value,
+  onChange,
+  disabled = false,
+}: {
+  value: ApprovalMode;
+  onChange: (value: ApprovalMode) => void;
+  disabled?: boolean;
+}) {
+  const options: Array<{
+    value: ApprovalMode;
+    label: string;
+    description: string;
+  }> = [
+    {
+      value: "manual",
+      label: "手动审批",
+      description: "编辑与命令逐项确认；读取不打断",
+    },
+    {
+      value: "automatic",
+      label: "自动审批",
+      description: "本地规则放行计划内动作；未知项询问",
+    },
+    {
+      value: "full_access",
+      label: "完全访问（工作区）",
+      description: "沙箱内免询问；无 OS 沙箱时未知命令降级确认",
+    },
+  ];
+  return (
+    <fieldset className="approval-mode-picker">
+      <legend>权限模式 <small>与计划模式独立</small></legend>
+      <div>
+        {options.map((option) => (
+          <label
+            className={`${value === option.value ? "selected" : ""} ${option.value}`}
+            key={option.value}
+          >
+            <input
+              type="radio"
+              name="approval-mode"
+              value={option.value}
+              checked={value === option.value}
+              disabled={disabled}
+              onChange={() => onChange(option.value)}
+            />
+            <span className="radio-dot" />
+            <span><strong>{option.label}</strong><small>{option.description}</small></span>
+          </label>
+        ))}
+      </div>
+    </fieldset>
   );
 }
 
@@ -1226,7 +1326,11 @@ function RunStage({
   onRollback: () => void;
   onProof: () => void;
   onOpenWorkspace: () => Promise<unknown>;
-  onFollowUp: (prompt: string, mode: InteractionMode) => Promise<void>;
+  onFollowUp: (
+    prompt: string,
+    mode: InteractionMode,
+    approvalMode: ApprovalMode,
+  ) => Promise<void>;
 }) {
   const [confirmRollback, setConfirmRollback] = useState(false);
   const [openingWorkspace, setOpeningWorkspace] = useState(false);
@@ -1239,6 +1343,7 @@ function RunStage({
           <div className="run-header-meta">
             <StateBadge state={run.state} />
             {run.mode === "plan" && run.plan_gate && <PlanGateBadge gate={run.plan_gate} />}
+            <ApprovalModeBadge mode={run.approval_mode} />
             <span>{run.mode === "plan" ? "计划模式" : "普通 Agent"} · 第 {Math.max(run.turns.length, 1)} 轮</span>
             <span>任务 {run.id.slice(0, 8).toUpperCase()}</span>
           </div>
@@ -1300,7 +1405,10 @@ function RunStage({
         {run.error && <Notice icon={<OctagonX size={18} />} title={run.state === "interrupted" ? "暂停原因" : "停止原因"} danger={run.state !== "interrupted"}>{systemMessageLabel(run.error)}</Notice>}
         {run.state === "succeeded" && <CompletionSummary run={run} onProof={onProof} />}
         {followUpEnabled && ["answered", "succeeded", "failed", "cancelled"].includes(run.state) && (
-          <FollowUpComposer onSubmit={onFollowUp} />
+          <FollowUpComposer
+            defaultApprovalMode={run.approval_mode}
+            onSubmit={onFollowUp}
+          />
         )}
       </div>
       {confirmRollback && (
@@ -1372,7 +1480,8 @@ function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
       )}
       {conversation.map((event) => {
         if (event.type === "turn.started") {
-          return <article className="conversation-turn user-turn" key={event.seq}><span>你 · 第 {String(event.payload.index ?? "?")} 轮</span><p>{String(event.payload.request ?? "")}</p></article>;
+          const approvalMode = String(event.payload.approval_mode ?? "automatic") as ApprovalMode;
+          return <article className="conversation-turn user-turn" key={event.seq}><span>你 · 第 {String(event.payload.index ?? "?")} 轮 · {approvalModeLabel(approvalMode)}</span><p>{String(event.payload.request ?? "")}</p></article>;
         }
         if (event.type === "turn.completed") {
           const index = Number(event.payload.index ?? 0);
@@ -1492,6 +1601,10 @@ function ToolActivityItem({ event }: { event: RunEvent }) {
   const call = (event.payload.call ?? {}) as { name?: string; arguments?: Record<string, unknown> };
   const result = (event.payload.result ?? {}) as { ok?: boolean; output?: string; error?: string; metadata?: Record<string, unknown> };
   const sandbox = result.metadata?.sandbox as { status?: string; backend?: string } | undefined;
+  const permission = result.metadata?.permission as {
+    mode?: ApprovalMode;
+    outcome?: string;
+  } | undefined;
   const [expanded, setExpanded] = useState(!result.ok);
   return (
     <article className={`activity tool-card ${result.ok ? "ok" : "bad"}`}>
@@ -1499,7 +1612,10 @@ function ToolActivityItem({ event }: { event: RunEvent }) {
       <div className="tool-body">
         <button className="tool-summary" type="button" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
           <span className="tool-summary-copy"><span className="tool-title"><code>{call.name ?? "工具"}</code><em>{result.ok ? "已完成" : "失败"}</em></span><span className="tool-args">{formatArguments(call.arguments)}</span></span>
-          {sandbox && <span className={`sandbox-evidence ${sandbox.status ?? "not_used"}`}>{sandbox.status === "enforced" ? sandbox.backend : sandboxStatusLabel(sandbox.status ?? "not_used")}</span>}
+          <span className="tool-evidence-badges">
+            {permission && <span className={`permission-evidence ${permission.mode ?? "automatic"}`}>{permissionOutcomeLabel(permission.mode, permission.outcome)}</span>}
+            {sandbox && <span className={`sandbox-evidence ${sandbox.status ?? "not_used"}`}>{sandbox.status === "enforced" ? sandbox.backend : sandboxStatusLabel(sandbox.status ?? "not_used")}</span>}
+          </span>
           <ChevronDown className={`tool-chevron ${expanded ? "expanded" : ""}`} size={13} />
         </button>
         {expanded && (result.output || result.error) && <pre>{result.error ?? result.output}</pre>}
@@ -1571,10 +1687,10 @@ function PlanPanel({ runId, plan, gate, onDecision }: { runId: string; plan: Tas
 function ApprovalPanel({ approval, onDecision }: { approval: NonNullable<Run["pending_approval"]>; onDecision: (approved: boolean) => void }) {
   return (
     <div className="decision-panel approval-panel">
-      <div className="decision-heading"><AlertTriangle size={19} /><div><p>动作审批 · {riskLabel(approval.risk)}</p><h3>{approval.summary}</h3></div></div>
+      <div className="decision-heading"><AlertTriangle size={19} /><div><p>动作审批 · {approvalModeLabel(approval.approval_mode)} · {riskLabel(approval.risk)}</p><h3>{approval.summary}</h3></div></div>
       <p className="approval-reason">{approval.reason}</p>
       <pre>{JSON.stringify(approval.tool_call.arguments, null, 2)}</pre>
-      <div className="decision-actions"><span className="muted">未知命令绝不会静默执行。</span><div className="button-row"><button className="button danger-ghost" type="button" onClick={() => onDecision(false)}>拒绝</button><button className="button warning" type="button" onClick={() => onDecision(true)}>仅运行一次</button></div></div>
+      <div className="decision-actions"><span className="muted">{approval.sandbox_bypass_on_approve ? "批准后将仅本次绕过 OS 沙箱；凭证环境仍会清理。" : "批准不会主动绕过命令沙箱；主机若显示“仅策略限制”，则仍无 OS 级隔离。"} 工作区路径规则与证据记录始终保留。</span><div className="button-row"><button className="button danger-ghost" type="button" onClick={() => onDecision(false)}>拒绝</button><button className="button warning" type="button" onClick={() => onDecision(true)}>{approval.sandbox_bypass_on_approve ? "绕过并批准一次" : "批准并继续"}</button></div></div>
     </div>
   );
 }
@@ -1593,9 +1709,22 @@ function CompletionSummary({ run, onProof }: { run: Run; onProof: () => void }) 
   );
 }
 
-function FollowUpComposer({ onSubmit }: { onSubmit: (prompt: string, mode: InteractionMode) => Promise<void> }) {
+function FollowUpComposer({
+  defaultApprovalMode,
+  onSubmit,
+}: {
+  defaultApprovalMode: ApprovalMode;
+  onSubmit: (
+    prompt: string,
+    mode: InteractionMode,
+    approvalMode: ApprovalMode,
+  ) => Promise<void>;
+}) {
   const [prompt, setPrompt] = useState("");
   const [planMode, setPlanMode] = useState(false);
+  const [approvalMode, setApprovalMode] = useState<ApprovalMode>(
+    defaultApprovalMode === "full_access" ? "automatic" : defaultApprovalMode,
+  );
   const [submitting, setSubmitting] = useState(false);
   return (
     <form
@@ -1605,7 +1734,8 @@ function FollowUpComposer({ onSubmit }: { onSubmit: (prompt: string, mode: Inter
         const request = prompt.trim();
         if (!request || submitting) return;
         setSubmitting(true);
-        void onSubmit(request, planMode ? "plan" : "agent")
+        persistApprovalMode(approvalMode);
+        void onSubmit(request, planMode ? "plan" : "agent", approvalMode)
           .then(() => setPrompt(""))
           .catch(() => undefined)
           .finally(() => setSubmitting(false));
@@ -1633,6 +1763,22 @@ function FollowUpComposer({ onSubmit }: { onSubmit: (prompt: string, mode: Inter
           <input type="checkbox" checked={planMode} onChange={(event) => setPlanMode(event.target.checked)} />
           <span className="toggle" />
           <span><strong>计划模式</strong><small>本轮先审计划再执行</small></span>
+        </label>
+        <label className="approval-mode-select">
+          <span>权限</span>
+          <select
+            aria-label="本轮权限模式"
+            value={approvalMode}
+            onChange={(event) => {
+              const value = event.target.value as ApprovalMode;
+              setApprovalMode(value);
+              persistApprovalMode(value);
+            }}
+          >
+            <option value="manual">手动审批（逐项）</option>
+            <option value="automatic">自动审批（规则）</option>
+            <option value="full_access">完全访问（工作区）</option>
+          </select>
         </label>
         <span className="follow-up-hint">Enter 发送 · Shift+Enter 换行</span>
         <button className="button primary" type="submit" disabled={!prompt.trim() || submitting}>
@@ -1730,6 +1876,14 @@ function PlanGateBadge({ gate }: { gate: PlanGate }) {
   return <span className={`plan-gate-badge ${automatic ? "fast" : "reviewed"}`}>{automatic ? <Zap size={10} /> : <ShieldCheck size={10} />}{gate.decision === "agent_continues" ? "Agent 自动" : gate.decision === "auto_approved" ? "快速路径" : riskLabel(gate.risk)}</span>;
 }
 
+function ApprovalModeBadge({ mode }: { mode: ApprovalMode }) {
+  return (
+    <span className={`approval-mode-badge ${mode}`} title={approvalModeDescription(mode)}>
+      <ShieldCheck size={10} />{approvalModeLabel(mode)}
+    </span>
+  );
+}
+
 function PlanGateSummary({ gate }: { gate: PlanGate }) {
   const automatic = gate.decision !== "approval_required";
   const title = gate.decision === "agent_continues"
@@ -1748,7 +1902,7 @@ function ProofPackDialog({ pack, runId, onClose }: { pack: ProofPack | null; run
         <div className="modal-heading"><div><p className="eyebrow">可审计完成记录</p><h2 id="proof-title">证据包</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭证据包"><X size={17} /></button></div>
         {!pack ? <div className="proof-loading"><LoaderCircle className="spin" size={18} /> 正在汇总持久化证据…</div> : <>
           <div className={`proof-verdict ${pack.proof_status}`}><div className="evidence-seal"><Fingerprint size={22} /></div><div><span>证明状态</span><strong>{proofStatusLabel(pack.proof_status)}</strong><small>{pack.verification?.summary ?? "仍在汇总证据。"}</small></div><div><span>新鲜检查</span><strong>{pack.checks_fresh ? "是" : "否"}</strong></div></div>
-          <div className="proof-grid"><article><span>工作边界</span><strong>{pack.plan_gate ? planDecisionLabel(pack.plan_gate.decision) : "未评估"}</strong><small>{pack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>变更范围</span><strong>{pack.changed_files.length} 个文件</strong><small>{pack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(pack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(pack.command_sandbox.status)}</strong><small>{pack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {pack.command_sandbox.sandboxed_commands} 个已强制隔离 · {pack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(pack.rollback.status)}</strong><small>{pack.rollback.conflicts.length ? `保留 ${pack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>{pack.event_count} 条事件</strong><small>{pack.step_count} 个工具步骤 · {pack.repair_cycles} 轮修复</small></article></div>
+          <div className="proof-grid"><article><span>工作边界</span><strong>{pack.plan_gate ? planDecisionLabel(pack.plan_gate.decision) : "未评估"}</strong><small>{pack.plan_gate?.reasons.map(planGateReasonLabel).join(" · ")}</small></article><article><span>动作权限</span><strong>{approvalModeLabel(pack.turns.at(-1)?.approval_mode ?? "automatic")}</strong><small>逐轮冻结 · 实际授权与 bypass 写入工具事件</small></article><article><span>变更范围</span><strong>{pack.changed_files.length} 个文件</strong><small>{pack.changed_files.join(" · ") || "没有快照"} · {diffSourceLabel(pack.diff_source)}</small></article><article><span>命令沙箱</span><strong>{sandboxStatusLabel(pack.command_sandbox.status)}</strong><small>{pack.command_sandbox.backends.join(" · ") || "未记录操作系统沙箱后端"} · {pack.command_sandbox.sandboxed_commands} 个已强制隔离 · {pack.command_sandbox.not_executed_commands} 个运行前拦截</small></article><article><span>回滚</span><strong>{rollbackStatusLabel(pack.rollback.status)}</strong><small>{pack.rollback.conflicts.length ? `保留 ${pack.rollback.conflicts.length} 个冲突` : "可感知冲突"}</small></article><article><span>事件账本</span><strong>{pack.event_count} 条事件</strong><small>{pack.step_count} 个工具步骤 · {pack.repair_cycles} 轮修复</small></article></div>
           <div className="proof-section"><div className="section-kicker">原始任务</div><p>{pack.task}</p></div>
           <div className="proof-section"><div className="section-kicker">验收证据</div>{pack.plan?.acceptance_checks.map((check) => <div className="proof-check" key={check.id}><CheckCircle2 size={14} /><span><strong>{check.label}</strong><small>{check.evidence || check.command?.join(" ") || "等待证据"}</small></span><em>{checkStatusLabel(check.status)}</em></div>) ?? <p className="muted">尚无完成契约。</p>}</div>
           <div className="digest-card"><Fingerprint size={15} /><span><small>稳定证据 SHA-256</small><code>{pack.evidence_sha256}</code></span></div>
@@ -1796,6 +1950,40 @@ function agentPhaseLabel(phase: string): string {
     verifying: "验证",
     recovery: "恢复",
   });
+}
+
+function approvalModeLabel(mode: string): string {
+  return labelFromMap(mode, {
+    manual: "手动审批",
+    automatic: "自动审批",
+    full_access: "完全访问（工作区）",
+  });
+}
+
+function approvalModeShortDescription(mode: ApprovalMode): string {
+  return {
+    manual: "编辑与命令逐项确认",
+    automatic: "计划内自动，未知项询问",
+    full_access: "沙箱内免询问",
+  }[mode];
+}
+
+function approvalModeDescription(mode: ApprovalMode): string {
+  return {
+    manual: "读取自动执行；每次编辑和命令均等待你的确认。",
+    automatic: "本地确定性规则自动放行计划内动作，未知或越界动作转人工。",
+    full_access: "工作区与 OS 沙箱内不询问；不可关闭的高危命令和路径边界仍会拦截。",
+  }[mode];
+}
+
+function permissionOutcomeLabel(
+  mode: ApprovalMode | undefined,
+  outcome: string | undefined,
+): string {
+  if (outcome === "denied") return "策略拦截";
+  if (outcome === "user_rejected") return "用户拒绝";
+  if (outcome === "user_approved") return "手动批准";
+  return mode === "full_access" ? "工作区免询问" : "规则自动";
 }
 
 function planDecisionLabel(decision: string): string {

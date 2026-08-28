@@ -5,7 +5,9 @@
 TraceForge is a local coding agent built without an agent framework. The model can propose tool
 calls, but the application owns every consequential decision: a state machine, structured
 clarification, Agent/Plan interaction mode, path and command policy, subprocess lifecycle, evidence
-freshness, persistence, recovery, rollback, and independent completion review. Agent mode is the
+freshness, persistence, recovery, rollback, and independent completion review. A separate per-turn
+action-permission profile provides Manual, deterministic Automatic, and workspace-scoped Full
+access without conflating approval with the OS sandbox. Agent mode is the
 low-friction default; optional Plan mode pauses whenever implementation is needed. Greetings and
 read-only questions end as a distinct answer instead of fabricating a plan or proof. The visual workbench
 keeps multi-turn conversation primary while exposing the same persisted Trace used for recovery and
@@ -49,8 +51,8 @@ still reject the result and trigger a bounded repair cycle.
 No. Agent mode skips only the plan-review click. The model still submits a structured scope and
 acceptance contract before any mutation, and the application still enforces workspace paths, undeclared-file approval,
 command classification, sandboxing, and destructive-operation denial. Plan mode is available when
-the user wants to inspect the full Markdown plan first; permissions have the same meaning in both
-modes. A direct answer executes nothing and is labeled separately; completion review is also
+the user wants to inspect the full Markdown plan first; each action-permission profile has the same
+meaning in both interaction modes. A direct answer executes nothing and is labeled separately; completion review is also
 separate and read-only.
 
 ### What does the Proof Pack hash prove?
@@ -71,10 +73,22 @@ native code is harmless; a disposable VM remains the correct outer boundary for 
 ### Is approval the same as sandboxing?
 
 No. Policy decides whether an action is routine, approval records a human decision, and the OS
-sandbox constrains what a process can technically do. Planned checks normally stay sandboxed. An
-unknown command pauses; approving it creates one unsandboxed invocation and a visible bypass event.
+sandbox constrains what a process can technically do. In the default Automatic profile, planned
+checks stay sandboxed and an unknown command pauses; approving it creates one unsandboxed
+invocation and a visible bypass event. Manual confirmations stay sandboxed, and workspace Full
+access never creates an automatic bypass.
 The header, tool row, and Proof Pack all expose the actual state, including degraded policy-only
 machines.
+
+### What do the three action-permission choices actually mean?
+
+Manual is “ask every edit or command,” while reads remain uninterrupted. Automatic is the default
+deterministic policy: planned edits/checks and known reads run, drift and unknown commands ask.
+Workspace Full access removes those soft prompts only inside the Workspace guard and an enforced OS
+sandbox; without enforcement, unknown code falls back to a human decision. It is deliberately not
+host-wide Codex `danger-full-access`, never disables hard destructive denials, and is not persisted
+as the next turn's default. Tool events record the base and effective decision plus actual bypass,
+so the labels can be audited rather than trusted.
 
 ### What happens on a crash in the middle of a command?
 
@@ -91,8 +105,7 @@ recoverable view of the same source of truth rather than a best-effort stream.
 ### What would you build next?
 
 The fixed quality corpus and two low-frequency real-model scenarios now cover the main claims.
-Next: explicit approval profiles with defensible boundaries, followed by model reasoning-effort
-routing and richer language-aware patch validation. After that: optional stronger Linux profiles
+Next: model reasoning-effort routing and richer language-aware patch validation. After that: optional stronger Linux profiles
 and signed evidence.
 Parallel writers and plugins come later because they complicate attribution and recovery more than
 they improve this v0.1 demo.

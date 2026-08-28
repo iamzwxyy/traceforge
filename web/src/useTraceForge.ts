@@ -3,6 +3,7 @@ import { api } from "./api";
 import { mergeEvents, preferNewerRun } from "./lib";
 import type {
   AppStatus,
+  ApprovalMode,
   ClarificationAnswer,
   InteractionMode,
   Project,
@@ -168,10 +169,15 @@ export function useTraceForge() {
   );
 
   const createRun = useCallback(
-    async (task: string, mode: InteractionMode, target: RunTarget) => {
+    async (
+      task: string,
+      mode: InteractionMode,
+      approvalMode: ApprovalMode,
+      target: RunTarget,
+    ) => {
       setError(null);
       try {
-        const created = await api.createRun(task, mode, target);
+        const created = await api.createRun(task, mode, approvalMode, target);
         setRuns((current) => [created, ...current]);
         selectRun(created.id);
         setStatus(await api.status());
@@ -274,8 +280,8 @@ export function useTraceForge() {
     selectedRunId,
     selectRun,
     createRun,
-    followUp: (prompt: string, mode: InteractionMode) =>
-      run && perform(() => api.followUp(run.id, prompt, mode)),
+    followUp: (prompt: string, mode: InteractionMode, approvalMode: ApprovalMode) =>
+      run && perform(() => api.followUp(run.id, prompt, mode, approvalMode)),
     createProject,
     saveProvider,
     testProvider,

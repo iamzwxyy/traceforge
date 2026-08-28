@@ -35,6 +35,8 @@ flowchart TB
 - `assess_plan_gate` is a deterministic risk projection over the task and structured plan. The
   selected interaction mode—not a model claim—decides whether implementation pauses for review.
 - `ToolRegistry` defines and executes the bounded local capability surface.
+- `ToolRegistry.assess` produces an invariant base decision; `resolve_permission` applies the
+  persisted per-turn `ApprovalMode` without ever upgrading a hard denial.
 - `CommandSandbox` probes an OS backend and constructs a per-command profile; it returns structured
   enforcement metadata even when execution is policy-only or explicitly bypassed.
 - `Workspace` resolves paths, records the first pre-change snapshot, creates diffs, and rolls back.
@@ -55,7 +57,7 @@ stateDiagram-v2
     planning --> executing: Agent mode
     awaiting_plan_approval --> planning: revise
     awaiting_plan_approval --> executing: approve
-    executing --> awaiting_action_approval: unknown action
+    executing --> awaiting_action_approval: selected profile requires human
     awaiting_action_approval --> executing: allow or reject
     executing --> verifying: finish + fresh checks
     verifying --> executing: findings and repair budget
@@ -82,9 +84,12 @@ stateDiagram-v2
 ```
 
 Transitions are allowlisted. Invalid public actions return a conflict rather than silently
-changing state. A process shutdown records the previous phase and never automatically replays an
+changing state. `InteractionMode` does not add states for action permissions: Manual/Automatic/
+workspace Full access all reuse the same optional `awaiting_action_approval` gate. A process shutdown records the previous phase and never automatically replays an
 incomplete tool call. On resume, any unmatched assistant tool call receives a synthetic failure
-result before the model is called again, preserving the provider protocol.
+result before the model is called again, preserving the provider protocol. A persisted pending
+approval is first resolved as `abandoned` and cleared, so an old approval ID cannot authorize a
+new or reconstructed action.
 
 ## Answer, clarify, plan, build, verify
 
@@ -111,19 +116,26 @@ Plan mode persists `approval_required` and always waits, even for a one-file low
 structured fields are materialized as one canonical Markdown document containing goal, approach,
 steps, expected files, validation, and risks; `GET /api/runs/{id}/plan.md` downloads that exact
 contract. A restart preserves the recorded decision. Any later file mutation outside
-`impacted_files` is a separate action approval in either mode, so skipping a plan-review click does
-not broaden technical permissions.
+`impacted_files` remains a base-policy `ask`; Manual and Automatic pause, while workspace Full
+access handles that soft decision automatically without disabling the Workspace guard. Skipping a
+plan-review click never changes these action semantics.
 
 ### Building
 
 The builder receives the current turn, earlier turn summaries, and recorded plan. It can call six local file/process tools
 plus the structured `update_plan` and `finish` controls. File mutations invalidate prior command
-evidence. Exact acceptance commands and known read-only commands enter the OS sandbox when its
-probe succeeds. Non-writing, non-interactive focused Pytest variants from the same launcher family
-also stay sandboxed without another prompt, but only the exact planned argv refreshes acceptance
-evidence. Other check-family changes pause for a decision.
-An unknown executable action pauses; user approval grants one visibly recorded unsandboxed
-invocation rather than silently weakening later commands. `finish` is rejected until
+evidence. Before every consequential tool, the builder evaluates a two-stage permission result:
+hard policy first, then the frozen per-turn profile. Manual asks on every native edit/command;
+Automatic preserves the planned/read-only allow and unknown/drift ask behavior; workspace Full
+access auto-handles soft asks but never disables invariant denials. Exact acceptance commands and
+known read-only commands enter the OS sandbox when its probe succeeds. Non-writing,
+non-interactive focused Pytest variants from the same launcher family also stay sandboxed without
+another prompt, but only the exact planned argv refreshes acceptance evidence.
+
+In Automatic mode, approving a base-policy unknown command grants one visibly recorded
+unsandboxed invocation for compatibility. Manual confirmations retain the sandbox. Workspace Full
+access auto-runs an unknown command only when OS enforcement is real and passes
+`sandbox_bypass=False`; on a policy-only host it falls back to human approval. `finish` is rejected until
 every command-backed acceptance check has a fresh passing result.
 
 The loop has three independent brakes:
@@ -194,7 +206,7 @@ window, and inserts a bounded evidence-oriented summary of the middle. Assistant
 paired with their following tool results; hidden reasoning is neither requested nor displayed.
 
 A run is also a durable conversation. `ConversationTurn` records the request, selected Agent/Plan
-mode, outcome, completion summary, native-edit files, and timestamps. A terminal answered, successful, failed, or
+mode, selected action-permission mode, outcome, completion summary, native-edit files, and timestamps. A terminal answered, successful, failed, or
 cancelled run can transition back to `created` for a follow-up. The next planner receives the last six completed
 turn requests and summaries while keeping the same run id, project, workspace snapshots, event
 ledger, and rollback boundary. Model protocol messages reset per turn so stale tool-call state is
@@ -204,7 +216,7 @@ not mixed into a new request.
 
 SQLite uses WAL mode and six tables:
 
-- `runs`: public state, optional project association, current interaction mode, conversation turns,
+- `runs`: public state, optional project association, current interaction and action-permission modes, conversation turns,
   internal messages, plan and scope assessment, approval state, and interrupted origin;
 - `events`: per-run monotonically increasing sequence and JSON payload;
 - `snapshots`: original bytes, mode, original hash, and last agent-written hash per path.
@@ -221,6 +233,8 @@ run is marked interrupted before any workspace manager is created. The same SQLi
 appends a `state.changed` event with the previous phase and `cause=process_restart`, so the recovery
 audit cannot disagree with the run row. Resume appends a `run.resumed` event with its
 application-selected strategy and the number of incomplete tool calls closed without replay. A
+pending action approval first emits an `approval.resolved` event with `outcome=abandoned`; its
+persisted ID is cleared before resume can issue another action. A
 verifier rejection similarly appends `repair.started` before builder work continues. See
 [Fault-injection evidence](fault-injection.md) for the deterministic failure matrix.
 

@@ -1,5 +1,6 @@
 import type {
   AppStatus,
+  ApprovalMode,
   ClarificationAnswer,
   DirectoryChoice,
   DirectoryListing,
@@ -42,15 +43,31 @@ export const api = {
   openWorkspace: (runId: string) =>
     request<OpenWorkspaceResult>(`/api/runs/${runId}/open-workspace`, { method: "POST" }),
   getProofPack: (runId: string) => request<ProofPack>(`/api/runs/${runId}/proof-pack`),
-  createRun: (task: string, mode: InteractionMode, target: RunTarget) =>
+  createRun: (
+    task: string,
+    mode: InteractionMode,
+    approvalMode: ApprovalMode,
+    target: RunTarget,
+  ) =>
     request<Run>("/api/runs", {
       method: "POST",
-      body: JSON.stringify({ task, verifier_enabled: true, mode, ...target }),
+      body: JSON.stringify({
+        task,
+        verifier_enabled: true,
+        mode,
+        approval_mode: approvalMode,
+        ...target,
+      }),
     }),
-  followUp: (runId: string, prompt: string, mode: InteractionMode) =>
+  followUp: (
+    runId: string,
+    prompt: string,
+    mode: InteractionMode,
+    approvalMode: ApprovalMode,
+  ) =>
     request<Run>(`/api/runs/${runId}/turns`, {
       method: "POST",
-      body: JSON.stringify({ prompt, mode }),
+      body: JSON.stringify({ prompt, mode, approval_mode: approvalMode }),
     }),
   listProjects: () => request<Project[]>("/api/projects"),
   createProject: (name: string, root: string, createDirectory: boolean) =>

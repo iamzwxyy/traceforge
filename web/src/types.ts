@@ -15,6 +15,7 @@ export type RunState =
 
 export type CheckStatus = "pending" | "running" | "passed" | "failed" | "waived";
 export type InteractionMode = "agent" | "plan";
+export type ApprovalMode = "manual" | "automatic" | "full_access";
 
 export interface QuestionOption {
   id: string;
@@ -78,7 +79,10 @@ export interface ApprovalRequest {
   tool_call: ToolCall;
   summary: string;
   reason: string;
-  risk: "unknown" | "elevated" | "dangerous";
+  risk: "low" | "unknown" | "elevated" | "dangerous";
+  approval_mode: ApprovalMode;
+  policy_decision: "allow" | "ask" | "deny";
+  sandbox_bypass_on_approve: boolean;
 }
 
 export interface VerificationFinding {
@@ -102,6 +106,7 @@ export interface Run {
   project_id: string | null;
   state: RunState;
   mode: InteractionMode;
+  approval_mode: ApprovalMode;
   turns: ConversationTurn[];
   verifier_enabled: boolean;
   plan: TaskPlan | null;
@@ -122,6 +127,7 @@ export interface ConversationTurn {
   index: number;
   request: string;
   mode: InteractionMode;
+  approval_mode: ApprovalMode;
   outcome: "in_progress" | "answered" | "succeeded" | "failed" | "cancelled";
   summary: string;
   changed_files: string[];

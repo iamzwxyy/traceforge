@@ -14,7 +14,7 @@ from traceforge.agent import AgentManager, RunConflictError
 from traceforge.config import Settings
 from traceforge.events import EventBroker
 from traceforge.model_context import ResolvedModelContext, resolve_model_context
-from traceforge.models import InteractionMode, ProviderConfig, RunRecord
+from traceforge.models import ApprovalMode, InteractionMode, ProviderConfig, RunRecord
 from traceforge.provider import ModelProvider, OpenAICompatibleProvider, ProviderError
 from traceforge.storage import Storage
 
@@ -167,6 +167,7 @@ class AgentRuntime:
         verifier_enabled: bool = True,
         project_id: str | None = None,
         mode: InteractionMode = InteractionMode.AGENT,
+        approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
     ) -> RunRecord:
         manager = self.manager_for_workspace(workspace)
         return await manager.start_run(
@@ -174,6 +175,7 @@ class AgentRuntime:
             verifier_enabled=verifier_enabled,
             project_id=project_id,
             mode=mode,
+            approval_mode=approval_mode,
         )
 
     def manager_for_run(self, run_id: str) -> AgentManager:

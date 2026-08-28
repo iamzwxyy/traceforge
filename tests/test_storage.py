@@ -6,13 +6,33 @@ from pathlib import Path
 import pytest
 
 from traceforge.config import Settings
-from traceforge.models import EventType, ProjectRecord, ProviderConfig, RunRecord, RunState
+from traceforge.models import (
+    ApprovalMode,
+    ConversationTurn,
+    EventType,
+    ProjectRecord,
+    ProviderConfig,
+    RunRecord,
+    RunState,
+)
 from traceforge.storage import SnapshotRecord, Storage
 
 
 def test_run_and_events_round_trip(storage: Storage, settings: Settings) -> None:
     workspace = settings.workspace
-    run = RunRecord(id="run-1", task="Fix it", workspace=str(workspace))
+    run = RunRecord(
+        id="run-1",
+        task="Fix it",
+        workspace=str(workspace),
+        approval_mode=ApprovalMode.FULL_ACCESS,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Fix it",
+                approval_mode=ApprovalMode.FULL_ACCESS,
+            )
+        ],
+    )
     storage.create_run(run)
     run.state = RunState.PLANNING
     run.messages.append({"role": "user", "content": "Fix it"})
@@ -22,6 +42,8 @@ def test_run_and_events_round_trip(storage: Storage, settings: Settings) -> None
     loaded = storage.get_run("run-1")
 
     assert loaded.state is RunState.PLANNING
+    assert loaded.approval_mode is ApprovalMode.FULL_ACCESS
+    assert loaded.turns[0].approval_mode is ApprovalMode.FULL_ACCESS
     assert loaded.messages[0]["content"] == "Fix it"
     assert event.seq == 1
     assert storage.get_events("run-1")[0].payload == {"state": "planning"}
@@ -200,5 +222,6 @@ def test_storage_migrates_legacy_run_columns(tmp_path: Path) -> None:
         assert loaded.interrupted_from is None
         assert loaded.project_id is None
         assert loaded.plan_gate is None
+        assert loaded.approval_mode is ApprovalMode.AUTOMATIC
     finally:
         migrated.close()

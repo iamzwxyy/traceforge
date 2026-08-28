@@ -36,9 +36,11 @@ for executable work in both modes. Selecting Agent mode cannot turn a denied com
 allowed command or expand the workspace boundary.
 
 After planning, each `create_file` and every file in an `apply_patch` is compared with the declared
-scope. An unexpected path pauses for a one-time action decision before any bytes are written. This
-scope check remains an application policy even when an OS sandbox is active; it answers “was this
-planned?” while the sandbox answers “what can this process technically reach?”
+scope. The base policy marks an unexpected path as `ask` before any bytes are written; the selected
+action-permission profile decides whether that soft decision pauses or is automatically handled.
+The Workspace real-path guard remains mandatory in every profile. Scope classification answers
+“was this planned?” while the path guard and command sandbox answer “what can this action
+technically reach?”
 
 For user-facing per-turn attribution, those two native edit tools fingerprint canonical candidate
 paths before and after execution. Only actual changes are recorded, including a successful first
@@ -49,12 +51,36 @@ Completion review is a third, separate concept. After fresh checks, the verifier
 through a read-only tool surface and cannot mutate files or execute commands. Its pass/fail decision
 does not grant runtime permissions; a rejection only returns bounded findings to the builder.
 
+## Per-turn action-permission profiles
+
+Every turn freezes one `ApprovalMode` in SQLite and in its immutable conversation-turn snapshot.
+Resume and repair read that persisted value; they never consult a later browser preference. The
+profiles modify only soft `allow`/`ask` outcomes after the invariant policy has run:
+
+| Profile | Native edits | Known/planned commands | Scope drift / unknown command |
+| --- | --- | --- | --- |
+| `manual` | ask each time | ask each time with `bypass=False` | ask each time with `bypass=False` |
+| `automatic` (default) | planned edits allow | allow + sandbox | ask; an approved unknown command keeps the legacy one-shot bypass |
+| `full_access` (workspace-scoped) | allow inside the Workspace guard | allow + sandbox | native drift allows; unknown command auto-allows only under an enforced OS sandbox |
+
+`full_access` is intentionally not host-wide Codex `danger-full-access`. If no OS backend is
+enforced, an unknown/code-executing command falls back to a human approval instead of silently
+running with host authority. The UI calls this **完全访问（工作区）**, shows it throughout the turn,
+and does not persist it as the next turn's default. `sudo`, disk/power tools, destructive Git,
+recursive forced deletion, explicit outside-workspace paths, native-write traversal/symlinks, and
+credential exposure remain denied in all profiles.
+
+Each tool completion records the base decision, effective decision, profile, authorization source,
+outcome, reason, and actual sandbox-bypass fact. A pending approval also snapshots those fields so
+the approval card can say whether clicking once will retain or bypass the OS sandbox. Cancellation
+or restart resolves a stale approval as `abandoned`, clears its ID, and never replays the action.
+
 ## Command policy
 
 Commands are argv arrays passed to `asyncio.create_subprocess_exec`; shell parsing and expansion do
 not occur.
 
-| Class | Decision | Examples |
+| Base class | Automatic-mode decision | Examples |
 | --- | --- | --- |
 | Approved acceptance check | allow + sandbox | exact argv recorded in the approved plan |
 | Focused variant of an approved Pytest check | allow + sandbox, diagnostic only | same launcher family with a narrower selector or safe display/filter flags |
@@ -62,10 +88,11 @@ not occur.
 | Unknown / code execution | ask once; approval is a one-shot sandbox bypass | Python scripts, installers, network clients |
 | Destructive / privileged | deny | `sudo`, `git reset --hard`, recursive forced `rm` |
 
-An unknown command approval card shows the exact arguments, reason, and risk. Rejection returns a
-normal failed tool result so the builder can choose a safer path. Approval bypasses the OS sandbox
-for that invocation only; the resulting tool event, timeline badge, and Proof Pack record
-`bypassed`. Commands default to 120 seconds, are capped at 600 seconds, and run in a separate
+An approval card shows the exact arguments, reason, risk, selected profile, and whether approval
+retains or bypasses the sandbox. Rejection returns a persisted failed tool result so the builder
+can choose a safer path. In Automatic mode, approving a base-policy unknown command bypasses the OS
+sandbox for that invocation only; Manual-mode confirmations stay sandboxed. The resulting tool
+event, timeline badge, and Proof Pack record the actual fact. Commands default to 120 seconds, are capped at 600 seconds, and run in a separate
 process group so Stop/timeout can terminate descendants.
 
 Routine variants are deliberately narrow: `python` and `python3` Pytest invocations are one family,
@@ -148,6 +175,8 @@ controls chosen by the user.
 ## Residual risks
 
 - A user-approved bypass has the user's OS permissions and can ignore the workspace boundary.
+- The label `full_access` is workspace-scoped in TraceForge; it is not permission to write arbitrary
+  host paths or disable the OS sandbox.
 - A backend profile is a containment layer, not a proof that malicious native code has no kernel or
   platform escape; unfamiliar hostile repositories still belong in a disposable VM.
 - On Linux, OS enforcement requires Bubblewrap and usable unprivileged user namespaces. TraceForge

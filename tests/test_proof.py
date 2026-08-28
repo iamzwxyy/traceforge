@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from traceforge.models import (
     AcceptanceCheck,
+    ApprovalMode,
     CheckStatus,
     ConversationTurn,
     EventType,
@@ -201,11 +202,13 @@ def test_proof_v1_digest_excludes_per_turn_navigation_hints(
     storage.create_run(run)
     without_hint = run.model_copy(deep=True)
     without_hint.turns[0].changed_files = []
+    without_hint.turns[0].approval_mode = ApprovalMode.FULL_ACCESS
 
     with_hint_pack = build_proof_pack(run, storage)
     without_hint_pack = build_proof_pack(without_hint, storage)
 
     assert with_hint_pack.evidence_sha256 == without_hint_pack.evidence_sha256
+    assert without_hint_pack.turns[0].approval_mode is ApprovalMode.FULL_ACCESS
 
 
 def test_proof_pack_records_conflict_aware_rollback(

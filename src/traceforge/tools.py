@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from traceforge.config import Settings
-from traceforge.models import TaskPlan, ToolCall, ToolResult
+from traceforge.models import ApprovalMode, TaskPlan, ToolCall, ToolResult
 from traceforge.patching import FilePatch, PatchError, apply_file_patch, parse_unified_diff
 from traceforge.planning import is_safe_routine_check_variant
 from traceforge.sandbox import CommandSandbox, SandboxStatus
@@ -39,7 +39,29 @@ class PermissionDecision(StrEnum):
 class PermissionAssessment:
     decision: PermissionDecision
     reason: str
-    risk: Literal["unknown", "elevated", "dangerous"] = "unknown"
+    risk: Literal["low", "unknown", "elevated", "dangerous"] = "low"
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionResolution:
+    mode: ApprovalMode
+    decision: PermissionDecision
+    reason: str
+    risk: Literal["low", "unknown", "elevated", "dangerous"]
+    policy_decision: PermissionDecision
+    authorization: Literal["policy", "user", "full_access"]
+    sandbox_bypass_on_allow: bool = False
+
+    def as_metadata(self, *, outcome: str, sandbox_bypass: bool) -> dict[str, Any]:
+        return {
+            "mode": self.mode.value,
+            "policy_decision": self.policy_decision.value,
+            "effective_decision": self.decision.value,
+            "authorization": self.authorization,
+            "outcome": outcome,
+            "sandbox_bypass": sandbox_bypass,
+            "reason": self.reason,
+        }
 
 
 class ToolRegistry:
@@ -157,26 +179,15 @@ class ToolRegistry:
             or not all(isinstance(item, str) for item in argv)
         ):
             return PermissionAssessment(
-                PermissionDecision.DENY, "argv must be a non-empty string list"
+                PermissionDecision.DENY,
+                "argv must be a non-empty string list",
+                "unknown",
             )
-        executable = Path(argv[0]).name
-        if executable in {"sudo", "su", "shutdown", "reboot", "mkfs", "diskutil", "dd"}:
+        hard_denial = _hard_command_denial(argv, self.workspace.root)
+        if hard_denial is not None:
             return PermissionAssessment(
                 PermissionDecision.DENY,
-                f"{executable} is outside TraceForge's safety boundary",
-                "dangerous",
-            )
-        if _is_dangerous_git(argv) or _is_dangerous_remove(argv):
-            return PermissionAssessment(
-                PermissionDecision.DENY,
-                "Destructive version-control or recursive deletion command",
-                "dangerous",
-            )
-        outside_path = _outside_workspace_argument(argv, self.workspace.root)
-        if outside_path is not None:
-            return PermissionAssessment(
-                PermissionDecision.DENY,
-                f"Command path is outside the workspace: {outside_path}",
+                hard_denial,
                 "dangerous",
             )
         check_relation = _accepted_check_relation(argv, plan)
@@ -196,6 +207,90 @@ class ToolRegistry:
             "The command can execute project code, modify files, access the network, "
             "or write externally",
             "elevated",
+        )
+
+    def resolve_permission(
+        self,
+        call: ToolCall,
+        plan: TaskPlan | None,
+        mode: ApprovalMode,
+    ) -> PermissionResolution:
+        """Apply the user-selected approval mode without weakening invariant denials."""
+
+        assessment = self.assess(call, plan)
+        if assessment.decision is PermissionDecision.DENY:
+            return PermissionResolution(
+                mode=mode,
+                decision=PermissionDecision.DENY,
+                reason=assessment.reason,
+                risk=assessment.risk,
+                policy_decision=assessment.decision,
+                authorization="policy",
+            )
+        if mode is ApprovalMode.MANUAL and call.name in {
+            "apply_patch",
+            "create_file",
+            "run_command",
+        }:
+            return PermissionResolution(
+                mode=mode,
+                decision=PermissionDecision.ASK,
+                reason=(
+                    "Manual approval mode requires confirmation before every edit or command. "
+                    + assessment.reason
+                ),
+                risk=assessment.risk,
+                policy_decision=assessment.decision,
+                authorization="user",
+                sandbox_bypass_on_allow=False,
+            )
+        if mode is ApprovalMode.FULL_ACCESS:
+            if (
+                call.name == "run_command"
+                and assessment.decision is PermissionDecision.ASK
+                and not self.sandbox.status.enforced
+            ):
+                return PermissionResolution(
+                    mode=mode,
+                    decision=PermissionDecision.ASK,
+                    reason=(
+                        "Full access cannot auto-approve an unclassified command because "
+                        "no OS sandbox is available. "
+                        + assessment.reason
+                    ),
+                    risk=assessment.risk,
+                    policy_decision=assessment.decision,
+                    authorization="user",
+                    sandbox_bypass_on_allow=True,
+                )
+            return PermissionResolution(
+                mode=mode,
+                decision=PermissionDecision.ALLOW,
+                reason=(
+                    "Full access mode allows this workspace action without prompting while "
+                    "retaining invariant workspace and OS-sandbox boundaries. "
+                    + assessment.reason
+                ),
+                risk=assessment.risk,
+                policy_decision=assessment.decision,
+                authorization="full_access",
+                sandbox_bypass_on_allow=False,
+            )
+        return PermissionResolution(
+            mode=mode,
+            decision=assessment.decision,
+            reason=assessment.reason,
+            risk=assessment.risk,
+            policy_decision=assessment.decision,
+            authorization=(
+                "user"
+                if assessment.decision is PermissionDecision.ASK
+                else "policy"
+            ),
+            sandbox_bypass_on_allow=(
+                call.name == "run_command"
+                and assessment.decision is PermissionDecision.ASK
+            ),
         )
 
     async def execute(
@@ -433,9 +528,9 @@ class ToolRegistry:
     ) -> ToolResult:
         if not argv or not all(isinstance(item, str) and item for item in argv):
             raise ValueError("argv must contain non-empty strings")
-        outside_path = _outside_workspace_argument(argv, self.workspace.root)
-        if outside_path is not None:
-            raise ValueError(f"Command path is outside the workspace: {outside_path}")
+        hard_denial = _hard_command_denial(argv, self.workspace.root)
+        if hard_denial is not None:
+            raise ValueError(hard_denial)
         command_temp = tempfile.TemporaryDirectory(prefix="traceforge-command-")
         command_temp_path = Path(command_temp.name)
         sandbox_home = command_temp_path / "home"
@@ -610,6 +705,18 @@ def _outside_workspace_argument(argv: list[str], workspace: Path) -> str | None:
         resolved = path.resolve() if path.is_absolute() else (workspace / path).resolve()
         if not resolved.is_relative_to(workspace):
             return candidate
+    return None
+
+
+def _hard_command_denial(argv: list[str], workspace: Path) -> str | None:
+    executable = Path(argv[0]).name
+    if executable in {"sudo", "su", "shutdown", "reboot", "mkfs", "diskutil", "dd"}:
+        return f"{executable} is outside TraceForge's safety boundary"
+    if _is_dangerous_git(argv) or _is_dangerous_remove(argv):
+        return "Destructive version-control or recursive deletion command"
+    outside_path = _outside_workspace_argument(argv, workspace)
+    if outside_path is not None:
+        return f"Command path is outside the workspace: {outside_path}"
     return None
 
 

@@ -34,6 +34,7 @@ from traceforge.context import ContextManager
 from traceforge.events import EventBroker
 from traceforge.model_context import resolve_model_context
 from traceforge.models import (
+    ApprovalMode,
     ApprovalRequest,
     ClarificationAnswer,
     ClarificationRequest,
@@ -64,6 +65,7 @@ class CreateRunRequest(BaseModel):
     task: str = Field(min_length=1, max_length=20_000)
     verifier_enabled: bool = True
     mode: InteractionMode = InteractionMode.AGENT
+    approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC
     project_id: str | None = None
     workspace: str | None = Field(default=None, max_length=4_096)
     create_direct_workspace: bool = False
@@ -138,6 +140,7 @@ class FollowUpRequest(BaseModel):
 
     prompt: str = Field(min_length=1, max_length=20_000)
     mode: InteractionMode = InteractionMode.AGENT
+    approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC
 
 
 class OpenWorkspaceResponse(BaseModel):
@@ -157,6 +160,7 @@ class RunView(BaseModel):
     project_id: str | None
     state: RunState
     mode: InteractionMode
+    approval_mode: ApprovalMode
     turns: list[ConversationTurn]
     verifier_enabled: bool
     plan: TaskPlan | None
@@ -388,6 +392,8 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 )
             if body.project_id or body.workspace or body.create_direct_workspace:
                 raise ValueError("The fixed demo only runs in its disposable demo workspace")
+            if body.approval_mode is not ApprovalMode.AUTOMATIC:
+                raise ValueError("The fixed demo only supports automatic approval mode")
         project_id = body.project_id
         created_workspace: Path | None = None
         if settings.demo_mode:
@@ -409,6 +415,9 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 verifier_enabled=body.verifier_enabled,
                 project_id=project_id,
                 mode=(InteractionMode.PLAN if settings.demo_mode else body.mode),
+                approval_mode=(
+                    ApprovalMode.AUTOMATIC if settings.demo_mode else body.approval_mode
+                ),
             )
         except Exception:
             if created_workspace is not None:
@@ -506,7 +515,10 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
                 "for multi-turn tasks"
             )
         run = await runtime.manager_for_run(run_id).follow_up(
-            run_id, body.prompt, mode=body.mode
+            run_id,
+            body.prompt,
+            mode=body.mode,
+            approval_mode=body.approval_mode,
         )
         return RunView.from_record(run)
 
@@ -525,7 +537,9 @@ def create_app(settings: Settings, *, provider: ModelProvider | None = None) -> 
         run = storage.get_run(run_id)
         if run.pending_approval is None or run.pending_approval.id != approval_id:
             raise HTTPException(status_code=409, detail="Approval is no longer pending")
-        await runtime.manager_for_run(run_id).decide_action(run_id, approved=body.approved)
+        await runtime.manager_for_run(run_id).decide_action(
+            run_id, approval_id, approved=body.approved
+        )
         return {"accepted": True}
 
     @app.post("/api/runs/{run_id}/cancel", response_model=RunView)

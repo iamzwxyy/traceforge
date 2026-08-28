@@ -7,7 +7,15 @@ import pytest
 
 import traceforge.tools as tools_module
 from traceforge.config import Settings
-from traceforge.models import AcceptanceCheck, PlanStep, RunRecord, TaskPlan, ToolCall
+from traceforge.models import (
+    AcceptanceCheck,
+    ApprovalMode,
+    PlanStep,
+    RunRecord,
+    TaskPlan,
+    ToolCall,
+)
+from traceforge.sandbox import SandboxStatus
 from traceforge.storage import Storage
 from traceforge.tools import PermissionDecision, ToolRegistry
 from traceforge.workspace import Workspace
@@ -34,6 +42,97 @@ def test_permission_policy(settings: Settings, workspace: Workspace) -> None:
     )
     assert registry.assess(unknown_call, None).decision is PermissionDecision.ASK
     assert registry.assess(denied_call, None).decision is PermissionDecision.DENY
+
+
+def test_approval_modes_are_orthogonal_to_invariant_permission_policy(
+    settings: Settings, workspace: Workspace
+) -> None:
+    registry = ToolRegistry(workspace, settings)
+    registry.sandbox.status = SandboxStatus(
+        backend="seatbelt", enforced=True, detail="test sandbox"
+    )
+    plan = _plan(["uv", "run", "pytest"]).model_copy(
+        update={"impacted_files": ["src/allowed.py"]}
+    )
+    planned_write = ToolCall(
+        id="write",
+        name="create_file",
+        arguments={"path": "src/allowed.py", "content": "value = 1\n"},
+    )
+    drift = ToolCall(
+        id="drift",
+        name="create_file",
+        arguments={"path": "src/drift.py", "content": "value = 2\n"},
+    )
+    accepted_check = ToolCall(
+        id="check",
+        name="run_command",
+        arguments={"argv": ["uv", "run", "pytest"]},
+    )
+    unknown_command = ToolCall(
+        id="unknown",
+        name="run_command",
+        arguments={"argv": ["python", "app.py"]},
+    )
+    read_tool = ToolCall(
+        id="read", name="read_file", arguments={"path": "README.md"}
+    )
+    destructive = ToolCall(
+        id="deny",
+        name="run_command",
+        arguments={"argv": ["rm", "-rf", "build"]},
+    )
+
+    for call in (planned_write, drift, accepted_check, unknown_command):
+        manual = registry.resolve_permission(call, plan, ApprovalMode.MANUAL)
+        assert manual.decision is PermissionDecision.ASK
+        assert manual.authorization == "user"
+        assert manual.sandbox_bypass_on_allow is False
+    assert (
+        registry.resolve_permission(read_tool, plan, ApprovalMode.MANUAL).decision
+        is PermissionDecision.ALLOW
+    )
+
+    assert registry.resolve_permission(
+        planned_write, plan, ApprovalMode.AUTOMATIC
+    ).decision is PermissionDecision.ALLOW
+    automatic_unknown = registry.resolve_permission(
+        unknown_command, plan, ApprovalMode.AUTOMATIC
+    )
+    assert automatic_unknown.decision is PermissionDecision.ASK
+    assert automatic_unknown.sandbox_bypass_on_allow is True
+
+    for call in (planned_write, drift, accepted_check, unknown_command):
+        full = registry.resolve_permission(call, plan, ApprovalMode.FULL_ACCESS)
+        assert full.decision is PermissionDecision.ALLOW
+        assert full.authorization == "full_access"
+        assert full.sandbox_bypass_on_allow is False
+    for mode in ApprovalMode:
+        assert (
+            registry.resolve_permission(destructive, plan, mode).decision
+            is PermissionDecision.DENY
+        )
+
+
+def test_full_access_unknown_command_falls_back_to_human_without_os_sandbox(
+    settings: Settings, workspace: Workspace
+) -> None:
+    registry = ToolRegistry(workspace, settings)
+    registry.sandbox.status = SandboxStatus(
+        backend="none", enforced=False, detail="policy only"
+    )
+    unknown = ToolCall(
+        id="unknown",
+        name="run_command",
+        arguments={"argv": ["python", "app.py"]},
+    )
+
+    resolution = registry.resolve_permission(unknown, None, ApprovalMode.FULL_ACCESS)
+
+    assert resolution.decision is PermissionDecision.ASK
+    assert resolution.authorization == "user"
+    assert resolution.sandbox_bypass_on_allow is True
+    assert "no OS sandbox" in resolution.reason
 
 
 def test_permission_policy_allows_sandboxed_variants_of_an_approved_check(
@@ -150,6 +249,22 @@ def test_permission_policy_denies_malformed_and_destructive_commands(
     assert registry.assess(
         ToolCall(id="read", name="run_command", arguments={"argv": ["ls"]}), None
     ).decision is PermissionDecision.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_execute_rechecks_hard_command_denials_even_if_policy_is_bypassed(
+    settings: Settings, workspace: Workspace
+) -> None:
+    registry = ToolRegistry(workspace, settings)
+
+    for argv in (["sudo", "true"], ["rm", "-rf", "build"], ["cat", "../../secret"]):
+        result = await registry.execute(
+            "run",
+            ToolCall(id="hard-denial", name="run_command", arguments={"argv": argv}),
+            sandbox_bypass=True,
+        )
+        assert result.ok is False
+        assert result.error
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ from traceforge.config import Settings
 from traceforge.context import ContextManager
 from traceforge.events import EventBroker
 from traceforge.models import (
+    ApprovalMode,
     ApprovalRequest,
     CheckStatus,
     ClarificationAnswer,
@@ -36,7 +37,7 @@ from traceforge.planning import assess_plan_gate
 from traceforge.prompts import BUILDER_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT
 from traceforge.provider import ModelProvider, ModelResponse, ProviderError
 from traceforge.storage import Storage
-from traceforge.tools import PermissionAssessment, PermissionDecision, ToolRegistry
+from traceforge.tools import PermissionDecision, PermissionResolution, ToolRegistry
 from traceforge.workspace import RollbackResult, Workspace
 
 
@@ -166,6 +167,7 @@ class AgentManager:
         verifier_enabled: bool = True,
         project_id: str | None = None,
         mode: InteractionMode = InteractionMode.AGENT,
+        approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
     ) -> RunRecord:
         clean_task = task.strip()
         if not clean_task:
@@ -178,9 +180,17 @@ class AgentManager:
             workspace=str(self.settings.workspace),
             project_id=project_id,
             mode=mode,
+            approval_mode=approval_mode,
             verifier_enabled=verifier_enabled,
             context_limit=self.settings.context_limit,
-            turns=[ConversationTurn(index=1, request=clean_task, mode=mode)],
+            turns=[
+                ConversationTurn(
+                    index=1,
+                    request=clean_task,
+                    mode=mode,
+                    approval_mode=approval_mode,
+                )
+            ],
         )
         self.storage.create_run(run)
         self._controls[run.id] = _Control()
@@ -192,13 +202,23 @@ class AgentManager:
         await self.broker.emit(
             run.id,
             EventType.TURN_STARTED,
-            {"index": 1, "request": clean_task, "mode": mode.value},
+            {
+                "index": 1,
+                "request": clean_task,
+                "mode": mode.value,
+                "approval_mode": approval_mode.value,
+            },
         )
         self._spawn(run.id, resume=False)
         return run
 
     async def follow_up(
-        self, run_id: str, prompt: str, *, mode: InteractionMode = InteractionMode.AGENT
+        self,
+        run_id: str,
+        prompt: str,
+        *,
+        mode: InteractionMode = InteractionMode.AGENT,
+        approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC,
     ) -> RunRecord:
         clean_prompt = prompt.strip()
         if not clean_prompt:
@@ -218,7 +238,15 @@ class AgentManager:
 
         index = len(run.turns) + 1
         run.mode = mode
-        run.turns.append(ConversationTurn(index=index, request=clean_prompt, mode=mode))
+        run.approval_mode = approval_mode
+        run.turns.append(
+            ConversationTurn(
+                index=index,
+                request=clean_prompt,
+                mode=mode,
+                approval_mode=approval_mode,
+            )
+        )
         run.plan = None
         run.plan_gate = None
         run.plan_approved = False
@@ -235,7 +263,12 @@ class AgentManager:
         await self.broker.emit(
             run.id,
             EventType.TURN_STARTED,
-            {"index": index, "request": clean_prompt, "mode": mode.value},
+            {
+                "index": index,
+                "request": clean_prompt,
+                "mode": mode.value,
+                "approval_mode": approval_mode.value,
+            },
         )
         self._spawn(run.id, resume=False)
         return self.storage.get_run(run.id)
@@ -269,10 +302,14 @@ class AgentManager:
             raise InvalidRunAction("Plan decision window is not active")
         future.set_result(decision)
 
-    async def decide_action(self, run_id: str, *, approved: bool) -> None:
+    async def decide_action(
+        self, run_id: str, approval_id: str, *, approved: bool
+    ) -> None:
         run = self.storage.get_run(run_id)
         if run.state is not RunState.AWAITING_ACTION_APPROVAL:
             raise InvalidRunAction("The run is not waiting for an action approval")
+        if run.pending_approval is None or run.pending_approval.id != approval_id:
+            raise InvalidRunAction("Approval is no longer pending")
         future = self._control(run_id).approval_future
         if future is None or future.done():
             raise InvalidRunAction("Action decision window is not active")
@@ -291,6 +328,7 @@ class AgentManager:
             except asyncio.CancelledError:
                 pass
         elif run.state is RunState.INTERRUPTED:
+            await self._abandon_pending_approval(run, cause="user_cancelled")
             await self._transition(run, RunState.CANCELLED)
             await self._close_turn(run, "cancelled", "The user stopped this turn.")
         return self.storage.get_run(run_id)
@@ -400,6 +438,10 @@ class AgentManager:
         except asyncio.CancelledError:
             current = self.storage.get_run(run_id)
             if not current.state.terminal:
+                await self._abandon_pending_approval(
+                    current,
+                    cause="process_shutdown" if self._shutting_down else "user_cancelled",
+                )
                 if self._shutting_down:
                     current.interrupted_from = current.state
                     await self._transition(current, RunState.INTERRUPTED)
@@ -439,6 +481,7 @@ class AgentManager:
 
     async def _prepare_resume(self, run: RunRecord) -> None:
         previous = run.interrupted_from
+        await self._abandon_pending_approval(run, cause="process_restart")
         run.interrupted_from = None
         run.error = None
         repaired_calls = self._repair_incomplete_tool_protocol(run)
@@ -762,36 +805,60 @@ class AgentManager:
                     )
                     result = self._apply_plan_update(run, call)
                 else:
-                    assessment = self.tools.assess(call, run.plan)
-                    sandbox_bypass = False
-                    if assessment.decision is PermissionDecision.DENY:
+                    permission = self.tools.resolve_permission(
+                        call, run.plan, run.approval_mode
+                    )
+                    sandbox_bypass = permission.sandbox_bypass_on_allow
+                    if permission.decision is PermissionDecision.DENY:
                         result = ToolResult(
                             tool_call_id=call.id,
                             name=call.name,
                             ok=False,
-                            error=assessment.reason,
+                            error=permission.reason,
+                            metadata={
+                                "permission": permission.as_metadata(
+                                    outcome="denied",
+                                    sandbox_bypass=False,
+                                )
+                            },
                         )
                     else:
-                        if assessment.decision is PermissionDecision.ASK:
-                            approved = await self._await_action_approval(run, call, assessment)
-                            if not approved:
-                                result = ToolResult(
-                                    tool_call_id=call.id,
-                                    name=call.name,
-                                    ok=False,
-                                    error="User rejected this action.",
-                                )
-                                self._append_tool_result(run, result)
-                                await self._emit_tool_result(run, call, result)
-                                continue
-                            sandbox_bypass = call.name == "run_command"
-                        await self._transition(run, RunState.EXECUTING)
-                        await self.broker.emit(
-                            run.id, EventType.TOOL_STARTED, call.model_dump(mode="json")
-                        )
-                        result = await self.tools.execute(
-                            run.id, call, sandbox_bypass=sandbox_bypass
-                        )
+                        approved = True
+                        if permission.decision is PermissionDecision.ASK:
+                            approved = await self._await_action_approval(
+                                run, call, permission
+                            )
+                        if not approved:
+                            result = ToolResult(
+                                tool_call_id=call.id,
+                                name=call.name,
+                                ok=False,
+                                error="User rejected this action.",
+                                metadata={
+                                    "permission": permission.as_metadata(
+                                        outcome="user_rejected",
+                                        sandbox_bypass=False,
+                                    )
+                                },
+                            )
+                        else:
+                            await self._transition(run, RunState.EXECUTING)
+                            await self.broker.emit(
+                                run.id,
+                                EventType.TOOL_STARTED,
+                                call.model_dump(mode="json"),
+                            )
+                            result = await self.tools.execute(
+                                run.id, call, sandbox_bypass=sandbox_bypass
+                            )
+                            result.metadata["permission"] = permission.as_metadata(
+                                outcome=(
+                                    "user_approved"
+                                    if permission.decision is PermissionDecision.ASK
+                                    else "auto_allowed"
+                                ),
+                                sandbox_bypass=sandbox_bypass,
+                            )
                 result = self._redact_result(result)
                 self._append_tool_result(run, result)
                 await self._update_checks_and_diff(run, call, result)
@@ -1178,14 +1245,17 @@ class AgentManager:
         return False
 
     async def _await_action_approval(
-        self, run: RunRecord, call: ToolCall, assessment: PermissionAssessment
+        self, run: RunRecord, call: ToolCall, permission: PermissionResolution
     ) -> bool:
         approval = ApprovalRequest(
             id=uuid4().hex,
             tool_call=call,
             summary=_command_summary(call),
-            reason=assessment.reason,
-            risk=assessment.risk,
+            reason=permission.reason,
+            risk=permission.risk,
+            approval_mode=permission.mode,
+            policy_decision=permission.policy_decision.value,
+            sandbox_bypass_on_approve=permission.sandbox_bypass_on_allow,
         )
         run.pending_approval = approval
         self.storage.save_run(run)
@@ -1193,7 +1263,13 @@ class AgentManager:
         self._control(run.id).approval_future = future
         await self._transition(run, RunState.AWAITING_ACTION_APPROVAL)
         await self.broker.emit(
-            run.id, EventType.APPROVAL_REQUESTED, approval.model_dump(mode="json")
+            run.id,
+            EventType.APPROVAL_REQUESTED,
+            {
+                **approval.model_dump(mode="json"),
+                "mode": permission.mode.value,
+                "policy_decision": permission.policy_decision.value,
+            },
         )
         approved = await future
         run.pending_approval = None
@@ -1201,10 +1277,37 @@ class AgentManager:
         await self.broker.emit(
             run.id,
             EventType.APPROVAL_RESOLVED,
-            {"approval_id": approval.id, "approved": approved},
+            {
+                "approval_id": approval.id,
+                "approved": approved,
+                "outcome": "approved" if approved else "rejected",
+                "mode": permission.mode.value,
+                "sandbox_bypass": (
+                    permission.sandbox_bypass_on_allow if approved else False
+                ),
+            },
         )
         await self._transition(run, RunState.EXECUTING)
         return approved
+
+    async def _abandon_pending_approval(self, run: RunRecord, *, cause: str) -> None:
+        approval = run.pending_approval
+        if approval is None:
+            return
+        run.pending_approval = None
+        self.storage.save_run(run)
+        await self.broker.emit(
+            run.id,
+            EventType.APPROVAL_RESOLVED,
+            {
+                "approval_id": approval.id,
+                "approved": False,
+                "outcome": "abandoned",
+                "cause": cause,
+                "mode": run.approval_mode.value,
+                "sandbox_bypass": False,
+            },
+        )
 
     async def _transition(self, run: RunRecord, new_state: RunState) -> None:
         if run.state is new_state:
@@ -1423,7 +1526,12 @@ class AgentManager:
     def _active_turn(run: RunRecord) -> ConversationTurn:
         if run.turns:
             return run.turns[-1]
-        turn = ConversationTurn(index=1, request=run.task, mode=run.mode)
+        turn = ConversationTurn(
+            index=1,
+            request=run.task,
+            mode=run.mode,
+            approval_mode=run.approval_mode,
+        )
         run.turns.append(turn)
         return turn
 
@@ -1475,6 +1583,7 @@ class AgentManager:
                 "outcome": outcome,
                 "summary": turn.summary,
                 "changed_files": turn.changed_files,
+                "approval_mode": turn.approval_mode.value,
             },
         )
 

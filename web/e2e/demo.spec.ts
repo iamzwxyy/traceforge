@@ -24,6 +24,10 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.locator("textarea")).toHaveValue(/多租户缓存隔离/);
   await expect(page.locator("textarea")).toHaveAttribute("readonly", "");
   await expect(page.getByText("固定演示", { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("radio", { name: /手动审批/ })).toBeDisabled();
+  await expect(page.getByRole("radio", { name: /自动审批/ })).toBeChecked();
+  await expect(page.getByRole("radio", { name: /完全访问（工作区）/ })).toBeDisabled();
+  await expect(page.getByText("与计划模式独立", { exact: true })).toBeVisible();
   await expect(page.getByText("本地就绪", { exact: true })).toBeVisible();
   await expect(page.locator(".sandbox-status")).toContainText(/seatbelt|bubblewrap|仅策略限制/i);
 

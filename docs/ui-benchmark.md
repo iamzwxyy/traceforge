@@ -65,6 +65,10 @@ trajectory and evidence on demand—but not the literal layout:
 - Tianshu's current source has moved model, reasoning, execution, and approval controls into the
   composer even though its README screenshot still describes some of them in the right panel.
   TraceForge bases decisions on the pinned source/runtime rather than copying an outdated image.
+- Tianshu exposes five flat execution choices and runs shell text without an OS sandbox. TraceForge
+  keeps Plan separate and offers three accurately qualified action profiles: Manual (逐项),
+  deterministic Automatic, and **完全访问（工作区）**. The last never silently becomes the next
+  turn's default and cannot auto-run unknown code on a policy-only host.
 
 ## Chosen changes
 
@@ -78,6 +82,9 @@ The right-side Timeline still exposes every event in exact sequence, while the P
 the complete downloadable Markdown contract. This reduces process ceremony without deleting
 evidence or inventing a second source of truth. A terminal task exposes a follow-up composer that
 keeps the same run, workspace, and evidence history; Plan mode remains an optional per-turn switch.
+The new-task composer presents action permissions as three explanatory cards beside that switch;
+the compact follow-up composer retains an independent selector. The run header and tool evidence
+badges keep the effective choice visible after submission.
 
 Successful work now ends with the Agent's final answer, a turn-local native-edit file list, and a
 single compact completion footer. The former full-width evidence board was removed; Proof Pack is

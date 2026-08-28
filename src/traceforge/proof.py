@@ -42,10 +42,13 @@ def build_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
         "workspace": run.workspace,
         "project_id": run.project_id,
         "mode": run.mode.value,
-        # v1 predates per-turn UI navigation hints. Keep its stable digest surface
-        # unchanged; cumulative snapshot paths remain covered by changed_files below.
+        # v1 predates per-turn UI navigation and permission hints. Keep its stable
+        # digest surface unchanged; permission choices remain covered by the event chain.
         "turns": [
-            turn.model_dump(mode="json", exclude={"changed_files"}) for turn in run.turns
+            turn.model_dump(
+                mode="json", exclude={"changed_files", "approval_mode"}
+            )
+            for turn in run.turns
         ],
         "state": run.state.value,
         "proof_status": proof_status,
@@ -68,9 +71,10 @@ def build_proof_pack(run: RunRecord, storage: Storage) -> ProofPack:
         "created_at": run.created_at.isoformat(),
         "updated_at": run.updated_at.isoformat(),
     }
+    presentation = {**evidence, "turns": run.turns}
     return ProofPack(
         generated_at=utc_now(),
-        **evidence,
+        **presentation,
         evidence_sha256=_digest_json(evidence),
     )
 
@@ -81,6 +85,10 @@ def proof_pack_markdown(pack: ProofPack) -> str:
         "",
         f"- Proof status: **{pack.proof_status}**",
         f"- Run state: `{pack.state.value}`",
+        (
+            "- Current action-permission profile: "
+            f"`{pack.turns[-1].approval_mode.value if pack.turns else 'automatic'}`"
+        ),
         f"- Evidence SHA-256: `{pack.evidence_sha256}`",
         f"- Event chain SHA-256: `{pack.event_chain_sha256}` ({pack.event_count} events)",
         f"- Diff source: `{pack.diff_source}`",
@@ -97,7 +105,10 @@ def proof_pack_markdown(pack: ProofPack) -> str:
         for turn in pack.turns:
             lines.extend(
                 [
-                    f"### Turn {turn.index} · {turn.mode.value}",
+                    (
+                        f"### Turn {turn.index} · {turn.mode.value} · "
+                        f"{turn.approval_mode.value} approvals"
+                    ),
                     "",
                     turn.request,
                     "",

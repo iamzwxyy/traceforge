@@ -180,20 +180,50 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
         assert created.status_code == 201
         run_id = created.json()["id"]
         assert created.json()["mode"] == "agent"
+        assert created.json()["approval_mode"] == "automatic"
         first = _wait_for_state(client, run_id, "succeeded")
         assert first["plan_gate"]["decision"] == "agent_continues"
         assert len(first["turns"]) == 1
 
         follow_up = client.post(
             f"/api/runs/{run_id}/turns",
-            json={"prompt": "Check the edge case too"},
+            json={
+                "prompt": "Check the edge case too",
+                "approval_mode": "manual",
+            },
         )
         assert follow_up.status_code == 200
         assert follow_up.json()["id"] == run_id
+        assert follow_up.json()["approval_mode"] == "manual"
         second = _wait_for_state(client, run_id, "succeeded")
         assert len(second["turns"]) == 2
         assert second["turns"][1]["request"] == "Check the edge case too"
+        assert second["turns"][0]["approval_mode"] == "automatic"
+        assert second["turns"][1]["approval_mode"] == "manual"
         assert all(turn["outcome"] == "succeeded" for turn in second["turns"])
+
+
+def test_api_validates_approval_modes(settings: Settings) -> None:
+    app = create_app(settings, provider=ScriptedProvider([_answer_response("ok")]))
+
+    with TestClient(app) as client:
+        invalid = client.post(
+            "/api/runs",
+            json={"task": "Answer", "approval_mode": "unbounded"},
+        )
+        assert invalid.status_code == 422
+
+        full = client.post(
+            "/api/runs",
+            json={
+                "task": "Answer",
+                "approval_mode": "full_access",
+                "create_direct_workspace": True,
+            },
+        )
+        assert full.status_code == 201
+        assert full.json()["approval_mode"] == "full_access"
+        assert full.json()["turns"][0]["approval_mode"] == "full_access"
 
 
 def test_api_rejects_second_active_run(settings: Settings) -> None:
@@ -371,6 +401,12 @@ def test_fixed_demo_rejects_unrelated_tasks(settings: Settings) -> None:
         )
         assert retargeted.status_code == 422
         assert "disposable demo workspace" in retargeted.json()["detail"]
+        unsafe_mode = client.post(
+            "/api/runs",
+            json={"task": suggested_task, "approval_mode": "full_access"},
+        )
+        assert unsafe_mode.status_code == 422
+        assert "automatic approval" in unsafe_mode.json()["detail"]
         assert client.get("/api/runs").json() == []
 
 

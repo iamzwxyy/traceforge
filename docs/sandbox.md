@@ -8,13 +8,20 @@ execution facts:
 | Result | Meaning |
 | --- | --- |
 | `enforced` | a probed Seatbelt or Bubblewrap profile wrapped this invocation |
-| `bypassed` | the user approved this unknown command for one execution outside that profile |
+| `bypassed` | the user approved a base-policy unknown command for one Automatic-mode execution outside that profile |
 | `policy_only` | no supported backend passed its probe; application policy still applied |
 
 The application header reports current backend readiness. Each command row reports its own fact,
 which matters because a run can be mixed. The Proof Pack aggregates the persisted command events
 rather than trusting the current machine state. Commands rejected or denied before process launch
 are counted separately and do not appear as misleading `policy_only` executions.
+
+Action-permission profiles do not redefine these facts. Manual confirmations always pass
+`bypass=False`; workspace Full access also passes `bypass=False` and auto-runs unknown commands
+only when the backend is actually `enforced`. If the host is `policy_only`, that unknown command
+falls back to a one-time human decision whose card explicitly warns about the bypass. Hard command
+denials are repeated inside the executor so a caller cannot skip the base assessment and smuggle a
+privileged, destructive, or outside-workspace argv into the bypass path.
 
 ## Profile construction
 
@@ -64,6 +71,10 @@ available it proves:
 2. the same interpreter cannot write to a sibling path outside that workspace;
 3. project `.env` / configured credential contents cannot be read;
 4. an explicit bypass can perform the otherwise-blocked write, and the result says `bypassed`.
+
+The permission matrix additionally proves that Manual planned checks stay sandboxed, workspace
+Full access never requests a bypass, hard denials survive all three profiles, and an unknown Full-
+access command cannot auto-run on a policy-only host.
 
 The tests skip only the backend-dependent attacks when the machine honestly reports
 `policy_only`; profile-construction, API status, event aggregation, and bypass evidence remain

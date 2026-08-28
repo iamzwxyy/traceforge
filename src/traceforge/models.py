@@ -43,6 +43,12 @@ class InteractionMode(StrEnum):
     PLAN = "plan"
 
 
+class ApprovalMode(StrEnum):
+    MANUAL = "manual"
+    AUTOMATIC = "automatic"
+    FULL_ACCESS = "full_access"
+
+
 class CheckStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -222,7 +228,10 @@ class ApprovalRequest(BaseModel):
     tool_call: ToolCall
     summary: str
     reason: str
-    risk: Literal["unknown", "elevated", "dangerous"]
+    risk: Literal["low", "unknown", "elevated", "dangerous"]
+    approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC
+    policy_decision: Literal["allow", "ask", "deny"] = "ask"
+    sandbox_bypass_on_approve: bool = False
 
 
 class VerificationFinding(BaseModel):
@@ -280,6 +289,7 @@ class ConversationTurn(BaseModel):
     index: int = Field(ge=1)
     request: str = Field(min_length=1, max_length=20_000)
     mode: InteractionMode = InteractionMode.AGENT
+    approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC
     outcome: Literal["in_progress", "answered", "succeeded", "failed", "cancelled"] = (
         "in_progress"
     )
@@ -351,6 +361,7 @@ class RunRecord(BaseModel):
     project_id: str | None = None
     state: RunState = RunState.CREATED
     mode: InteractionMode = InteractionMode.AGENT
+    approval_mode: ApprovalMode = ApprovalMode.AUTOMATIC
     turns: list[ConversationTurn] = Field(default_factory=list)
     verifier_enabled: bool = True
     plan: TaskPlan | None = None

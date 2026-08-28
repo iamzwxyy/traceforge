@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from traceforge.models import (
+    ApprovalMode,
     ApprovalRequest,
     ClarificationRequest,
     EventType,
@@ -66,6 +67,7 @@ class Storage:
                     project_id TEXT,
                     state TEXT NOT NULL,
                     mode TEXT NOT NULL DEFAULT 'agent',
+                    approval_mode TEXT NOT NULL DEFAULT 'automatic',
                     turns_json TEXT NOT NULL DEFAULT '[]',
                     verifier_enabled INTEGER NOT NULL,
                     plan_json TEXT,
@@ -143,6 +145,7 @@ class Storage:
                 "project_id": "TEXT",
                 "plan_gate_json": "TEXT",
                 "mode": "TEXT NOT NULL DEFAULT 'agent'",
+                "approval_mode": "TEXT NOT NULL DEFAULT 'automatic'",
                 "turns_json": "TEXT NOT NULL DEFAULT '[]'",
                 "context_limit": "INTEGER NOT NULL DEFAULT 64000",
             }
@@ -233,12 +236,12 @@ class Storage:
             self._connection.execute(
                 """
                 INSERT INTO runs (
-                    id, task, workspace, project_id, state, mode, turns_json,
+                    id, task, workspace, project_id, state, mode, approval_mode, turns_json,
                     verifier_enabled, plan_json,
                     clarification_json, pending_approval_json, verification_json,
                     plan_gate_json, messages_json, plan_approved, interrupted_from,
                     step_count, repair_cycles, context_limit, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._run_values(run),
             )
@@ -251,7 +254,7 @@ class Storage:
                 """
                 UPDATE runs SET
                     task = ?, workspace = ?, project_id = ?, state = ?, mode = ?,
-                    turns_json = ?, verifier_enabled = ?,
+                    approval_mode = ?, turns_json = ?, verifier_enabled = ?,
                     plan_json = ?, clarification_json = ?, pending_approval_json = ?,
                     verification_json = ?, plan_gate_json = ?, messages_json = ?,
                     plan_approved = ?, interrupted_from = ?, step_count = ?,
@@ -538,6 +541,7 @@ class Storage:
             run.project_id,
             run.state.value,
             run.mode.value,
+            run.approval_mode.value,
             json.dumps([turn.model_dump(mode="json") for turn in run.turns], ensure_ascii=False),
             int(run.verifier_enabled),
             _dump_model(run.plan),
@@ -565,6 +569,7 @@ class Storage:
             project_id=row["project_id"],
             state=RunState(row["state"]),
             mode=InteractionMode(row["mode"]),
+            approval_mode=ApprovalMode(row["approval_mode"]),
             turns=json.loads(row["turns_json"]),
             verifier_enabled=bool(row["verifier_enabled"]),
             plan=_load_model(TaskPlan, row["plan_json"]),

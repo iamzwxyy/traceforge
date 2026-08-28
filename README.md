@@ -19,9 +19,10 @@ Its differentiator is a defensible engineering loop with useful human control.
 - **Agent by default, Plan when requested.** Executable tasks inspect, plan internally, implement,
   and verify without a plan-approval ceremony. Plan mode is an explicit composer toggle that
   pauses on a complete downloadable Markdown plan whenever implementation is actually needed.
-- **Permission boundaries remain independent.** Routine work inside the workspace proceeds; an
-  undeclared file, unknown command, or dangerous operation still asks or is denied regardless of
-  whether Plan mode is enabled.
+- **Three explicit action-permission profiles.** Manual asks before every edit or command;
+  Automatic (the default) applies deterministic local rules; Full access is deliberately scoped
+  to the workspace and enforced OS sandbox. All three remain independent from Agent/Plan mode,
+  while hard destructive commands, real-path boundaries, and credential scrubbing stay invariant.
 - **Plan as a completion contract.** Planned files, builder progress, check status, exact commands,
   and evidence stay visible. A write outside the declared file scope pauses for action approval.
 - **Independent completion review.** The reviewer cannot write files or run commands. A rejection
@@ -108,11 +109,16 @@ configurable conservative fallback. The resolved value and its source remain vis
 Click **新建任务** to enter only the request; press Enter to submit or Shift+Enter for a newline.
 The optional **计划模式** toggle is off by default. Leave it off for the normal Agent flow, or
 turn it on when you want to review and download the plan before any implementation. TraceForge
-creates a unique task directory beneath the visible default root. Click **添加项目** to select a
+also exposes a separate action-permission picker: **手动审批** confirms every edit/command,
+**自动审批** runs planned routine work and asks on drift, and **完全访问（工作区）** auto-handles
+workspace-scoped edits while retaining the path guard. It removes unknown-command prompts only
+when an OS sandbox is enforced; on a policy-only host, those commands fall back to human
+confirmation. Full access is per-turn and never becomes the next turn's silent default.
+TraceForge creates a unique task directory beneath the visible default root. Click **添加项目** to select a
 reusable project root in the application, then use the plus button beside that folder for
 project-scoped tasks. Direct runs stay at the top level. After a
 turn finishes, use the bottom composer to continue in the same task; each follow-up can choose its
-own Agent or Plan mode. In either mode, conversational or read-only requests can answer directly;
+own Agent/Plan and action-permission modes. In either mode, conversational or read-only requests can answer directly;
 the UI labels that terminal state separately from evidence-backed completion.
 
 The right **任务详情** panel starts collapsed so the conversation stays primary. Use the header
@@ -192,7 +198,7 @@ uv run python scripts/evaluate_quality.py --require-os-sandbox
 uv run python scripts/evaluate_real_model.py --credential-file /absolute/path/to/key
 ```
 
-The current suite has 170 backend tests at 87.71% coverage (with a hard 85% gate), eight frontend
+The current suite has 179 backend tests at 87.90% coverage (with a hard 85% gate), eight frontend
 unit tests, and three serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
@@ -216,7 +222,9 @@ concurrently on macOS/Linux. It is local-first and not a multi-user service. OS 
 backend-dependent: Seatbelt is built into supported macOS systems; Linux requires a working,
 non-setuid Bubblewrap installation. The header reports a visible **仅策略限制** state when no
 backend passes its startup probe. A user can explicitly approve an unknown command for one
-unsandboxed execution, which is recorded as a bypass. Binary file editing, Windows, parallel
+unsandboxed execution in the default Automatic profile, which is recorded as a bypass. The
+workspace Full-access profile is not host-wide `danger-full-access`; it retains the OS sandbox and
+falls back to a prompt for unknown commands when enforcement is unavailable. Binary file editing, Windows, parallel
 agents, browser automation, and plugin systems are outside v0.1.
 
 Licensed under the [MIT License](LICENSE).

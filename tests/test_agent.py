@@ -9,6 +9,7 @@ import pytest
 from traceforge.agent import AgentManager, InvalidRunAction, PlanDecision, RunConflictError
 from traceforge.config import Settings
 from traceforge.models import (
+    ApprovalMode,
     ClarificationAnswer,
     EventType,
     InteractionMode,
@@ -17,6 +18,7 @@ from traceforge.models import (
     RunState,
     TaskPlan,
     ToolCall,
+    ToolResult,
     Verdict,
 )
 from traceforge.prompts import (
@@ -25,6 +27,7 @@ from traceforge.prompts import (
     VERIFIER_SYSTEM_PROMPT,
 )
 from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
+from traceforge.sandbox import SandboxStatus
 from traceforge.storage import Storage
 
 
@@ -916,7 +919,9 @@ async def test_unknown_command_waits_for_explicit_approval(
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
 
-    await manager.decide_action(run.id, approved=False)
+    approval = storage.get_run(run.id).pending_approval
+    assert approval is not None
+    await manager.decide_action(run.id, approval.id, approved=False)
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED
@@ -1329,7 +1334,9 @@ async def test_approved_unknown_command_runs_once(
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
-    await manager.decide_action(run.id, approved=True)
+    approval = storage.get_run(run.id).pending_approval
+    assert approval is not None
+    await manager.decide_action(run.id, approval.id, approved=True)
 
     completed = await manager.wait(run.id)
     assert completed.state is RunState.SUCCEEDED
@@ -1341,6 +1348,408 @@ async def test_approved_unknown_command_runs_once(
     ]
     assert [result["output"] for result in results] == ["approved\n"]
     assert results[0]["metadata"]["sandbox"]["status"] == "bypassed"
+
+
+@pytest.mark.asyncio
+async def test_manual_mode_asks_for_planned_edit_and_check_without_sandbox_bypass(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = ["uv", "run", "pytest", "-q"]
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments={
+                            **_plan_arguments(command),
+                            "impacted_files": ["manual.txt"],
+                        },
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="write",
+                        name="create_file",
+                        arguments={"path": "manual.txt", "content": "approved\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="check",
+                        name="run_command",
+                        arguments={"argv": command},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Approved", "evidence": ["check"]},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    original_execute = manager.tools.execute
+    command_bypasses: list[bool] = []
+
+    async def execute(
+        run_id: str,
+        call: ToolCall,
+        *,
+        output_callback=None,
+        sandbox_bypass: bool = False,
+    ) -> ToolResult:
+        if call.name != "run_command":
+            return await original_execute(
+                run_id,
+                call,
+                output_callback=output_callback,
+                sandbox_bypass=sandbox_bypass,
+            )
+        command_bypasses.append(sandbox_bypass)
+        return ToolResult(
+            tool_call_id=call.id,
+            name=call.name,
+            ok=True,
+            output="1 passed\n",
+            metadata={
+                "exit_code": 0,
+                "sandbox": {
+                    "status": "enforced",
+                    "backend": "seatbelt",
+                    "enforced": True,
+                },
+            },
+        )
+
+    monkeypatch.setattr(manager.tools, "execute", execute)
+    run = await manager.start_run(
+        "Create manual.txt",
+        verifier_enabled=False,
+        approval_mode=ApprovalMode.MANUAL,
+    )
+
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    write_approval = storage.get_run(run.id).pending_approval
+    assert write_approval is not None
+    assert write_approval.tool_call.id == "write"
+    assert write_approval.policy_decision == "allow"
+    assert write_approval.sandbox_bypass_on_approve is False
+    await manager.decide_action(run.id, write_approval.id, approved=True)
+
+    async with asyncio.timeout(3):
+        while True:
+            next_approval = storage.get_run(run.id).pending_approval
+            if next_approval is not None and next_approval.id != write_approval.id:
+                break
+            await asyncio.sleep(0.01)
+    check_approval = storage.get_run(run.id).pending_approval
+    assert check_approval is not None
+    assert check_approval.tool_call.id == "check"
+    assert check_approval.policy_decision == "allow"
+    assert check_approval.sandbox_bypass_on_approve is False
+    await manager.decide_action(run.id, check_approval.id, approved=True)
+
+    completed = await manager.wait(run.id)
+    assert completed.state is RunState.SUCCEEDED
+    assert (settings.workspace / "manual.txt").read_text() == "approved\n"
+    assert command_bypasses == [False]
+    assert completed.approval_mode is ApprovalMode.MANUAL
+    assert completed.turns[-1].approval_mode is ApprovalMode.MANUAL
+
+
+@pytest.mark.asyncio
+async def test_full_access_auto_allows_scope_drift_but_not_hard_denials(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments={
+                            "summary": "Create a file",
+                            "steps": [{"id": "create", "title": "Create it"}],
+                            "acceptance_checks": [
+                                {"id": "review", "label": "The file exists"}
+                            ],
+                            "impacted_files": ["planned.txt"],
+                        },
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="drift",
+                        name="create_file",
+                        arguments={"path": "actual.txt", "content": "inside\n"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Created", "evidence": ["diff"]},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run(
+        "Create a file",
+        verifier_enabled=False,
+        approval_mode=ApprovalMode.FULL_ACCESS,
+    )
+
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    assert (settings.workspace / "actual.txt").read_text() == "inside\n"
+    assert not any(
+        event.type is EventType.APPROVAL_REQUESTED
+        for event in storage.get_events(run.id)
+    )
+    result = next(
+        event.payload["result"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TOOL_COMPLETED
+        and event.payload["call"]["id"] == "drift"
+    )
+    assert result["metadata"]["permission"]["mode"] == "full_access"
+    assert result["metadata"]["permission"]["policy_decision"] == "ask"
+    assert result["metadata"]["permission"]["sandbox_bypass"] is False
+
+
+@pytest.mark.asyncio
+async def test_full_access_unknown_command_auto_runs_only_inside_enforced_sandbox(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="unknown",
+                        name="run_command",
+                        arguments={"argv": ["python", "app.py"]},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Ran safely", "evidence": ["sandbox"]},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    manager.tools.sandbox.status = SandboxStatus(
+        backend="seatbelt", enforced=True, detail="test sandbox"
+    )
+    bypasses: list[bool] = []
+
+    async def execute(
+        _run_id: str,
+        call: ToolCall,
+        *,
+        output_callback=None,
+        sandbox_bypass: bool = False,
+    ) -> ToolResult:
+        del output_callback
+        bypasses.append(sandbox_bypass)
+        return ToolResult(
+            tool_call_id=call.id,
+            name=call.name,
+            ok=True,
+            output="safe\n",
+            metadata={
+                "exit_code": 0,
+                "sandbox": {
+                    "status": "enforced",
+                    "backend": "seatbelt",
+                    "enforced": True,
+                },
+            },
+        )
+
+    monkeypatch.setattr(manager.tools, "execute", execute)
+    run = await manager.start_run(
+        "Run unknown code",
+        verifier_enabled=False,
+        approval_mode=ApprovalMode.FULL_ACCESS,
+    )
+
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    assert bypasses == [False]
+    assert not any(
+        event.type is EventType.APPROVAL_REQUESTED
+        for event in storage.get_events(run.id)
+    )
+    command_result = next(
+        event.payload["result"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TOOL_COMPLETED
+        and event.payload["call"]["id"] == "unknown"
+    )
+    assert command_result["metadata"]["sandbox"]["status"] == "enforced"
+    assert command_result["metadata"]["permission"]["sandbox_bypass"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_abandons_pending_approval_and_stale_id_cannot_resolve_it(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="unknown",
+                        name="run_command",
+                        arguments={"argv": ["python", "app.py"]},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run(
+        "Run a command",
+        verifier_enabled=False,
+        approval_mode=ApprovalMode.AUTOMATIC,
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    approval = storage.get_run(run.id).pending_approval
+    assert approval is not None
+
+    with pytest.raises(InvalidRunAction, match="no longer pending"):
+        await manager.decide_action(run.id, "stale-id", approved=True)
+    await manager.cancel(run.id)
+
+    cancelled = storage.get_run(run.id)
+    assert cancelled.state is RunState.CANCELLED
+    assert cancelled.pending_approval is None
+    resolved = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.APPROVAL_RESOLVED
+    ]
+    assert resolved[-1].payload["approval_id"] == approval.id
+    assert resolved[-1].payload["outcome"] == "abandoned"
+    assert resolved[-1].payload["cause"] == "user_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_restart_abandons_pending_approval_without_replaying_action(
+    settings: Settings, storage: Storage
+) -> None:
+    first = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="pending-command",
+                            name="run_command",
+                            arguments={"argv": ["python", "app.py"]},
+                        )
+                    ]
+                ),
+            ]
+        ),
+    )
+    run = await first.start_run("Run later", verifier_enabled=False)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_ACTION_APPROVAL)
+    approval = storage.get_run(run.id).pending_approval
+    assert approval is not None
+
+    await first.shutdown()
+
+    interrupted = storage.get_run(run.id)
+    assert interrupted.state is RunState.INTERRUPTED
+    assert interrupted.pending_approval is None
+    assert interrupted.interrupted_from is RunState.AWAITING_ACTION_APPROVAL
+    abandoned = next(
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.APPROVAL_RESOLVED
+        and event.payload.get("outcome") == "abandoned"
+    )
+    assert abandoned.payload["approval_id"] == approval.id
+    assert abandoned.payload["cause"] == "process_shutdown"
+
+    second = AgentManager(
+        settings,
+        storage,
+        ScriptedProvider(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="finish-after-resume",
+                            name="finish",
+                            arguments={
+                                "summary": "Inspected after restart",
+                                "evidence": ["no replay"],
+                            },
+                        )
+                    ]
+                )
+            ]
+        ),
+    )
+    await second.resume(run.id)
+    completed = await second.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED
+    assert not any(
+        event.type is EventType.TOOL_COMPLETED
+        and event.payload["call"]["id"] == "pending-command"
+        for event in storage.get_events(run.id)
+    )
 
 
 @pytest.mark.asyncio
@@ -1727,7 +2136,7 @@ async def test_public_actions_reject_invalid_run_states(
     with pytest.raises(InvalidRunAction, match="plan approval"):
         await manager.decide_plan("terminal", PlanDecision(decision="approve"))
     with pytest.raises(InvalidRunAction, match="action approval"):
-        await manager.decide_action("terminal", approved=True)
+        await manager.decide_action("terminal", "missing", approved=True)
     with pytest.raises(InvalidRunAction, match="interrupted"):
         await manager.resume("terminal")
 
