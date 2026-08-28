@@ -25,6 +25,16 @@ export function presentState(state: RunState): StatePresentation {
   return states[state];
 }
 
+export function taskTitle(run: Pick<Run, "task">): string {
+  const source = run.task.replace(/\s+/g, " ").trim();
+  const sentenceEnd = source.search(/[。！？!?]/u);
+  const sentence = sentenceEnd >= 0 ? source.slice(0, sentenceEnd + 1) : source;
+  const characters = Array.from(sentence);
+  return characters.length <= 48
+    ? sentence
+    : `${characters.slice(0, 47).join("")}…`;
+}
+
 export function mergeEvents(current: RunEvent[], incoming: RunEvent[]): RunEvent[] {
   const bySequence = new Map(current.map((event) => [event.seq, event]));
   for (const event of incoming) bySequence.set(event.seq, event);
@@ -78,34 +88,59 @@ export function projectConversationEvents(events: RunEvent[]): RunEvent[] {
   const conversation = events.filter((event) =>
     ["turn.started", "turn.completed", "message"].includes(event.type)
   );
-  const hidden = new Set<number>();
-  let turnStart = -1;
+  const projected: RunEvent[] = [];
+  let started: RunEvent | null = null;
+  let messages: RunEvent[] = [];
+  const flushIncomplete = () => {
+    if (started) projected.push(started);
+    if (messages.length > 0) {
+      projected.push(messages.at(-1)!);
+    }
+    started = null;
+    messages = [];
+  };
 
-  for (const [index, event] of conversation.entries()) {
+  for (const event of conversation) {
     if (event.type === "turn.started") {
-      turnStart = index;
+      flushIncomplete();
+      started = event;
       continue;
     }
-    if (event.type !== "turn.completed") continue;
-    if (["answered", "succeeded"].includes(String(event.payload.outcome ?? ""))) {
-      const summary = String(event.payload.summary ?? "");
-      for (let candidate = index - 1; candidate > turnStart; candidate -= 1) {
-        const previous = conversation[candidate];
-        if (previous.type !== "message") continue;
-        if (
-          ["planning", "building", "verifying"].includes(
-            String(previous.payload.phase ?? ""),
-          )
-          && String(previous.payload.content ?? "") === summary
-        ) {
-          hidden.add(previous.seq);
-        }
-      }
+    if (event.type === "message") {
+      messages.push(event);
+      continue;
     }
-    turnStart = -1;
+    if (started) projected.push(started);
+    projected.push(event);
+    started = null;
+    messages = [];
   }
+  flushIncomplete();
 
-  return conversation.filter((event) => !hidden.has(event.seq));
+  return projected;
+}
+
+export function projectProgressEvents(events: RunEvent[]): RunEvent[] {
+  const progress: RunEvent[] = [];
+  let messages: RunEvent[] = [];
+  const flush = (summary?: string) => {
+    progress.push(...messages.filter((event) =>
+      summary === undefined || String(event.payload.content ?? "") !== summary
+    ));
+    messages = [];
+  };
+
+  for (const event of events) {
+    if (event.type === "turn.started") {
+      flush();
+    } else if (event.type === "message") {
+      messages.push(event);
+    } else if (event.type === "turn.completed") {
+      flush(String(event.payload.summary ?? ""));
+    }
+  }
+  flush();
+  return progress;
 }
 
 export function reasoningErrorLabel(message: string): string | null {

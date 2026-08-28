@@ -59,12 +59,25 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await page.getByRole("button", { name: "继续" }).click();
 
   await expect(page.getByRole("button", { name: "批准并执行" })).toBeVisible();
+  await expect(page.getByRole("heading", {
+    level: 2,
+    name: "修复多租户缓存隔离问题，不能改变 TTL 或缓存命中行为。",
+  })).toBeVisible();
+  await expect(page.locator(".run-item strong"))
+    .toHaveText("修复多租户缓存隔离问题，不能改变 TTL 或缓存命中行为。");
+  await expect(page.locator(".user-turn").first())
+    .toContainText("补充回归测试，并证明完整测试套件通过。");
   await expect(page.locator(".plan-document")).toContainText("实施计划");
   await expect(page.getByRole("link", { name: "下载 Markdown" }))
     .toHaveAttribute("href", /plan\.md$/);
   await page.getByRole("button", { name: "批准并执行" }).click();
 
   await expect(page.getByText("本轮已完成", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator(".assistant-turn")).toHaveCount(1);
+  await expect(page.locator(".assistant-turn"))
+    .toContainText("已按 (tenant_id, profile_id) 隔离缓存项");
+  await expect(page.locator(".assistant-turn"))
+    .not.toContainText("实现和回归测试已经就位");
   await expect(page.locator(".reasoning-effort-badge")).toContainText("模型默认");
   await expect(page.getByRole("region", { name: "第 1 轮由编辑工具更改的文件" }))
     .toContainText("src/tenant_cache_api/cache.py");
@@ -89,6 +102,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(trace.locator("summary")).toContainText("查看工作记录");
   await trace.locator("summary").click();
   await expect(trace).toHaveAttribute("open", "");
+  await expect(trace).toContainText("实现和回归测试已经就位");
   await expect(trace).toContainText("完成后复核");
 
   await page.reload();

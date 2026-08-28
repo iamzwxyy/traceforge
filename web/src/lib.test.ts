@@ -6,9 +6,11 @@ import {
   preferNewerRun,
   presentState,
   projectConversationEvents,
+  projectProgressEvents,
   reasoningErrorLabel,
   shouldSubmitPrompt,
   supportedReasoningEffort,
+  taskTitle,
 } from "./lib";
 import type { Run, RunEvent } from "./types";
 
@@ -61,8 +63,8 @@ describe("mission control helpers", () => {
     expect(supportedReasoningEffort([], "high")).toBe("auto");
   });
 
-  it("hides only an exact legacy planning duplicate of an answered turn", () => {
-    const projected = projectConversationEvents([
+  it("keeps completed turns conversation-first and moves distinct progress to Trace", () => {
+    const events = [
       { ...event(1), type: "turn.started", payload: { index: 1 } },
       { ...event(2), payload: { phase: "planning", content: "Inspecting first." } },
       { ...event(3), payload: { phase: "planning", content: "Final answer" } },
@@ -72,12 +74,28 @@ describe("mission control helpers", () => {
         type: "turn.completed",
         payload: { index: 1, outcome: "answered", summary: "Final answer" },
       },
+    ];
+    const projected = projectConversationEvents([
+      ...events,
     ]);
 
-    expect(projected.map((item) => item.seq)).toEqual([1, 2, 4, 5]);
+    expect(projected.map((item) => item.seq)).toEqual([1, 5]);
+    expect(projectProgressEvents(events).map((item) => item.seq)).toEqual([2, 4]);
   });
 
-  it("does not deduplicate across turns or discard distinct progress", () => {
+  it("keeps one live progress update while retaining every update for Trace", () => {
+    const events = [
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      { ...event(2), payload: { phase: "planning", content: "First progress" } },
+      { ...event(3), payload: { phase: "building", content: "Latest progress" } },
+    ];
+
+    expect(projectConversationEvents(events).map((item) => item.seq))
+      .toEqual([1, 3]);
+    expect(projectProgressEvents(events).map((item) => item.seq)).toEqual([2, 3]);
+  });
+
+  it("keeps one canonical response per completed turn without cross-turn folding", () => {
     const projected = projectConversationEvents([
       { ...event(1), type: "turn.started", payload: { index: 1 } },
       { ...event(2), payload: { phase: "planning", content: "Progress" } },
@@ -94,7 +112,7 @@ describe("mission control helpers", () => {
       },
     ]);
 
-    expect(projected.map((item) => item.seq)).toEqual([1, 2, 3, 4, 5]);
+    expect(projected.map((item) => item.seq)).toEqual([1, 3, 4, 5]);
   });
 
   it("hides an exact legacy builder draft before a successful terminal summary", () => {
@@ -106,6 +124,28 @@ describe("mission control helpers", () => {
         type: "turn.completed",
         payload: { index: 1, outcome: "succeeded", summary: "Implemented and tested" },
       },
+    ]);
+
+    expect(projected.map((item) => item.seq)).toEqual([1, 3]);
+  });
+
+  it("derives a stable concise task title without hiding the original request", () => {
+    expect(taskTitle({
+      task: "修复多租户缓存隔离问题，不能改变 TTL 或缓存命中行为。补充回归测试，并证明完整测试套件通过。",
+    })).toBe("修复多租户缓存隔离问题，不能改变 TTL 或缓存命中行为。");
+    const plannedRun = {
+      task: "  Inspect the cache key\nwithout changing TTL  ",
+      plan: { summary: "A plan that must not rename the task" } as Run["plan"],
+    };
+    expect(taskTitle(plannedRun)).toBe("Inspect the cache key without changing TTL");
+    expect(Array.from(taskTitle({ task: "🙂".repeat(60) }))).toHaveLength(48);
+  });
+
+  it("keeps the latest progress for an incomplete legacy or interrupted turn", () => {
+    const projected = projectConversationEvents([
+      { ...event(1), type: "turn.started", payload: { index: 1 } },
+      { ...event(2), payload: { phase: "planning", content: "Earlier" } },
+      { ...event(3), payload: { phase: "building", content: "Last durable progress" } },
     ]);
 
     expect(projected.map((item) => item.seq)).toEqual([1, 3]);

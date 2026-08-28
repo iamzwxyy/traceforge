@@ -54,9 +54,11 @@ import {
   parseDiff,
   presentState,
   projectConversationEvents,
+  projectProgressEvents,
   reasoningErrorLabel,
   shouldSubmitPrompt,
   supportedReasoningEffort,
+  taskTitle,
 } from "./lib";
 import type {
   ApprovalMode,
@@ -300,7 +302,12 @@ export default function App() {
       return;
     }
     if (!choice.path) return;
-    await forge.createProject(projectNameFromPath(choice.path), choice.path, false);
+    const created = await forge.createProject(
+      projectNameFromPath(choice.path),
+      choice.path,
+      false,
+    );
+    openProjectComposer(created.id);
   };
 
   const toggleHistory = () => {
@@ -485,8 +492,9 @@ export default function App() {
           onClose={() => setShowProject(false)}
           onListDirectories={forge.listDirectories}
           onCreate={async (name, root, createDirectory) => {
-            await forge.createProject(name, root, createDirectory);
+            const created = await forge.createProject(name, root, createDirectory);
             setShowProject(false);
+            openProjectComposer(created.id);
           }}
         />
       )}
@@ -834,7 +842,7 @@ function SidebarRun({
         <span className="run-state">{state.label}</span>
         <span className="run-time">{relativeTime(run.updated_at)}</span>
       </div>
-      <strong>{run.task}</strong>
+      <strong title={run.task}>{taskTitle(run)}</strong>
       <div className="run-item-foot">
         <span className="run-id">{run.id.slice(0, 8)}</span>
         <span className="run-scope">{nested ? "项目任务" : "独立目录"}</span>
@@ -1525,7 +1533,7 @@ function RunStage({
             <span>{run.mode === "plan" ? "计划模式" : "普通 Agent"} · 第 {Math.max(run.turns.length, 1)} 轮</span>
             <span>任务 {run.id.slice(0, 8).toUpperCase()}</span>
           </div>
-          <h2>{run.task}</h2>
+          <h2 title={run.task}>{taskTitle(run)}</h2>
         </div>
         <div className="button-row">
           <button
@@ -1642,8 +1650,12 @@ function RollbackDialog({ onClose, onConfirm }: { onClose: () => void; onConfirm
 function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
   const end = useRef<HTMLDivElement>(null);
   const conversation = projectConversationEvents(events);
+  const progressSequences = new Set(
+    projectProgressEvents(events).map((event) => event.seq),
+  );
   const trace = events.filter((event) =>
     [
+      "message",
       "tool.completed",
       "plan.gated",
       "verification.completed",
@@ -1651,7 +1663,7 @@ function ActivityFeed({ run, events }: { run: Run; events: RunEvent[] }) {
       "model.retry",
       "run.resumed",
       "error",
-    ].includes(event.type)
+    ].includes(event.type) && (event.type !== "message" || progressSequences.has(event.seq))
   );
   const hasPersistedTurn = conversation.some((event) => event.type === "turn.started");
   useEffect(() => {

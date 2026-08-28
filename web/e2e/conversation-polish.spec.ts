@@ -328,3 +328,67 @@ test("a failed draft probe preserves an older verified connection", async ({ pag
     "本地服务已就绪，模型连接已验证",
   );
 });
+
+test("adding a project lands directly in that project's task composer", async ({ page }) => {
+  const workspace = "/tmp/traceforge-project-root";
+  const project = {
+    id: "project-added",
+    name: "billing-service",
+    root: "/tmp/billing-service",
+    created_at: createdAt,
+    updated_at: createdAt,
+    last_opened_at: createdAt,
+  };
+  let submittedProject: Record<string, unknown> | null = null;
+  let submittedRun: Record<string, unknown> | null = null;
+  const createdRun = {
+    ...answeredRun("project-run", "Inspect billing retries", "Done"),
+    project_id: project.id,
+    workspace: project.root,
+  };
+
+  await page.route("**/api/status", (route) => route.fulfill(json(status(workspace))));
+  await page.route("**/api/runs", async (route) => {
+    if (route.request().method() === "POST") {
+      submittedRun = route.request().postDataJSON() as Record<string, unknown>;
+      await route.fulfill(json(createdRun));
+      return;
+    }
+    await route.fulfill(json([]));
+  });
+  await page.route("**/api/runs/project-run", (route) => route.fulfill(json(createdRun)));
+  await page.route("**/api/runs/project-run/events?*", (route) => route.fulfill(json([])));
+  await page.route("**/api/runs/project-run/diff", (route) => route.fulfill(json({ diff: "" })));
+  await page.route("**/api/provider", (route) => route.fulfill(json(provider())));
+  await page.route("**/api/filesystem/choose-directory", (route) => route.fulfill(json({
+    supported: true,
+    path: project.root,
+  })));
+  await page.route("**/api/projects", async (route) => {
+    if (route.request().method() === "POST") {
+      submittedProject = route.request().postDataJSON() as Record<string, unknown>;
+      await route.fulfill(json(project));
+      return;
+    }
+    await route.fulfill(json([]));
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "添加项目" }).click();
+
+  await expect(page.getByRole("heading", {
+    name: "你想在 billing-service 中处理什么？",
+  })).toBeVisible();
+  await expect(page.locator(".composer-target")).toContainText(project.root);
+  await expect(page.locator("textarea")).toBeFocused();
+  await expect(page.locator(".project-group")).toContainText("billing-service");
+  expect(submittedProject).toEqual({
+    name: "billing-service",
+    root: project.root,
+    create_directory: false,
+  });
+
+  await page.locator("textarea").fill("Inspect billing retries");
+  await page.getByRole("button", { name: "发送" }).click();
+  await expect.poll(() => submittedRun?.project_id).toBe(project.id);
+});
