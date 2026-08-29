@@ -255,6 +255,7 @@ test("reasoning picker follows the exact sparse model capability list", async ({
 
   const picker = page.getByLabel("本轮思考强度");
   await expect(picker).toBeVisible();
+  await expect(page.getByText("计划模式", { exact: true })).toHaveCount(0);
   await expect(picker.locator("option")).toHaveText([
     "模型默认 · 高", "关闭", "低", "高", "最大",
   ]);
@@ -263,6 +264,9 @@ test("reasoning picker follows the exact sparse model capability list", async ({
   await expect(picker.locator('option[value="xhigh"]')).toHaveCount(0);
   await picker.selectOption("high");
   await expect(picker).toHaveValue("high");
+  await picker.hover();
+  await expect(picker).toHaveCSS("background-color", "rgb(247, 248, 250)");
+  await expect(picker).toHaveCSS("color", "rgb(32, 36, 43)");
   await picker.focus();
   await expect(picker).toBeFocused();
   await picker.selectOption("max");
@@ -276,6 +280,7 @@ test("reasoning picker follows the exact sparse model capability list", async ({
   await page.locator("textarea").fill("Explain this repository");
   await page.getByRole("button", { name: "发送" }).click();
   await expect.poll(() => submitted?.reasoning_effort).toBe("high");
+  expect(submitted?.mode).toBe("agent");
 });
 
 test("reasoning capability loading and a non-default singleton stay truthful", async ({ page }) => {

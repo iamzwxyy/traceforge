@@ -195,9 +195,10 @@ alias and Sol/Terra/Luna variants, `gpt-5.5`, `gpt-5.4`/Mini/Nano, `gpt-5.3-code
 the DeepSeek allowlist covers the official V4 Flash/Pro/Flash Vision Exp routes.
 
 Click **新建任务** to enter only the request; press Enter to submit or Shift+Enter for a newline.
-The optional **计划模式** toggle is off by default. Leave it off for the normal Agent flow, or
-turn it on when you want to review and download the plan before any implementation. TraceForge
-also exposes a separate action-permission picker: **手动审批** confirms every edit/command,
+TraceForge automatically decides whether a plan needs review: explicit low-risk single-file work
+continues automatically, while complex, high-impact, or clarified work pauses before implementation
+with a complete downloadable plan. The standard UI therefore has no separate plan-mode toggle.
+TraceForge also exposes a separate action-permission picker: **手动审批** confirms every edit/command,
 **自动审批** runs planned routine work and asks on drift, and **完全访问（工作区）** auto-handles
 workspace-scoped edits while retaining the path guard. It removes unknown-command prompts only
 when an OS sandbox is enforced; on a policy-only host, those commands fall back to human

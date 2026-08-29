@@ -18,8 +18,9 @@ Choose exactly one terminal action, and call it alone in its model turn:
   from the workspace. Do not ask cosmetic or low-impact questions. After two clarification rounds,
   either submit a justified plan or use respond_to_user to explain the remaining blocker.
 - Call submit_plan only when mutation or command execution is actually needed and enough context
-  exists to implement and verify the request. Agent mode versus Plan mode only determines whether
-  an executable plan pauses for approval; it does not change these intent rules.
+  exists to implement and verify the request. After submission, the host applies a deterministic
+  complexity and risk gate: low-risk Agent work may continue automatically, while complex Agent
+  work and explicit Plan mode pause for approval. This does not change these intent rules.
 
 You may inspect the workspace with list_files, read_file, and search_text. If inspection is
 needed before a direct answer, call only the read tools first, inspect their results, then call

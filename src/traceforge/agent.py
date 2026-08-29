@@ -1401,16 +1401,7 @@ class AgentManager:
                         plan,
                         clarification_rounds=self._clarification_round(run.id),
                     )
-                    if run.mode is InteractionMode.AGENT:
-                        run.plan_gate = PlanGate(
-                            decision="agent_continues",
-                            risk=assessed_gate.risk,
-                            reasons=[
-                                "Agent mode continues without a plan approval pause",
-                                *assessed_gate.reasons,
-                            ],
-                        )
-                    else:
+                    if run.mode is InteractionMode.PLAN:
                         run.plan_gate = PlanGate(
                             decision="approval_required",
                             risk=assessed_gate.risk,
@@ -1419,13 +1410,15 @@ class AgentManager:
                                 *assessed_gate.reasons,
                             ],
                         )
+                    else:
+                        run.plan_gate = assessed_gate
                     self.storage.save_run(run)
                     await self.broker.emit(
                         run.id,
                         EventType.PLAN_GATED,
                         run.plan_gate.model_dump(mode="json"),
                     )
-                    if run.mode is InteractionMode.AGENT:
+                    if run.plan_gate.decision == "auto_approved":
                         await self.broker.emit(
                             run.id, EventType.PLAN_UPDATED, plan.model_dump(mode="json")
                         )

@@ -106,14 +106,12 @@ const DEFAULT_REASONING_EFFORTS: ReasoningEffort[] = ["auto"];
 
 interface TaskComposerDraft {
   task: string;
-  planMode: boolean;
   approvalMode: ApprovalMode;
   reasoningEffort: ReasoningEffort;
 }
 
 interface FollowUpDraft {
   prompt: string;
-  planMode: boolean;
   approvalMode: ApprovalMode;
   reasoningEffort: ReasoningEffort;
 }
@@ -339,7 +337,6 @@ export default function App() {
 
   const defaultTaskDraft = (): TaskComposerDraft => ({
     task: forge.status?.suggested_task ?? "",
-    planMode: forge.status?.mode === "demo",
     approvalMode: forge.status?.mode === "demo" ? "automatic" : storedApprovalMode(),
     reasoningEffort: "auto",
   });
@@ -375,7 +372,6 @@ export default function App() {
   const followUpDraft = forge.run && followUpDraftKey
     ? followUpDrafts[followUpDraftKey] ?? {
       prompt: "",
-      planMode: false,
       approvalMode: forge.run.approval_mode === "full_access"
         ? "automatic"
         : forge.run.approval_mode,
@@ -1050,7 +1046,7 @@ function TaskComposer({
               : { create_direct_workspace: true };
           void onSubmit(
             draft.task.trim(),
-            draft.planMode ? "plan" : "agent",
+            demoMode ? "plan" : "agent",
             demoMode ? "automatic" : draft.approvalMode,
             demoMode ? "auto" : effectiveReasoningEffort,
             target,
@@ -1115,11 +1111,6 @@ function TaskComposer({
           disabled={demoMode || submitting}
         />
         <div className="composer-actions">
-          <label className="toggle-row plan-mode-toggle">
-            <input type="checkbox" checked={draft.planMode} onChange={(event) => onDraftChange({ ...draft, planMode: event.target.checked })} disabled={demoMode || submitting} />
-            <span className="toggle" />
-            <span><strong>计划模式</strong></span>
-          </label>
           <ReasoningEffortPicker
             value={effectiveReasoningEffort}
             onChange={(reasoningEffort) => onDraftChange({ ...draft, reasoningEffort })}
@@ -2242,11 +2233,11 @@ function ActivityItem({ event }: { event: RunEvent }) {
   if (event.type === "plan.gated") {
     const decision = String(event.payload.decision ?? "assessed");
     const reasons = Array.isArray(event.payload.reasons) ? event.payload.reasons.map(String) : [];
-    const agentContinues = decision === "agent_continues";
+    const automatic = decision !== "approval_required";
     return (
       <article className="activity evidence-activity policy-activity">
         <div className="activity-icon"><Zap size={15} /></div>
-        <div><span className="activity-label">{agentContinues ? "Agent 工作边界" : "计划模式检查点"}</span><strong>{planDecisionLabel(decision)} · {riskLabel(String(event.payload.risk ?? "unknown"))}</strong>{reasons.length > 0 && <p>{reasons.map(planGateReasonLabel).join(" · ")}</p>}</div>
+        <div><span className="activity-label">{automatic ? "自动执行判断" : "执行前确认"}</span><strong>{planDecisionLabel(decision)} · {riskLabel(String(event.payload.risk ?? "unknown"))}</strong>{reasons.length > 0 && <p>{reasons.map(planGateReasonLabel).join(" · ")}</p>}</div>
       </article>
     );
   }
@@ -2674,7 +2665,7 @@ function FollowUpComposer({
         submittingRef.current = true;
         void onSubmit(
           request,
-          draft.planMode ? "plan" : "agent",
+          "agent",
           draft.approvalMode,
           effectiveReasoningEffort,
         )
@@ -2703,11 +2694,6 @@ function FollowUpComposer({
         aria-label="继续此任务"
       />
       <div className="follow-up-actions">
-        <label className="toggle-row">
-          <input type="checkbox" disabled={submitting} checked={draft.planMode} onChange={(event) => onDraftChange({ ...draft, planMode: event.target.checked })} />
-          <span className="toggle" />
-          <span><strong>计划模式</strong><small>本轮先审计划再执行</small></span>
-        </label>
         <label className="approval-mode-select">
           <span>权限</span>
           <select
@@ -2868,10 +2854,10 @@ function WorkspaceRulesBadge({ manifest }: { manifest: WorkspaceInstructionManif
 function PlanGateSummary({ gate }: { gate: PlanGate }) {
   const automatic = gate.decision !== "approval_required";
   const title = gate.decision === "agent_continues"
-    ? "普通 Agent 已自动继续"
+    ? "兼容任务已自动继续"
     : gate.decision === "auto_approved"
-      ? "低风险快速路径"
-      : "计划模式等待确认";
+      ? "范围明确，自动执行"
+      : "复杂任务，执行前确认";
   return <div className={`plan-gate-summary ${automatic ? "fast" : "review"}`}><div>{automatic ? <Zap size={15} /> : <ShieldCheck size={15} />}<span><strong>{title}</strong><small>工作边界评估 · {riskLabel(gate.risk)}</small></span></div><ul>{gate.reasons.map((reason) => <li key={reason}>{planGateReasonLabel(reason)}</li>)}</ul></div>;
 }
 
@@ -3213,7 +3199,7 @@ function rollbackStatusLabel(status: string): string {
 
 function planGateReasonLabel(reason: string): string {
   const exact: Record<string, string> = {
-    "Agent mode continues without a plan approval pause": "普通 Agent 不因计划审批而暂停",
+    "Agent mode continues without a plan approval pause": "兼容任务未暂停计划审批",
     "Plan mode pauses for review before implementation": "计划模式会在实施前等待确认",
     "Material choices were clarified with the user": "已与用户澄清关键选择",
     "The plan must name exactly one impacted file for automatic approval": "仅明确影响一个文件时才能自动批准",

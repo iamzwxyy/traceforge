@@ -165,7 +165,6 @@ test("session drafts stay isolated by task target and never enter browser storag
   await page.goto("/");
   const followUp = page.locator(".follow-up-composer");
   await followUp.getByLabel("继续此任务").fill(canaries.followA);
-  await followUp.locator('input[type="checkbox"]').check({ force: true });
   await followUp.getByLabel("本轮权限模式").selectOption("manual");
   await followUp.getByLabel("本轮思考强度").selectOption("high");
 
@@ -176,14 +175,12 @@ test("session drafts stay isolated by task target and never enter browser storag
 
   await runItem(page, "Task Alpha").click();
   await expect(followUp.getByLabel("继续此任务")).toHaveValue(canaries.followA);
-  await expect(followUp.locator('input[type="checkbox"]')).toBeChecked();
   await expect(followUp.getByLabel("本轮权限模式")).toHaveValue("manual");
   await expect(followUp.getByLabel("本轮思考强度")).toHaveValue("high");
 
   await page.getByRole("button", { name: "新建任务", exact: true }).click();
   const taskComposer = page.locator(".task-composer");
   await taskComposer.locator("textarea").fill(canaries.direct);
-  await taskComposer.locator('input[type="checkbox"]').check({ force: true });
   await taskComposer.getByRole("radio", { name: /手动审批/ }).check({ force: true });
   await taskComposer.getByLabel("本轮思考强度").selectOption("high");
 
@@ -196,7 +193,6 @@ test("session drafts stay isolated by task target and never enter browser storag
   await runItem(page, "Task Alpha").click();
   await page.getByRole("button", { name: "新建任务", exact: true }).click();
   await expect(taskComposer.locator("textarea")).toHaveValue(canaries.direct);
-  await expect(taskComposer.locator('input[type="checkbox"]')).toBeChecked();
   await expect(taskComposer.getByRole("radio", { name: /手动审批/ })).toBeChecked();
   await expect(taskComposer.getByLabel("本轮思考强度")).toHaveValue("high");
 

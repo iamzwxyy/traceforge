@@ -50,6 +50,7 @@ def _plan_response() -> ModelResponse:
                     "summary": "Observe the workspace",
                     "steps": [{"id": "observe", "title": "Observe"}],
                     "acceptance_checks": [{"id": "observed", "label": "Workspace was observed"}],
+                    "impacted_files": ["note.txt"],
                 },
             )
         ]
@@ -474,7 +475,7 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
         assert created.json()["approval_mode"] == "automatic"
         assert created.json()["reasoning_effort"] == "auto"
         first = _wait_for_state(client, run_id, "succeeded")
-        assert first["plan_gate"]["decision"] == "agent_continues"
+        assert first["plan_gate"]["decision"] == "auto_approved"
         assert len(first["turns"]) == 1
 
         follow_up = client.post(

@@ -117,6 +117,19 @@ test("new-task layout stays operable without horizontal overflow", async ({ page
       .toBe(true);
   }
 
+  await page.setViewportSize({ width: 1366, height: 768 });
+  const brandBox = await page.locator(".brand").boundingBox();
+  expect(brandBox).not.toBeNull();
+  expect(brandBox!.x).toBeLessThan(100);
+  const desktopHistory = page.getByRole("button", { name: "任务与项目" });
+  await desktopHistory.click();
+  await expect(desktopHistory).toHaveAttribute("aria-expanded", "false");
+  await expect(heading).toBeVisible();
+  const collapsedMainBox = await page.locator(".main-stage").boundingBox();
+  expect(collapsedMainBox).not.toBeNull();
+  expect(collapsedMainBox!.width).toBeGreaterThan(1_000);
+  await desktopHistory.click();
+
   await page.setViewportSize({ width: 390, height: 768 });
   const history = page.getByRole("button", { name: "任务与项目" });
   await history.click();

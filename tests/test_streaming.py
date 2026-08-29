@@ -1999,6 +1999,7 @@ async def test_verified_finish_summary_stream_is_committed_by_the_success_event(
         "acceptance_checks": [
             {"id": "review", "label": "Review is complete", "command": None}
         ],
+        "impacted_files": ["note.txt"],
         "risks": [],
     }
     provider = ScriptedProvider(
@@ -2038,6 +2039,7 @@ def _finish_stream_responses(summary: str) -> list[ModelResponse]:
         "acceptance_checks": [
             {"id": "review", "label": "Review is complete", "command": None}
         ],
+        "impacted_files": ["note.txt"],
         "risks": [],
     }
     return [

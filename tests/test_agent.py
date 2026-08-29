@@ -57,13 +57,18 @@ async def _wait_for_state(
             await asyncio.sleep(0.01)
 
 
-def _plan_arguments(command: list[str]) -> dict[str, object]:
+def _plan_arguments(
+    command: list[str],
+    *,
+    impacted_file: str = "result.txt",
+) -> dict[str, object]:
     return {
         "summary": "Create a verified result",
         "steps": [{"id": "implement", "title": "Create the requested file"}],
         "acceptance_checks": [
             {"id": "check", "label": "Result is correct", "command": command}
         ],
+        "impacted_files": [impacted_file],
         "risks": ["The file must stay inside the workspace"],
     }
 
@@ -418,7 +423,7 @@ async def test_full_clarify_build_verify_flow(
 
 
 @pytest.mark.asyncio
-async def test_agent_mode_continues_without_plan_approval_but_stays_visible(
+async def test_agent_mode_auto_approves_a_low_risk_plan_but_keeps_it_visible(
     settings: Settings, storage: Storage
 ) -> None:
     provider = ScriptedProvider(
@@ -468,7 +473,7 @@ async def test_agent_mode_continues_without_plan_approval_but_stays_visible(
     assert completed.state is RunState.SUCCEEDED, completed.error
     assert completed.plan is not None
     assert completed.plan_gate is not None
-    assert completed.plan_gate.decision == "agent_continues"
+    assert completed.plan_gate.decision == "auto_approved"
     state_events = [
         event.payload["state"]
         for event in storage.get_events(run.id)
@@ -476,6 +481,46 @@ async def test_agent_mode_continues_without_plan_approval_but_stays_visible(
     ]
     assert RunState.AWAITING_PLAN_APPROVAL.value not in state_events
     assert EventType.PLAN_GATED in [event.type for event in storage.get_events(run.id)]
+
+
+@pytest.mark.asyncio
+async def test_agent_mode_pauses_for_a_complex_plan(
+    settings: Settings, storage: Storage
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments={
+                            "summary": "Change two related modules",
+                            "steps": [
+                                {"id": "first", "title": "Update the first module"},
+                                {"id": "second", "title": "Update the second module"},
+                            ],
+                            "acceptance_checks": [
+                                {"id": "review", "label": "Both modules are correct"}
+                            ],
+                            "impacted_files": ["first.py", "second.py"],
+                        },
+                    )
+                ]
+            )
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("Change two related modules")
+
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.mode is InteractionMode.AGENT
+    assert waiting.plan_gate is not None
+    assert waiting.plan_gate.decision == "approval_required"
+    assert waiting.plan_gate.risk == "medium"
+    await manager.cancel(run.id)
 
 
 @pytest.mark.asyncio
@@ -1305,6 +1350,10 @@ async def test_each_turn_persists_its_actual_native_edit_files(
     await manager.wait(run.id)
 
     await manager.follow_up(run.id, "Update a.txt and add b.txt")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    assert storage.get_run(run.id).plan_gate is not None
+    assert storage.get_run(run.id).plan_gate.decision == "approval_required"
+    await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED
@@ -1384,6 +1433,8 @@ async def test_partial_edit_files_survive_terminal_builder_failure(
     monkeypatch.setattr(Path, "write_text", fail_second_write)
     manager = AgentManager(settings, storage, provider)
     run = await manager.start_run("Update both files", verifier_enabled=False)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.FAILED
@@ -1453,6 +1504,8 @@ async def test_no_op_edit_keeps_passing_check_fresh_and_reports_no_changed_file(
     )
     manager = AgentManager(settings, storage, provider)
     run = await manager.start_run("Confirm result.txt", verifier_enabled=False)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED, completed.error
@@ -1667,11 +1720,16 @@ async def test_unknown_command_waits_for_explicit_approval(
     assert approvals[0].payload["approved"] is False
 
 
-def _review_plan(summary: str = "Review the workspace") -> dict[str, object]:
+def _review_plan(
+    summary: str = "Review the workspace",
+    *,
+    impacted_files: list[str] | None = None,
+) -> dict[str, object]:
     return {
         "summary": summary,
         "steps": [{"id": "review", "title": "Review current behavior"}],
         "acceptance_checks": [{"id": "reviewed", "label": "Behavior was reviewed"}],
+        "impacted_files": impacted_files or ["note.txt"],
     }
 
 
@@ -1865,7 +1923,11 @@ async def test_successful_builder_batch_resets_consecutive_rejection_budget(
         [
             ModelResponse(
                 tool_calls=[
-                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=_review_plan(impacted_files=["reset.txt"]),
+                    )
                 ]
             ),
             malformed("malformed-1"),
@@ -1928,7 +1990,11 @@ async def test_builder_rejects_entire_mixed_finish_batch_and_preserves_public_pr
         [
             ModelResponse(
                 tool_calls=[
-                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=_review_plan(impacted_files=["accepted.txt"]),
+                    )
                 ]
             ),
             ModelResponse(content="Rejected mixed progress", tool_calls=mixed_calls),
@@ -2019,7 +2085,15 @@ async def test_builder_action_budget_allows_finish_below_or_at_exact_limit(
     responses = [
         ModelResponse(
             tool_calls=[
-                ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ToolCall(
+                    id="plan",
+                    name="submit_plan",
+                    arguments=_review_plan(
+                        impacted_files=[
+                            f"budget-{index}.txt" for index in range(action_count)
+                        ]
+                    ),
+                )
             ]
         ),
         *[
@@ -2055,6 +2129,9 @@ async def test_builder_action_budget_allows_finish_below_or_at_exact_limit(
     run = await manager.start_run(
         "Exercise the action budget", verifier_enabled=verifier_enabled
     )
+    if action_count > 1:
+        await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+        await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED, completed.error
@@ -2082,7 +2159,11 @@ async def test_exact_action_budget_verifier_failure_stops_without_phantom_repair
         [
             ModelResponse(
                 tool_calls=[
-                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=_review_plan(impacted_files=["draft.txt"]),
+                    )
                 ]
             ),
             ModelResponse(
@@ -2131,7 +2212,13 @@ async def test_builder_rejects_over_budget_batch_before_executing_any_call(
         [
             ModelResponse(
                 tool_calls=[
-                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=_review_plan(
+                            impacted_files=["first.txt", "second.txt"]
+                        ),
+                    )
                 ]
             ),
             ModelResponse(
@@ -2181,6 +2268,8 @@ async def test_builder_rejects_over_budget_batch_before_executing_any_call(
     manager = AgentManager(limited, storage, provider)
 
     run = await manager.start_run("Stay within two actions", verifier_enabled=False)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED, completed.error
@@ -2238,7 +2327,11 @@ async def test_builder_fails_after_three_consecutive_over_budget_batches(
         [
             ModelResponse(
                 tool_calls=[
-                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=_review_plan(impacted_files=["accepted.txt"]),
+                    )
                 ]
             ),
             ModelResponse(
@@ -2304,7 +2397,11 @@ async def test_rejected_finish_does_not_consume_budget_needed_for_command_check(
         [
             ModelResponse(
                 tool_calls=[
-                    ToolCall(id="plan", name="submit_plan", arguments=_plan_arguments(check))
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=_plan_arguments(check, impacted_file="checked.txt"),
+                    )
                 ]
             ),
             ModelResponse(
@@ -2344,6 +2441,8 @@ async def test_rejected_finish_does_not_consume_budget_needed_for_command_check(
     manager = AgentManager(limited, storage, provider)
 
     run = await manager.start_run("Create and check the file", verifier_enabled=False)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED, completed.error
@@ -2376,7 +2475,11 @@ async def test_finish_fails_immediately_when_budget_cannot_run_missing_command_c
         [
             ModelResponse(
                 tool_calls=[
-                    ToolCall(id="plan", name="submit_plan", arguments=_plan_arguments(check))
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=_plan_arguments(check, impacted_file="created.txt"),
+                    )
                 ]
             ),
             ModelResponse(
@@ -2403,6 +2506,8 @@ async def test_finish_fails_immediately_when_budget_cannot_run_missing_command_c
     manager = AgentManager(limited, storage, provider)
 
     run = await manager.start_run("Do not finish without the command", verifier_enabled=False)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.FAILED
@@ -3469,7 +3574,11 @@ async def test_verifier_failure_triggers_one_repair_cycle(
         [
             ModelResponse(
                 tool_calls=[
-                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=_review_plan(impacted_files=["result.txt"]),
+                    )
                 ]
             ),
             ModelResponse(
@@ -5286,7 +5395,11 @@ async def test_accepted_action_before_crash_executes_once_after_explicit_resume(
             [
                 ModelResponse(
                     tool_calls=[
-                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                        ToolCall(
+                            id="plan",
+                            name="submit_plan",
+                            arguments=_review_plan(impacted_files=["resumed.txt"]),
+                        )
                     ]
                 ),
                 ModelResponse(
@@ -5369,7 +5482,11 @@ async def test_started_approved_action_is_uncertain_and_never_replayed_after_cra
                 ),
                 ModelResponse(
                     tool_calls=[
-                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                        ToolCall(
+                            id="plan",
+                            name="submit_plan",
+                            arguments=_review_plan(impacted_files=["must-not-replay.txt"]),
+                        )
                     ]
                 ),
                 ModelResponse(
@@ -5464,7 +5581,11 @@ async def test_user_cancel_marks_a_started_approved_action_uncertain(
             [
                 ModelResponse(
                     tool_calls=[
-                        ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                        ToolCall(
+                            id="plan",
+                            name="submit_plan",
+                            arguments=_review_plan(impacted_files=["cancelled-action.txt"]),
+                        )
                     ]
                 ),
                 ModelResponse(
@@ -5622,7 +5743,7 @@ async def test_transient_model_outage_pauses_and_resumes_without_losing_run(
     assert completed.state is RunState.SUCCEEDED, completed.error
     assert completed.error is None
     assert completed.plan_gate is not None
-    assert completed.plan_gate.decision == "agent_continues"
+    assert completed.plan_gate.decision == "auto_approved"
 
 
 @pytest.mark.asyncio
