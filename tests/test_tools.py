@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -41,6 +45,40 @@ def _persisted_registry(
     registry = ToolRegistry(workspace, settings)
     registry.bind_workspace_instruction_snapshot(run.id, snapshot.snapshot_sha256)
     return registry
+
+
+def _create_uv_isolation_probe(tmp_path: Path) -> tuple[Path, Path, Path]:
+    workspace_root = tmp_path / "self-host-workspace"
+    workspace_root.mkdir()
+    private_prefix = Path(tools_module.sys.prefix).resolve()
+    (workspace_root / ".venv").symlink_to(private_prefix, target_is_directory=True)
+    (workspace_root / "pyproject.toml").write_text(
+        "[project]\nname = 'isolated-probe'\nversion = '0.0.0'\n"
+        "requires-python = '>=3.12,<3.13'\ndependencies = []\n",
+        encoding="utf-8",
+    )
+    isolated_environment = workspace_root / ".traceforge-uv-venv"
+    uv = shutil.which("uv")
+    assert uv is not None
+    base_python = Path(
+        getattr(tools_module.sys, "_base_executable", tools_module.sys.executable)
+    ).resolve()
+    subprocess.run(
+        [
+            uv,
+            "venv",
+            "--python",
+            str(base_python),
+            "--no-python-downloads",
+            str(isolated_environment),
+        ],
+        cwd=workspace_root,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return workspace_root, isolated_environment.resolve(), private_prefix
 
 
 def test_permission_policy(settings: Settings, workspace: Workspace) -> None:
@@ -282,7 +320,7 @@ async def test_execute_rechecks_hard_command_denials_even_if_policy_is_bypassed(
 
 
 @pytest.mark.asyncio
-async def test_command_prefers_traceforge_runtime_and_rejects_external_paths(
+async def test_command_does_not_borrow_traceforge_runtime_and_rejects_external_paths(
     settings: Settings,
     workspace: Workspace,
     storage: Storage,
@@ -301,7 +339,16 @@ async def test_command_prefers_traceforge_runtime_and_rejects_external_paths(
         ToolCall(
             id="runtime",
             name="run_command",
-            arguments={"argv": ["python", "-c", "import sys; print(sys.executable)"]},
+            arguments={
+                "argv": [
+                    "python3",
+                    "-c",
+                    (
+                        "import sys; print(sys.executable); "
+                        "print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+                    ),
+                ]
+            },
         ),
     )
     external = await registry.execute(
@@ -314,9 +361,208 @@ async def test_command_prefers_traceforge_runtime_and_rejects_external_paths(
     )
 
     assert runtime.ok
-    assert runtime.output.strip() == tools_module.sys.executable
+    executable, version = runtime.output.splitlines()
+    base_executable = Path(
+        getattr(tools_module.sys, "_base_executable", tools_module.sys.executable)
+    )
+    resolved_executable, resolved_base = await asyncio.gather(
+        asyncio.to_thread(Path(executable).resolve),
+        asyncio.to_thread(base_executable.resolve),
+    )
+    assert resolved_executable == resolved_base
+    assert version == "3.12"
+    if tools_module.sys.prefix != tools_module.sys.base_prefix:
+        executable_parent, private_parent = await asyncio.gather(
+            asyncio.to_thread(Path(executable).parent.resolve),
+            asyncio.to_thread(Path(tools_module.sys.executable).parent.resolve),
+        )
+        assert executable_parent != private_parent
     assert runtime.metadata["sandbox"]["status"] in {"enforced", "policy_only"}
     assert not external.ok and "outside the workspace" in (external.error or "")
+
+
+@pytest.mark.skipif(
+    tools_module.sys.prefix == tools_module.sys.base_prefix,
+    reason="The test process is not running from an isolated Agent environment",
+)
+def test_command_environment_filters_private_runtime_even_when_workspace_contains_it(
+    tmp_path: Path,
+) -> None:
+    private_runtime = Path(tools_module.sys.executable).parent.resolve()
+    workspace = Path(tools_module.sys.prefix).parent
+
+    environment = tools_module._command_environment(
+        workspace,
+        home=tmp_path / "home",
+        temp=tmp_path / "tmp",
+        cache=tmp_path / "cache",
+    )
+
+    path_entries = [Path(entry).resolve() for entry in environment["PATH"].split(os.pathsep)]
+    assert private_runtime not in path_entries
+    assert tools_module._base_python_runtime_directory() in path_entries
+    assert Path(environment["UV_PROJECT_ENVIRONMENT"]) == (
+        workspace / ".traceforge-uv-venv"
+    ).resolve()
+    assert environment["PIP_REQUIRE_VIRTUALENV"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    tools_module.sys.prefix == tools_module.sys.base_prefix or shutil.which("uv") is None,
+    reason="The test needs uv and an isolated Agent environment",
+)
+async def test_uv_run_cannot_rediscover_the_agent_private_environment(
+    tmp_path: Path,
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    workspace_root, isolated_environment, private_prefix = await asyncio.to_thread(
+        _create_uv_isolation_probe, tmp_path
+    )
+    workspace = Workspace(workspace_root, storage)
+    isolated_settings = replace(settings, workspace=workspace_root)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        isolated_settings,
+        RunRecord(id="uv-isolation", task="Run uv", workspace=str(workspace_root)),
+    )
+
+    result = await registry.execute(
+        "uv-isolation",
+        ToolCall(
+            id="uv-run",
+            name="run_command",
+            arguments={
+                "argv": [
+                    "uv",
+                    "run",
+                    "--no-sync",
+                    "python",
+                    "-c",
+                    (
+                        "import os, pathlib, sys; "
+                        "print(pathlib.Path(sys.prefix).resolve()); "
+                        "print(pathlib.Path(os.environ['UV_PROJECT_ENVIRONMENT']).resolve()); "
+                        "print(os.environ['PIP_REQUIRE_VIRTUALENV'])"
+                    ),
+                ]
+            },
+        ),
+    )
+
+    assert result.ok, result.error or result.output
+    prefix, selected_environment, pip_guard = result.output.splitlines()
+    assert Path(prefix) == isolated_environment
+    assert Path(selected_environment) == isolated_environment
+    assert Path(prefix) != private_prefix
+    assert pip_guard == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    tools_module.sys.prefix == tools_module.sys.base_prefix,
+    reason="The test process is not running from an isolated Agent environment",
+)
+async def test_command_rejects_an_explicit_agent_private_executable(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="run-1", task="Run", workspace=str(workspace.root)),
+    )
+
+    result = await registry.execute(
+        "run-1",
+        ToolCall(
+            id="private-runtime",
+            name="run_command",
+            arguments={
+                "argv": [tools_module.sys.executable, "-c", "print('unreachable')"]
+            },
+        ),
+    )
+
+    assert result.ok is False
+    assert "TraceForge's private runtime" in (result.error or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    tools_module.sys.prefix == tools_module.sys.base_prefix,
+    reason="The test process is not running from an isolated Agent environment",
+)
+async def test_command_rejects_workspace_symlink_to_agent_private_pytest(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    private_pytest = Path(tools_module.sys.executable).parent / "pytest"
+    if not private_pytest.is_file():
+        pytest.skip("The Agent environment does not contain a pytest launcher")
+    workspace_bin = workspace.root / ".venv" / "bin"
+    workspace_bin.mkdir(parents=True)
+    (workspace_bin / "pytest").symlink_to(private_pytest)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="symlinked-private-runtime", task="Run", workspace=str(workspace.root)),
+    )
+
+    result = await registry.execute(
+        "symlinked-private-runtime",
+        ToolCall(
+            id="symlinked-pytest",
+            name="run_command",
+            arguments={"argv": ["pytest", "--version"]},
+        ),
+    )
+
+    assert result.ok is False
+    assert "TraceForge's private runtime" in (result.error or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    tools_module.sys.prefix == tools_module.sys.base_prefix,
+    reason="The test process is not running from an isolated Agent environment",
+)
+async def test_command_rejects_copied_launcher_with_agent_private_shebang(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    private_pytest = Path(tools_module.sys.executable).parent / "pytest"
+    if not private_pytest.is_file():
+        pytest.skip("The Agent environment does not contain a pytest launcher")
+    workspace_bin = workspace.root / ".venv" / "bin"
+    workspace_bin.mkdir(parents=True)
+    copied_launcher = workspace_bin / "copied-pytest"
+    shutil.copy2(private_pytest, copied_launcher)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="copied-private-runtime", task="Run", workspace=str(workspace.root)),
+    )
+
+    result = await registry.execute(
+        "copied-private-runtime",
+        ToolCall(
+            id="copied-pytest",
+            name="run_command",
+            arguments={"argv": ["copied-pytest", "--version"]},
+        ),
+    )
+
+    assert result.ok is False
+    assert "TraceForge's private runtime" in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -339,6 +585,8 @@ async def test_command_scrubs_ambient_credentials_from_child_environment(
     monkeypatch.setenv("VIRTUAL_ENV", "/outside/traceforge-runtime")
     monkeypatch.setenv("VIRTUAL_ENV_PROMPT", "traceforge")
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/outside/shared-environment")
+    monkeypatch.setenv("PYTHONHOME", "/outside/python-home")
+    monkeypatch.setenv("PYTHONPATH", "/outside/python-path")
 
     result = await registry.execute(
         "run-1",
@@ -347,13 +595,14 @@ async def test_command_scrubs_ambient_credentials_from_child_environment(
             name="run_command",
             arguments={
                 "argv": [
-                    "python",
+                    "python3",
                     "-c",
                     (
                         "import os; print('|'.join(os.getenv(name, 'absent') for name in "
                         "['TRACEFORGE_TEST_API_KEY', 'TRACEFORGE_TEST_PASSPHRASE', "
                         "'SSH_AUTH_SOCK', 'TRACEFORGE_TEST_PLAIN', 'VIRTUAL_ENV', "
-                        "'VIRTUAL_ENV_PROMPT', 'UV_PROJECT_ENVIRONMENT']))"
+                        "'VIRTUAL_ENV_PROMPT', 'UV_PROJECT_ENVIRONMENT', 'PYTHONHOME', "
+                        "'PYTHONPATH']))"
                     ),
                 ]
             },
@@ -361,7 +610,9 @@ async def test_command_scrubs_ambient_credentials_from_child_environment(
     )
 
     assert result.ok
-    assert result.output.strip() == "absent|absent|absent|visible|absent|absent|absent"
+    assert result.output.strip() == (
+        "absent|absent|absent|visible|absent|absent|absent|absent|absent"
+    )
 
 
 @pytest.mark.asyncio

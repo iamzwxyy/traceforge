@@ -83,6 +83,9 @@ def test_unknown_scope_clarification_and_sensitive_work_require_review() -> None
 def test_only_non_mutating_local_checks_are_fast_path_eligible() -> None:
     assert is_routine_check(["pnpm", "--filter", "web", "test", "--run"])
     assert is_routine_check(["python3", "-m", "pytest", "-q"])
+    assert is_routine_check(
+        ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]
+    )
     assert is_routine_check(["ruff", "check", "src"])
     assert not is_routine_check(["python3", "-c", "open('x', 'w').write('bad')"])
     assert not is_routine_check(["python", "-m", "pytest", "--pdb"])
@@ -103,6 +106,9 @@ def test_routine_check_family_is_conservative_about_launchers() -> None:
     assert routine_check_family(
         ["python3", "-m", "pytest", "tests/test_api.py", "-v"]
     ) == "python:pytest"
+    assert routine_check_family(
+        ["python3", "-m", "unittest", "discover", "-s", "tests"]
+    ) == "python:unittest"
     assert routine_check_family(["uv", "run", "pytest", "-q"]) == "uv:pytest"
     assert routine_check_family(["ruff", "check", "src"]) == "ruff:check"
     assert routine_check_family(["ruff", "format", "src"]) is None

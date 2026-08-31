@@ -5,6 +5,7 @@ import email.utils
 import inspect
 import json
 import math
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -46,6 +47,19 @@ class ProviderError(RuntimeError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class ToolArgumentsError(ProviderError):
+    """A model tool call whose arguments can be safely regenerated."""
+
+    def __init__(self, tool_name: str, problem: str) -> None:
+        safe_name = _safe_tool_name(tool_name)
+        super().__init__(
+            f"Model returned invalid arguments for tool {safe_name}: {problem}",
+            retryable=True,
+            category="tool_arguments",
+        )
+        self.tool_name = safe_name
+
+
 _MAX_HTTP_BODY_BYTES = 32 * 1024 * 1024
 _MAX_HTTP_CHUNKS = 10_000
 _MAX_SSE_EVENT_BYTES = 16 * 1024 * 1024
@@ -58,14 +72,25 @@ class _ResponseGuardError(RuntimeError):
     pass
 
 
+class _ResponseLimitGuardError(_ResponseGuardError):
+    """A successful response exceeded a bounded transport resource."""
+
+
 class _RequestGuardError(RuntimeError):
     pass
 
 
 class _BoundedResponseStream(httpx.AsyncByteStream):
-    def __init__(self, stream: httpx.AsyncByteStream, limit: int) -> None:
+    def __init__(
+        self,
+        stream: httpx.AsyncByteStream,
+        limit: int,
+        *,
+        limit_error: type[_ResponseGuardError],
+    ) -> None:
         self._stream = stream
         self._limit = limit
+        self._limit_error = limit_error
         self._received = 0
         self._chunks = 0
         self._closed = False
@@ -76,12 +101,12 @@ class _BoundedResponseStream(httpx.AsyncByteStream):
             async for chunk in self._stream:
                 self._chunks += 1
                 if self._chunks > _MAX_HTTP_CHUNKS:
-                    raise _ResponseGuardError(
+                    raise self._limit_error(
                         "Model response used too many transport chunks"
                     )
                 self._received += len(chunk)
                 if self._received > self._limit:
-                    raise _ResponseGuardError("Model response exceeded the HTTP body limit")
+                    raise self._limit_error("Model response exceeded the HTTP body limit")
                 yield chunk
         except BaseException as exc:
             primary_error = exc
@@ -108,6 +133,7 @@ class _BoundedResponseStream(httpx.AsyncByteStream):
 
 
 async def _guard_http_response(response: httpx.Response) -> None:
+    limit_error = _ResponseLimitGuardError if response.is_success else _ResponseGuardError
     encoding = response.headers.get("content-encoding", "identity").strip().lower()
     if encoding not in {"", "identity"}:
         raise _ResponseGuardError("Compressed model responses are not accepted")
@@ -117,11 +143,17 @@ async def _guard_http_response(response: httpx.Response) -> None:
             declared_length = int(content_length)
         except ValueError as exc:
             raise _ResponseGuardError("Model response Content-Length is invalid") from exc
-        if declared_length < 0 or declared_length > _MAX_HTTP_BODY_BYTES:
-            raise _ResponseGuardError("Model response exceeded the HTTP body limit")
+        if declared_length < 0:
+            raise _ResponseGuardError("Model response Content-Length is invalid")
+        if declared_length > _MAX_HTTP_BODY_BYTES:
+            raise limit_error("Model response exceeded the HTTP body limit")
     if not isinstance(response.stream, httpx.AsyncByteStream):
         raise _ResponseGuardError("Model response stream is not asynchronous")
-    response.stream = _BoundedResponseStream(response.stream, _MAX_HTTP_BODY_BYTES)
+    response.stream = _BoundedResponseStream(
+        response.stream,
+        _MAX_HTTP_BODY_BYTES,
+        limit_error=limit_error,
+    )
 
 
 def _build_http_client(timeout: float) -> httpx.AsyncClient:
@@ -297,18 +329,29 @@ class OpenAICompatibleProvider:
                     category="server",
                 )
             calls: list[ToolCall] = []
+            if choice.finish_reason == "length":
+                raise ProviderError(
+                    "Model response ended before the tool call was complete",
+                    retryable=True,
+                    category="response_limit",
+                )
+            if choice.finish_reason == "content_filter":
+                raise ProviderError(
+                    "Model response was stopped by the provider content filter",
+                    category="protocol",
+                )
             for call in choice.message.tool_calls or []:
                 try:
                     arguments = json.loads(call.function.arguments)
                 except json.JSONDecodeError as exc:
-                    raise ProviderError(
-                        f"Model returned invalid JSON for tool {call.function.name}: {exc}",
-                        category="protocol",
+                    raise ToolArgumentsError(
+                        call.function.name,
+                        _json_error_summary(exc),
                     ) from exc
                 if not isinstance(arguments, dict):
-                    raise ProviderError(
-                        f"Tool arguments for {call.function.name} must be a JSON object",
-                        category="protocol",
+                    raise ToolArgumentsError(
+                        call.function.name,
+                        "arguments must be one JSON object",
                     )
                 calls.append(ToolCall(id=call.id, name=call.function.name, arguments=arguments))
             return ModelResponse(
@@ -423,6 +466,12 @@ class OpenAICompatibleProvider:
                 "transmission",
                 category="credential_boundary",
             ) from exc
+        except _ResponseLimitGuardError as exc:
+            raise ProviderError(
+                "Model response exceeded a safe transport boundary",
+                retryable=True,
+                category="response_limit",
+            ) from exc
         except _ResponseGuardError as exc:
             raise ProviderError(
                 "Model response exceeded a safe transport boundary",
@@ -455,7 +504,14 @@ class OpenAICompatibleProvider:
                     "transmission",
                     category="credential_boundary",
                 ) from exc
-            if _find_response_guard_error(exc) is not None:
+            response_guard = _find_response_guard_error(exc)
+            if isinstance(response_guard, _ResponseLimitGuardError):
+                raise ProviderError(
+                    "Model response exceeded a safe transport boundary",
+                    retryable=True,
+                    category="response_limit",
+                ) from exc
+            if response_guard is not None:
                 raise ProviderError(
                     "Model response exceeded a safe transport boundary",
                     category="protocol",
@@ -558,7 +614,7 @@ class OpenAICompatibleProvider:
                         parsed,
                         deepseek=self._reasoning.transport == "deepseek_chat",
                     )
-                    delta = accumulator.add(model_chunk, raw_size=len(payload))
+                    delta = accumulator.add(model_chunk)
                     if delta.content or delta.tool_calls or delta.finish_reason:
                         await on_delta(delta)
                 if done:
@@ -590,7 +646,7 @@ class _BoundedSSEFramer:
             raise ProviderError("Model stream yielded non-byte data", category="protocol")
         self._total_bytes += len(chunk)
         if self._total_bytes > _MAX_HTTP_BODY_BYTES:
-            raise _ResponseGuardError("Model stream exceeded the HTTP body limit")
+            raise _ResponseLimitGuardError("Model stream exceeded the HTTP body limit")
         self._buffer.extend(chunk)
         emitted: list[bytes] = []
         consumed = 0
@@ -616,7 +672,7 @@ class _BoundedSSEFramer:
         if consumed:
             del self._buffer[:consumed]
         if self._event_bytes + len(self._buffer) > _MAX_SSE_EVENT_BYTES:
-            raise _ResponseGuardError("Model stream event exceeded the size limit")
+            raise _ResponseLimitGuardError("Model stream event exceeded the size limit")
         return emitted
 
     def finish(self) -> None:
@@ -630,10 +686,10 @@ class _BoundedSSEFramer:
     def _accept_line(self, line: bytes) -> list[bytes]:
         self._lines += 1
         if self._lines > _MAX_SSE_LINES:
-            raise _ResponseGuardError("Model stream used too many SSE lines")
+            raise _ResponseLimitGuardError("Model stream used too many SSE lines")
         self._event_bytes += len(line) + 1
         if self._event_bytes > _MAX_SSE_EVENT_BYTES:
-            raise _ResponseGuardError("Model stream event exceeded the size limit")
+            raise _ResponseLimitGuardError("Model stream event exceeded the size limit")
         if line:
             if line.startswith(b":"):
                 return []
@@ -646,7 +702,7 @@ class _BoundedSSEFramer:
 
         self._events += 1
         if self._events > _MAX_SSE_EVENTS:
-            raise _ResponseGuardError("Model stream used too many SSE events")
+            raise _ResponseLimitGuardError("Model stream used too many SSE events")
         payload = b"\n".join(self._data_lines) if self._data_lines else None
         self._data_lines = []
         self._event_bytes = 0
@@ -848,7 +904,7 @@ class ScriptedProvider:
 class _ToolParts:
     id: str = ""
     name: str = ""
-    arguments: list[str] = field(default_factory=list)
+    arguments: str = ""
     arguments_length: int = 0
     type: str | None = None
 
@@ -878,13 +934,15 @@ class _ChatCompletionAccumulator:
         self._chunk_count = 0
         self._tool_fragment_count = 0
 
-    def add(self, chunk: Any, *, raw_size: int | None = None) -> ModelStreamDelta:
+    def add(self, chunk: Any) -> ModelStreamDelta:
         self._chunk_count += 1
         if self._chunk_count > self._MAX_CHUNKS:
             raise ProviderError("Streaming response used too many chunks", category="protocol")
-        count_known_fields = raw_size is None
-        if raw_size is not None:
-            self._consume_units(raw_size)
+        # The raw SSE path already has an independent HTTP body limit in
+        # ``_BoundedSSEFramer``.  Compatible providers may emit monotonic cumulative
+        # snapshots for tool arguments, so charging every repeated wire byte against the
+        # semantic response budget can reject a small final tool call after enough
+        # snapshots. Count only validated, merged field growth here.
         choices = getattr(chunk, "choices", None)
         if choices == []:
             return ModelStreamDelta()
@@ -931,19 +989,19 @@ class _ChatCompletionAccumulator:
             raise ProviderError("Streaming refusal must be a string", category="protocol")
         public_content = (content or "") + (refusal or "")
         if public_content:
-            if count_known_fields:
-                self._consume_characters(public_content)
+            self._consume_characters(public_content)
             self._content.append(public_content)
             self._content_length += len(public_content)
             if self._content_length > self._MAX_CONTENT:
                 raise ProviderError(
                     "Streaming response content exceeded the size limit",
-                    category="protocol",
+                    retryable=True,
+                    category="response_limit",
                 )
         reasoning = getattr(delta, "reasoning_content", None)
         if reasoning is not None and not isinstance(reasoning, str):
             raise ProviderError("Streaming private reasoning must be a string", category="protocol")
-        if count_known_fields and isinstance(reasoning, str):
+        if isinstance(reasoning, str):
             self._consume_characters(reasoning)
         if self._deepseek and isinstance(reasoning, str):
             self._reasoning_seen = True
@@ -952,7 +1010,8 @@ class _ChatCompletionAccumulator:
             if self._reasoning_length > self._MAX_REASONING:
                 raise ProviderError(
                     "Streaming private reasoning exceeded the size limit",
-                    category="protocol",
+                    retryable=True,
+                    category="response_limit",
                 )
 
         public_tools: list[ModelToolCallDelta] = []
@@ -994,8 +1053,9 @@ class _ChatCompletionAccumulator:
                 )
             name = raw_name or ""
             arguments = raw_arguments or ""
-            if count_known_fields:
-                self._consume_characters(call_id, name, arguments)
+            previous_id_length = len(parts.id)
+            previous_name_length = len(parts.name)
+            previous_arguments_length = len(parts.arguments)
             parts.id = _append_metadata(parts.id, call_id)
             parts.name = _append_metadata(parts.name, name)
             if len(parts.id) > self._MAX_METADATA or len(parts.name) > self._MAX_METADATA:
@@ -1004,12 +1064,21 @@ class _ChatCompletionAccumulator:
                     category="protocol",
                 )
             if arguments:
-                parts.arguments.append(arguments)
-                parts.arguments_length += len(arguments)
+                parts.arguments = _append_stream_fragment(parts.arguments, arguments)
+                parts.arguments_length = len(parts.arguments)
+            self._consume_units(
+                len(parts.id)
+                - previous_id_length
+                + len(parts.name)
+                - previous_name_length
+                + len(parts.arguments)
+                - previous_arguments_length
+            )
             if parts.arguments_length > self._MAX_ARGUMENTS:
                 raise ProviderError(
                     "Streaming tool arguments exceeded the size limit",
-                    category="protocol",
+                    retryable=True,
+                    category="response_limit",
                 )
             public_tools.append(
                 ModelToolCallDelta(
@@ -1039,9 +1108,15 @@ class _ChatCompletionAccumulator:
                 retryable=True,
                 category="server",
             )
-        if self._finish_reason in {"length", "content_filter"}:
+        if self._finish_reason == "length":
             raise ProviderError(
-                f"Model stream ended with incomplete output ({self._finish_reason})",
+                "Model stream ended before the tool call was complete",
+                retryable=True,
+                category="response_limit",
+            )
+        if self._finish_reason == "content_filter":
+            raise ProviderError(
+                "Model stream was stopped by the provider content filter",
                 category="protocol",
             )
         indexes = sorted(self._tools)
@@ -1057,16 +1132,13 @@ class _ChatCompletionAccumulator:
                     "Streaming tool call metadata is incomplete", category="protocol"
                 )
             try:
-                arguments = json.loads("".join(parts.arguments))
+                arguments = json.loads(parts.arguments)
             except json.JSONDecodeError as exc:
-                raise ProviderError(
-                    f"Model returned invalid JSON for tool {parts.name}: {exc}",
-                    category="protocol",
-                ) from exc
+                raise ToolArgumentsError(parts.name, _json_error_summary(exc)) from exc
             if not isinstance(arguments, dict):
-                raise ProviderError(
-                    f"Tool arguments for {parts.name} must be a JSON object",
-                    category="protocol",
+                raise ToolArgumentsError(
+                    parts.name,
+                    "arguments must be one JSON object",
                 )
             calls.append(ToolCall(id=parts.id, name=parts.name, arguments=arguments))
         if len({call.id for call in calls}) != len(calls):
@@ -1099,16 +1171,36 @@ class _ChatCompletionAccumulator:
         self._total_characters += amount
         if self._total_characters > self._MAX_TOTAL_CHARACTERS:
             raise ProviderError(
-                "Streaming response exceeded the total size limit", category="protocol"
+                "Streaming response exceeded the total size limit",
+                retryable=True,
+                category="response_limit",
             )
 
 
 def _append_metadata(current: str, fragment: str) -> str:
+    return _append_stream_fragment(current, fragment)
+
+
+def _append_stream_fragment(current: str, fragment: str) -> str:
+    """Merge both OpenAI delta fragments and cumulative compatible snapshots."""
+
     if not fragment or fragment == current:
         return current
     if fragment.startswith(current):
         return fragment
     return current + fragment
+
+
+_TOOL_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+
+
+def _safe_tool_name(name: object) -> str:
+    return name if isinstance(name, str) and _TOOL_NAME_PATTERN.fullmatch(name) else "unknown"
+
+
+def _json_error_summary(error: json.JSONDecodeError) -> str:
+    # Positions are useful for diagnostics; raw model output is never included.
+    return f"{error.msg} at character {error.pos}"
 
 
 def _api_error_is_retryable(exc: APIError) -> bool:

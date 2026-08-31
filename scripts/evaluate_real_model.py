@@ -7,8 +7,9 @@ import argparse
 import asyncio
 import json
 import os
-import re
+import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -22,6 +23,7 @@ from traceforge.config import Settings
 from traceforge.demo import DEMO_TASK
 from traceforge.events import EventBroker
 from traceforge.models import (
+    ApprovalMode,
     ClarificationAnswer,
     InteractionMode,
     ProviderConfig,
@@ -30,25 +32,75 @@ from traceforge.models import (
 )
 from traceforge.proof import build_proof_pack
 from traceforge.runtime import AgentRuntime, validate_credential_file
+from traceforge.sandbox import CommandSandbox
 from traceforge.storage import Storage
+from traceforge.tools import _command_environment, scrubbed_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = "deepseek-v4-flash-vision-exp"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-_SENSITIVE_ENV_PATTERN = re.compile(
-    r"KEY|PASSWORD|PASSWD|PASSPHRASE|SECRET|TOKEN|CREDENTIAL", re.IGNORECASE
+POST_CHECK_OUTPUT_LIMIT = 1024 * 1024
+GREENFIELD_TODO_HIDDEN_PROGRAM = (
+    "import re\n"
+    "import subprocess\n"
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from tempfile import TemporaryDirectory\n"
+    "from todo import TodoStore\n"
+    "workspace = Path.cwd()\n"
+    "readme_lines = [line.strip().strip('`').lstrip('$ ').lower() "
+    "for line in (workspace / 'README.md').read_text(encoding='utf-8').splitlines()]\n"
+    "launcher = re.compile(r'(?<![\\w.-])python(?:3(?:\\.12)?)?\\s+(?:\\./)?main\\.py\\b')\n"
+    "commands = ('add', 'list', 'toggle', 'delete')\n"
+    "def mentions(line, command):\n"
+    "    return re.search(rf'(?<![\\w-]){command}(?![\\w-])', line) is not None\n"
+    "for command in commands:\n"
+    "    examples = [line for line in readme_lines "
+    "if launcher.search(line) and '--data' in line and mentions(line, command) "
+    "and sum(mentions(line, candidate) for candidate in commands) == 1]\n"
+    "    assert examples, "
+    "f'README.md lacks a standalone executable main.py --data {command} example'\n"
+    "with TemporaryDirectory() as directory:\n"
+    "    path = Path(directory) / 'todos.json'\n"
+    "    def run_cli(command, *arguments):\n"
+    "        completed = subprocess.run(\n"
+    "            [sys.executable, 'main.py', '--data', str(path), command, "
+    "*map(str, arguments)],\n"
+    "            cwd=workspace, capture_output=True, text=True, check=False, timeout=5,\n"
+    "        )\n"
+    "        assert completed.returncode == 0, "
+    "f'{command} failed: {completed.stdout}\\n{completed.stderr}'\n"
+    "        return completed\n"
+    "    run_cli('add', 'Ship TraceForge')\n"
+    "    items = TodoStore(path).list_items()\n"
+    "    assert len(items) == 1\n"
+    "    first = items[0]\n"
+    "    assert {'id', 'title', 'done'} <= first.keys()\n"
+    "    assert first['title'] == 'Ship TraceForge' and first['done'] is False\n"
+    "    listed = run_cli('list')\n"
+    "    assert 'Ship TraceForge' in listed.stdout\n"
+    "    run_cli('toggle', first['id'])\n"
+    "    toggled = TodoStore(path).list_items()\n"
+    "    assert len(toggled) == 1 and toggled[0]['done'] is True\n"
+    "    run_cli('delete', first['id'])\n"
+    "    assert TodoStore(path).list_items() == []\n"
 )
+
+
 @dataclass(frozen=True, slots=True)
 class Scenario:
     id: str
     title: str
-    fixture: Path
+    fixture: Path | None
     task: str
     mode: InteractionMode
+    approval_mode: ApprovalMode
     expected_gate: Literal["agent_continues", "approval_required"]
     required_files: tuple[str, ...]
     allowed_files: tuple[str, ...] | None
-    baseline_pytest_exit: int
+    test_args: tuple[str, ...]
+    baseline_test_exit: int
+    environment_packages: tuple[str, ...]
     hidden_program: str
 
 
@@ -63,10 +115,19 @@ SCENARIOS = (
             "do not edit tests. Run the full test suite and finish only when it passes."
         ),
         mode=InteractionMode.AGENT,
+        approval_mode=ApprovalMode.AUTOMATIC,
         expected_gate="agent_continues",
         required_files=("duration_parser.py",),
         allowed_files=("duration_parser.py",),
-        baseline_pytest_exit=1,
+        test_args=("-m", "pytest", "-q"),
+        baseline_test_exit=1,
+        environment_packages=(
+            "iniconfig==2.3.0",
+            "packaging==26.3",
+            "pluggy==1.6.0",
+            "pygments==2.21.0",
+            "pytest==8.4.2",
+        ),
         hidden_program=(
             "from duration_parser import normalize_seconds\n"
             "for value in (True, False):\n"
@@ -85,10 +146,33 @@ SCENARIOS = (
         fixture=ROOT / "demo/tenant-cache-api",
         task=DEMO_TASK,
         mode=InteractionMode.PLAN,
+        approval_mode=ApprovalMode.AUTOMATIC,
         expected_gate="approval_required",
         required_files=("src/tenant_cache_api/cache.py",),
         allowed_files=None,
-        baseline_pytest_exit=0,
+        test_args=("-m", "pytest", "-q"),
+        baseline_test_exit=0,
+        environment_packages=(
+            "annotated-doc==0.0.5",
+            "annotated-types==0.8.0",
+            "anyio==4.14.2",
+            "certifi==2026.7.22",
+            "fastapi==0.141.1",
+            "h11==0.16.0",
+            "httpcore==1.0.9",
+            "httpx==0.28.1",
+            "idna==3.19",
+            "iniconfig==2.3.0",
+            "packaging==26.3",
+            "pluggy==1.6.0",
+            "pydantic==2.13.4",
+            "pydantic-core==2.46.4",
+            "pygments==2.21.0",
+            "pytest==8.4.2",
+            "starlette==1.6.0",
+            "typing-extensions==4.16.0",
+            "typing-inspection==0.4.4",
+        ),
         hidden_program=(
             "from tenant_cache_api.cache import TenantTTLCache\n"
             "cache = TenantTTLCache(clock=lambda: 10)\n"
@@ -97,11 +181,40 @@ SCENARIOS = (
             "assert cache.get_or_load('acme', '42', lambda: 'wrong') == 'Ada'\n"
         ),
     ),
+    Scenario(
+        id="greenfield-todo-cli",
+        title="Greenfield zero-dependency project from an empty workspace",
+        fixture=None,
+        task=(
+            "在空目录中创建一个完整、可运行、零第三方依赖的 Python 3.12 命令行待办项目。"
+            "todo.py 必须公开 TodoStore(path: str | Path), 并实现 add(title) -> dict、"
+            "list_items() -> list[dict]、toggle(id) -> dict、delete(id) -> bool; 数据以 JSON "
+            "持久化且重新实例化后仍可读取。每个待办 dict 必须包含 id、title、done, "
+            "其中 done 是 bool。main.py 使用 argparse 提供 add、list、toggle、"
+            "delete 子命令和 --data 路径。添加 tests/test_todo.py 和 README.md。"
+            "README.md 必须分别用四条可直接复制执行的单行命令展示 python3 main.py、"
+            "--data 与 add、list、toggle、delete。"
+            "不要使用或安装第三方依赖。验收命令必须是 python3 -m unittest discover -s "
+            "tests -v, 并在全部通过后结束。"
+        ),
+        mode=InteractionMode.AGENT,
+        approval_mode=ApprovalMode.FULL_ACCESS,
+        expected_gate="approval_required",
+        required_files=("todo.py", "main.py", "tests/test_todo.py", "README.md"),
+        allowed_files=None,
+        test_args=("-m", "unittest", "discover", "-s", "tests", "-v"),
+        baseline_test_exit=1,
+        environment_packages=(),
+        hidden_program=GREENFIELD_TODO_HIDDEN_PROGRAM,
+    ),
 )
 SCENARIO_BY_ID = {scenario.id: scenario for scenario in SCENARIOS}
 
 
-def _copy_fixture(source: Path, destination: Path) -> None:
+def _copy_fixture(source: Path | None, destination: Path) -> None:
+    if source is None:
+        destination.mkdir(parents=True)
+        return
     shutil.copytree(
         source,
         destination,
@@ -111,19 +224,24 @@ def _copy_fixture(source: Path, destination: Path) -> None:
     )
 
 
-def _run_host_check(workspace: Path, argv: list[str], *, timeout: int = 60) -> dict[str, Any]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if _SENSITIVE_ENV_PATTERN.search(key) is None
-    }
+def _host_environment(workspace: Path) -> dict[str, str]:
+    environment = scrubbed_environment()
+    environment.pop("VIRTUAL_ENV", None)
+    environment.pop("VIRTUAL_ENV_PROMPT", None)
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    environment.pop("__PYVENV_LAUNCHER__", None)
     source_root = workspace / "src"
     if source_root.is_dir():
         environment["PYTHONPATH"] = str(source_root)
+    return environment
+
+
+def _run_host_check(workspace: Path, argv: list[str], *, timeout: int = 60) -> dict[str, Any]:
     completed = subprocess.run(
         argv,
         cwd=workspace,
-        env=environment,
+        env=_host_environment(workspace),
         capture_output=True,
         text=True,
         check=False,
@@ -137,6 +255,236 @@ def _run_host_check(workspace: Path, argv: list[str], *, timeout: int = 60) -> d
     }
 
 
+def _require_enforced_check_sandbox(
+    workspace: Path, credential_file: Path
+) -> CommandSandbox:
+    sandbox = CommandSandbox(workspace, credential_file=credential_file)
+    if not sandbox.status.enforced:
+        raise RuntimeError(
+            "real-model post-run checks require an enforced OS sandbox: "
+            + sandbox.status.detail
+        )
+    return sandbox
+
+
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=1)
+
+
+def _run_bounded_process(
+    argv: list[str],
+    *,
+    workspace: Path,
+    environment: dict[str, str],
+    timeout: int,
+    output_limit: int = POST_CHECK_OUTPUT_LIMIT,
+) -> dict[str, Any]:
+    process = subprocess.Popen(
+        argv,
+        cwd=workspace,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    stdout = process.stdout
+    assert stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(stdout, selectors.EVENT_READ)
+    chunks: list[bytes] = []
+    stored_size = 0
+    truncated = False
+    timed_out = False
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                _kill_process_group(process)
+                break
+            for key, _mask in selector.select(min(remaining, 0.25)):
+                chunk = os.read(key.fileobj.fileno(), 4096)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                available = output_limit - stored_size
+                if available > 0:
+                    chunks.append(chunk[:available])
+                    stored_size += min(len(chunk), available)
+                if len(chunk) > available:
+                    truncated = True
+                    _kill_process_group(process)
+                    break
+            if truncated:
+                break
+    except BaseException:
+        _kill_process_group(process)
+        raise
+    finally:
+        selector.close()
+        stdout.close()
+    if process.poll() is None:
+        try:
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process_group(process)
+    output = b"".join(chunks).decode("utf-8", errors="replace").strip()
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if timed_out:
+        summary = f"Post-run check timed out after {timeout} seconds"
+    elif truncated:
+        summary = f"Post-run check output exceeded {output_limit} bytes"
+    else:
+        summary = lines[-1] if lines else "No output"
+    exit_code = process.returncode if process.returncode is not None else 1
+    if (timed_out or truncated) and exit_code == 0:
+        exit_code = 1
+    return {
+        "exit_code": exit_code,
+        "summary": summary,
+        "timed_out": timed_out,
+        "output_truncated": truncated,
+    }
+
+
+def _run_sandboxed_check(
+    workspace: Path,
+    argv: list[str],
+    *,
+    credential_file: Path,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Run model-controlled post-checks only inside an enforced OS sandbox."""
+
+    sandbox = _require_enforced_check_sandbox(workspace, credential_file)
+    with TemporaryDirectory(prefix="traceforge-evaluation-check-") as temporary:
+        command_temp = Path(temporary).resolve()
+        sandbox_home = command_temp / "home"
+        sandbox_tmp = command_temp / "tmp"
+        sandbox_cache = command_temp / "cache"
+        for directory in (sandbox_home, sandbox_tmp, sandbox_cache):
+            directory.mkdir()
+        environment = _command_environment(
+            workspace,
+            home=sandbox_home,
+            temp=sandbox_tmp,
+            cache=sandbox_cache,
+        )
+        source_root = workspace / "src"
+        if source_root.is_dir():
+            environment["PYTHONPATH"] = str(source_root)
+        executable = (
+            argv[0]
+            if Path(argv[0]).is_absolute()
+            else shutil.which(argv[0], path=environment["PATH"])
+        )
+        if executable is None:
+            raise RuntimeError(f"post-run check executable not found: {argv[0]}")
+        launch = sandbox.prepare(
+            executable,
+            argv,
+            cwd=workspace,
+            command_temp=command_temp,
+            environment=environment,
+            bypass=False,
+        )
+        result = _run_bounded_process(
+            [launch.program, *launch.arguments],
+            workspace=workspace,
+            environment=environment,
+            timeout=timeout,
+        )
+    return {**result, "sandbox": launch.metadata}
+
+
+def _run_setup_command(workspace: Path, argv: list[str], *, timeout: int = 180) -> None:
+    result = _run_host_check(workspace, argv, timeout=timeout)
+    if result["exit_code"] != 0:
+        raise RuntimeError(f"evaluation environment setup failed: {result['summary']}")
+
+
+def _base_python_executable() -> Path:
+    candidate = getattr(sys, "_base_executable", None)
+    if not isinstance(candidate, str) or not candidate:
+        candidate = sys.executable
+    return Path(candidate).resolve()
+
+
+def _prepare_scenario_python(scenario: Scenario, workspace: Path) -> Path:
+    base_python = _base_python_executable()
+    version = _run_host_check(
+        workspace,
+        [
+            str(base_python),
+            "-c",
+            "import sys; raise SystemExit(sys.version_info[:2] != (3, 12))",
+        ],
+        timeout=10,
+    )
+    if version["exit_code"] != 0:
+        raise RuntimeError("real-model evaluation requires the safe base Python 3.12 runtime")
+    if not scenario.environment_packages:
+        return base_python
+
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError("real-model repair evaluation requires uv to create an isolated venv")
+    environment_root = workspace / ".venv"
+    interpreter = environment_root / "bin" / "python"
+    _run_setup_command(
+        workspace,
+        [
+            uv,
+            "venv",
+            "--python",
+            str(base_python),
+            "--no-python-downloads",
+            str(environment_root),
+        ],
+    )
+    _run_setup_command(
+        workspace,
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(interpreter),
+            "--no-deps",
+            "--no-progress",
+            *scenario.environment_packages,
+        ],
+    )
+    _run_setup_command(
+        workspace,
+        [
+            str(interpreter),
+            "-c",
+            (
+                "import importlib.util, pathlib, sys; "
+                "assert sys.version_info[:2] == (3, 12); "
+                "assert pathlib.Path(sys.prefix).resolve() == pathlib.Path('.venv').resolve(); "
+                "assert importlib.util.find_spec('traceforge') is None"
+            ),
+        ],
+        timeout=10,
+    )
+    # Keep the visible venv launcher path. Resolving its symlink would invoke the base
+    # interpreter directly and discard the workspace prefix and installed packages.
+    return interpreter
+
+
 def _scenario_failures(
     scenario: Scenario,
     *,
@@ -147,14 +495,14 @@ def _scenario_failures(
     verdict: str | None,
     proof_status: str,
     action_prompts: list[dict[str, Any]],
-    baseline_pytest: dict[str, Any],
+    baseline_tests: dict[str, Any],
     baseline_hidden: dict[str, Any],
-    independent_pytest: dict[str, Any],
+    independent_tests: dict[str, Any],
     hidden_check: dict[str, Any],
 ) -> list[str]:
     failures: list[str] = []
-    if baseline_pytest["exit_code"] != scenario.baseline_pytest_exit:
-        failures.append("fixture Pytest baseline did not match the pinned precondition")
+    if baseline_tests["exit_code"] != scenario.baseline_test_exit:
+        failures.append("fixture test baseline did not match the pinned precondition")
     if baseline_hidden["exit_code"] == 0:
         failures.append("hidden semantic check did not fail before the repair")
     if state is not RunState.SUCCEEDED:
@@ -179,8 +527,8 @@ def _scenario_failures(
         failures.append(f"Proof Pack status was {proof_status}")
     if action_prompts:
         failures.append(f"encountered {len(action_prompts)} unplanned action approval(s)")
-    if independent_pytest["exit_code"] != 0:
-        failures.append("independent full Pytest run failed")
+    if independent_tests["exit_code"] != 0:
+        failures.append("independent full test run failed")
     if hidden_check["exit_code"] != 0:
         failures.append("independent hidden semantic check failed")
     return failures
@@ -196,9 +544,13 @@ async def _drive_run(
     reasoning_effort: ReasoningEffort,
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    baseline_pytest = _run_host_check(workspace, [sys.executable, "-m", "pytest", "-q"])
+    started = time.perf_counter()
+    scenario_python = _prepare_scenario_python(scenario, workspace)
+    _require_enforced_check_sandbox(workspace, credential_file)
+    test_argv = [str(scenario_python), *scenario.test_args]
+    baseline_tests = _run_host_check(workspace, test_argv)
     baseline_hidden = _run_host_check(
-        workspace, [sys.executable, "-c", scenario.hidden_program], timeout=10
+        workspace, [str(scenario_python), "-c", scenario.hidden_program], timeout=10
     )
     data_dir = workspace.parent / "data"
     settings = Settings(
@@ -222,13 +574,17 @@ async def _drive_run(
     action_prompts: list[dict[str, Any]] = []
     handled_clarifications: set[tuple[int, tuple[str, ...]]] = set()
     handled_approvals: set[str] = set()
-    started = time.perf_counter()
-
     try:
+        connection = await runtime.test_connection()
+        if not connection["ok"]:
+            raise RuntimeError(
+                "provider native tool-call probe failed: " + str(connection["detail"])
+            )
         run = await runtime.start_run(
             scenario.task,
             workspace,
             mode=scenario.mode,
+            approval_mode=scenario.approval_mode,
             reasoning_effort=reasoning_effort,
         )
         manager = runtime.manager_for_run(run.id)
@@ -305,17 +661,26 @@ async def _drive_run(
                             file=sys.stderr,
                             flush=True,
                         )
-                        await manager.decide_action(run.id, approved=False)
+                        await manager.decide_action(
+                            run.id,
+                            approval.id,
+                            approved=False,
+                        )
                         handled_approvals.add(approval.id)
                 await asyncio.sleep(0.05)
 
         completed = await manager.wait(run.id)
         proof = build_proof_pack(completed, storage)
-        independent_pytest = _run_host_check(
-            workspace, [sys.executable, "-m", "pytest", "-q"]
+        independent_tests = _run_sandboxed_check(
+            workspace,
+            test_argv,
+            credential_file=credential_file,
         )
-        hidden_check = _run_host_check(
-            workspace, [sys.executable, "-c", scenario.hidden_program], timeout=10
+        hidden_check = _run_sandboxed_check(
+            workspace,
+            [str(scenario_python), "-c", scenario.hidden_program],
+            credential_file=credential_file,
+            timeout=10,
         )
         gate = completed.plan_gate.decision if completed.plan_gate else None
         verdict = completed.verification.verdict.value if completed.verification else None
@@ -328,9 +693,9 @@ async def _drive_run(
             verdict=verdict,
             proof_status=proof.proof_status,
             action_prompts=action_prompts,
-            baseline_pytest=baseline_pytest,
+            baseline_tests=baseline_tests,
             baseline_hidden=baseline_hidden,
-            independent_pytest=independent_pytest,
+            independent_tests=independent_tests,
             hidden_check=hidden_check,
         )
         return {
@@ -354,12 +719,17 @@ async def _drive_run(
             "repair_cycles": completed.repair_cycles,
             "event_count": proof.event_count,
             "reasoning_effort": completed.reasoning_effort.value,
+            "approval_mode": completed.approval_mode.value,
             "clarification_rounds": clarification_rounds,
             "plan_reviews": plan_reviews,
             "action_prompts": action_prompts,
-            "baseline_pytest": baseline_pytest,
+            "environment": {
+                "python": "workspace .venv" if scenario.environment_packages else "base 3.12",
+                "packages": list(scenario.environment_packages),
+            },
+            "baseline_tests": baseline_tests,
             "baseline_hidden": baseline_hidden,
-            "independent_pytest": independent_pytest,
+            "independent_tests": independent_tests,
             "hidden_check": hidden_check,
             "failures": failures,
         }

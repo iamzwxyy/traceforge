@@ -306,8 +306,8 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 488 backend tests at 87.44% coverage (with a hard 85% gate), 35 frontend
-unit tests, and 35 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
+The current suite has 519 backend tests at 87.52% coverage (with a hard 85% gate), 35 frontend
+unit tests, and 38 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
 keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
 runs an Ubuntu quality job and a macOS smoke job.
 
@@ -320,7 +320,7 @@ demo/tenant-cache-api bundled real-task fixture
 tests/                unit, adversarial, integration, recovery, and API tests
 docs/                 architecture, security, and interview rationale
 scripts/              tracked-file credential scan
-evaluation/           pinned real-model repair fixtures
+evaluation/           pinned real-model repair fixtures; the evaluator also creates an empty greenfield workspace
 ```
 
 ## Scope and limitations

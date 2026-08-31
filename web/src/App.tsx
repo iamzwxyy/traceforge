@@ -550,11 +550,11 @@ export default function App() {
               onAnswer={forge.answerQuestions}
               onPlan={forge.decidePlan}
               onAction={forge.decideAction}
-              onCancel={() => {
-                void forge.cancel()?.catch(() => undefined);
+              onCancel={async () => {
+                await forge.cancel();
               }}
-              onResume={() => {
-                void forge.resume()?.catch(() => undefined);
+              onResume={async () => {
+                await forge.resume();
               }}
               onRollback={forge.rollback}
               onProof={(turnIndex) => {
@@ -1748,8 +1748,8 @@ function RunStage({
   onAnswer: (answers: ClarificationAnswer[]) => Promise<void>;
   onPlan: (decision: "approve" | "revise", feedback?: string) => Promise<void>;
   onAction: (approved: boolean) => Promise<void>;
-  onCancel: () => void;
-  onResume: () => void;
+  onCancel: () => Promise<void>;
+  onResume: () => Promise<void>;
   onRollback: () => Promise<RollbackResult>;
   onProof: (turnIndex: number) => void;
   onOpenWorkspace: () => Promise<unknown>;
@@ -1763,6 +1763,8 @@ function RunStage({
 }) {
   const [confirmRollback, setConfirmRollback] = useState(false);
   const [openingWorkspace, setOpeningWorkspace] = useState(false);
+  const [lifecycleOperation, setLifecycleOperation] = useState<"cancel" | "resume" | null>(null);
+  const lifecycleOperationRef = useRef<"cancel" | "resume" | null>(null);
   const rollbackSummaryRef = useRef<HTMLDivElement>(null);
   const answeredTaskHasEdits = run.state === "answered"
     && run.turns.some((turn) => turn.changed_files.length > 0);
@@ -1778,6 +1780,30 @@ function RunStage({
     ? proofTurnIndexes.filter((turnIndex) => turnIndex !== currentTurnIndex).at(-1) ?? null
     : latestProofTurnIndex;
   const effectiveRollbackResult = rollbackResult ?? latestRollbackResult(events);
+  const partialTurn = ["interrupted", "failed", "cancelled"].includes(run.state)
+    ? run.turns.at(-1) ?? null
+    : null;
+  const responseLimitInterruption = run.state === "interrupted"
+    && hasResponseLimitFailure(run.error, events);
+  const openWorkspace = () => {
+    if (openingWorkspace) return;
+    setOpeningWorkspace(true);
+    void onOpenWorkspace().catch(() => undefined).finally(() => setOpeningWorkspace(false));
+  };
+  const performLifecycleOperation = (
+    operation: "cancel" | "resume",
+    request: () => Promise<void>,
+  ) => {
+    if (lifecycleOperationRef.current) return;
+    lifecycleOperationRef.current = operation;
+    setLifecycleOperation(operation);
+    void request()
+      .catch(() => undefined)
+      .finally(() => {
+        lifecycleOperationRef.current = null;
+        setLifecycleOperation(null);
+      });
+  };
   return (
     <div className="run-stage">
       <div className="run-header">
@@ -1800,26 +1826,36 @@ function RunStage({
             className="button ghost"
             type="button"
             disabled={openingWorkspace}
-            onClick={() => {
-              setOpeningWorkspace(true);
-              void onOpenWorkspace().catch(() => undefined).finally(() => setOpeningWorkspace(false));
-            }}
+            onClick={openWorkspace}
             title="在本地文件管理器中定位任务目录"
           >
             {openingWorkspace ? <LoaderCircle className="spin" size={14} /> : <FolderOpen size={14} />}
             {openingWorkspace ? "正在打开" : "打开目录"}
           </button>
-          {isActiveState(run.state) && (
-            <button className="button danger-ghost" type="button" onClick={onCancel}><Square size={14} /> 停止</button>
+          {(isActiveState(run.state) || run.state === "interrupted") && (
+            <button
+              className="button danger-ghost"
+              type="button"
+              disabled={Boolean(lifecycleOperation)}
+              onClick={() => performLifecycleOperation("cancel", onCancel)}
+            >
+              {lifecycleOperation === "cancel" ? <LoaderCircle className="spin" size={14} /> : <Square size={14} />}
+              {lifecycleOperation === "cancel"
+                ? "正在停止"
+                : run.state === "interrupted" ? "停止本轮" : "停止"}
+            </button>
           )}
           {run.state === "interrupted" && (
             <button
               className="button"
               type="button"
-              onClick={onResume}
-              disabled={!providerReady}
+              onClick={() => performLifecycleOperation("resume", onResume)}
+              disabled={!providerReady || Boolean(lifecycleOperation)}
               title={providerReady ? "继续安全暂停的任务" : "请先测试并验证模型连接"}
-            ><Play size={14} /> 继续</button>
+            >
+              {lifecycleOperation === "resume" ? <LoaderCircle className="spin" size={14} /> : <Play size={14} />}
+              {lifecycleOperation === "resume" ? "正在继续" : "再次继续"}
+            </button>
           )}
           {(["succeeded", "failed", "cancelled", "interrupted"].includes(run.state) || answeredTaskHasEdits) && (
             <button className="button ghost" type="button" onClick={() => setConfirmRollback(true)}><RotateCcw size={14} /> 回滚</button>
@@ -1851,10 +1887,20 @@ function RunStage({
             onDecision={onAction}
           />
         )}
+        {partialTurn && partialTurn.changed_files.length > 0 && (
+          <PartialResultSummary
+            state={run.state}
+            turnIndex={partialTurn.index}
+            paths={partialTurn.changed_files}
+            openingWorkspace={openingWorkspace}
+            onOpenWorkspace={openWorkspace}
+          />
+        )}
         {run.state === "interrupted" && (
           <Notice icon={<Pause size={18} />} title="任务已安全暂停">
-            工作区和运行历史均已保留。如有需要，请先修复连接，再点击“继续”；
-            未完成的命令不会被自动重放。
+            {responseLimitInterruption
+              ? "模型输出超过安全上限，TraceForge 已完成有界精简重试；这不是工作区或连接故障。你可以“再次继续”，也可以“停止本轮”后在同一任务中输入更短的后续要求。未完成的命令不会被自动重放。"
+              : "当前尝试未能完成，工作区和运行历史均已保留。你可以“再次继续”，也可以“停止本轮”后在同一任务中补充要求。未完成的命令不会被自动重放。"}
           </Notice>
         )}
         {run.state === "cancelled" && (
@@ -2105,7 +2151,9 @@ function ActivityFeed({
                   ? <p className="streaming-copy">{content}<i className="stream-cursor" aria-hidden="true" /></p>
                   : <ReactMarkdown>{content || "本次生成没有可显示的内容。"}</ReactMarkdown>}
                 {!committed && !streaming && (
-                  <small className="stream-status-note">{assistantOutputStatusDetail(status)}</small>
+                  <small className="stream-status-note">
+                    {assistantOutputStatusDetail(status, String(event.payload.reason ?? ""))}
+                  </small>
                 )}
               </article>
               {committed && changedFiles.length > 0 && (
@@ -2158,7 +2206,13 @@ function assistantOutputStatusLabel(status: string): string {
   return "正在生成";
 }
 
-function assistantOutputStatusDetail(status: string): string {
+function assistantOutputStatusDetail(status: string, reason = ""): string {
+  if (reason === "response_limit") {
+    if (status === "retrying") {
+      return "本次输出超过安全上限；TraceForge 正在用新的隔离尝试精简重生成。";
+    }
+    return "模型输出超过安全上限；以上内容不完整，也没有成为本轮正式结果。";
+  }
   if (status === "provider_completed") return "模型输出已接收，仍需完成本轮提交或独立验证。";
   if (status === "retrying") return "连接中断；TraceForge 已开始新的隔离生成尝试。";
   if (status === "discarded") return "这份临时模型输出没有成为本轮正式结果。";
@@ -2199,6 +2253,51 @@ function TurnChangedFiles({ index, paths }: { index: number; paths: string[] }) 
         {paths.map((path) => <code title={path} key={path}>{path}</code>)}
       </div>
       <small>仅列出 TraceForge 编辑工具产生的实际内容变更；右侧“差异”是整个任务的累计净差异。</small>
+    </section>
+  );
+}
+
+function PartialResultSummary({
+  state,
+  turnIndex,
+  paths,
+  openingWorkspace,
+  onOpenWorkspace,
+}: {
+  state: RunState;
+  turnIndex: number;
+  paths: string[];
+  openingWorkspace: boolean;
+  onOpenWorkspace: () => void;
+}) {
+  const detail = state === "interrupted"
+    ? "当前轮已暂停，以下实际编辑仍保留；验证尚未完成。"
+    : state === "cancelled"
+      ? "当前轮已停止，以下实际编辑仍保留；可检查后继续对话或回滚。"
+      : "当前轮未完成，以下实际编辑仍保留；不能视为已经验证的成果。";
+  return (
+    <section
+      className="partial-result-summary"
+      aria-label={`第 ${turnIndex} 轮保留的部分成果`}
+    >
+      <FileDiff size={18} />
+      <div className="partial-result-copy">
+        <strong>已保留 {paths.length} 个文件更改</strong>
+        <span>{detail}</span>
+        <div className="partial-result-files">
+          {paths.map((path) => <code title={path} key={path}>{path}</code>)}
+        </div>
+      </div>
+      <button
+        className="button ghost"
+        type="button"
+        aria-label="打开部分成果所在目录"
+        disabled={openingWorkspace}
+        onClick={onOpenWorkspace}
+      >
+        {openingWorkspace ? <LoaderCircle className="spin" size={14} /> : <FolderOpen size={14} />}
+        {openingWorkspace ? "正在打开" : "打开目录"}
+      </button>
     </section>
   );
 }
@@ -2268,22 +2367,25 @@ function ActivityItem({ event }: { event: RunEvent }) {
   }
   if (event.type === "assistant.output.aborted") {
     const status = String(event.payload.status ?? "failed");
+    const reason = String(event.payload.reason ?? "");
     return (
       <article className="activity evidence-activity recovery-activity">
         <div className="activity-icon"><MessageSquareMore size={15} /></div>
         <div>
           <span className="activity-label">临时模型输出</span>
           <strong>{assistantOutputStatusLabel(status)}</strong>
-          <p>{assistantOutputStatusDetail(status)}</p>
+          <p>{assistantOutputStatusDetail(status, reason)}</p>
         </div>
       </article>
     );
   }
   if (event.type === "model.retry") {
+    const category = String(event.payload.category ?? "provider");
+    const responseLimited = category === "response_limit";
     return (
       <article className="activity evidence-activity recovery-activity">
-        <div className="activity-icon"><Wifi size={15} /></div>
-        <div><span className="activity-label">模型连接恢复</span><strong>第 {String(event.payload.next_attempt ?? "?")} / {String(event.payload.max_attempts ?? "?")} 次尝试</strong><p>{providerErrorLabel(String(event.payload.category ?? "provider"))} · {String(event.payload.delay_seconds ?? "?")} 秒后重试</p></div>
+        <div className="activity-icon">{responseLimited ? <Gauge size={15} /> : <Wifi size={15} />}</div>
+        <div><span className="activity-label">{responseLimited ? "模型输出精简重试" : "模型连接恢复"}</span><strong>第 {String(event.payload.next_attempt ?? "?")} / {String(event.payload.max_attempts ?? "?")} 次尝试</strong><p>{providerErrorLabel(category)} · {String(event.payload.delay_seconds ?? "?")} 秒后重试</p></div>
       </article>
     );
   }
@@ -2315,7 +2417,22 @@ function ToolActivityItem({ event }: { event: RunEvent }) {
           </span>
           <ChevronDown className={`tool-chevron ${expanded ? "expanded" : ""}`} size={13} />
         </button>
-        {expanded && (result.output || result.error) && <pre>{result.error ?? result.output}</pre>}
+        {expanded && (result.output || result.error) && (
+          <div className="tool-result-details">
+            {result.error && (
+              <div className="tool-result-block">
+                <span>错误摘要</span>
+                <pre>{result.error}</pre>
+              </div>
+            )}
+            {result.output && (
+              <div className="tool-result-block">
+                <span>命令输出</span>
+                <pre>{result.output}</pre>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </article>
   );
@@ -3091,6 +3208,7 @@ function providerErrorLabel(category: string): string {
     connection: "连接失败",
     timeout: "请求超时",
     rate_limit: "请求限流",
+    response_limit: "输出超限",
     server: "服务端临时错误",
     provider_contract: "服务响应异常",
     provider: "模型服务异常",
@@ -3120,6 +3238,9 @@ function systemMessageLabel(message: string): string {
   if (reasoningLabel) return reasoningLabel;
   const workspaceRuleLabel = workspaceInstructionErrorLabel(message);
   if (workspaceRuleLabel) return workspaceRuleLabel;
+  if (message.startsWith("Streaming response exceeded the total size limit")) {
+    return "模型流式输出超过安全大小上限，已停止接收本次不完整输出。";
+  }
   const exact: Record<string, string> = {
     "Scripted provider is ready.": "脚本化模型服务已就绪。",
     "Connection and native tool calling verified.": "连接和原生工具调用已验证。",
@@ -3139,6 +3260,8 @@ function systemMessageLabel(message: string): string {
     "The local file manager could not open this workspace": "本地文件管理器无法打开此工作目录",
     "The recorded workspace path no longer points to its original directory": "任务记录的工作目录已被替换，已拒绝打开",
     "Provider-private replay state could not be stored safely": "模型返回的私有推理状态无法安全保存，任务已停止且未保留该内容。",
+    "Model connection failed": "模型连接失败",
+    "Model response exceeded a safe transport boundary": "模型响应超过安全传输上限",
     "The root AGENTS.md must not be a symbolic link.": "根目录 AGENTS.md 不能是符号链接。",
     "The root AGENTS.md must be a regular file.": "根目录 AGENTS.md 必须是普通文件。",
     "The root AGENTS.md must contain valid UTF-8 text.": "根目录 AGENTS.md 必须是有效的 UTF-8 文本。",
@@ -3160,6 +3283,38 @@ function systemMessageLabel(message: string): string {
   ];
   const match = prefixes.find(([prefix]) => message.startsWith(prefix));
   return match ? `${match[1]}${message.slice(match[0].length).trimStart()}` : message;
+}
+
+function hasResponseLimitFailure(error: string | null, events: RunEvent[]): boolean {
+  if (error && (
+    error.startsWith("Streaming response exceeded the total size limit")
+    || error.includes("response_limit")
+  )) return true;
+  const ordered = [...events].sort((left, right) => left.seq - right.seq);
+  let interruptionIndex = -1;
+  for (let index = ordered.length - 1; index >= 0; index -= 1) {
+    const event = ordered[index];
+    if (event.type === "state.changed" && event.payload.state === "interrupted") {
+      interruptionIndex = index;
+      break;
+    }
+  }
+  let episodeStart = -1;
+  const episodeEnd = interruptionIndex >= 0 ? interruptionIndex : ordered.length;
+  for (let index = episodeEnd - 1; index >= 0; index -= 1) {
+    const event = ordered[index];
+    if (event.type === "state.changed" || event.type === "turn.started") {
+      episodeStart = index;
+      break;
+    }
+  }
+  const episode = ordered.slice(episodeStart + 1, episodeEnd);
+  const terminalError = [...episode].reverse().find((event) => event.type === "error");
+  if (terminalError) return terminalError.payload.category === "response_limit";
+  return episode.some((event) => (
+    event.type === "assistant.output.aborted"
+    && event.payload.reason === "response_limit"
+  ));
 }
 
 function checkStatusLabel(status: string): string {

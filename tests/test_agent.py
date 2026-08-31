@@ -39,7 +39,12 @@ from traceforge.prompts import (
     VERIFIER_SYSTEM_PROMPT,
 )
 from traceforge.proof import build_proof_pack, proof_pack_markdown
-from traceforge.provider import ModelResponse, ProviderError, ScriptedProvider
+from traceforge.provider import (
+    ModelResponse,
+    ProviderError,
+    ScriptedProvider,
+    ToolArgumentsError,
+)
 from traceforge.sandbox import SandboxStatus
 from traceforge.storage import SecureCheckpointError, Storage
 from traceforge.streaming import contains_redactable_json_secret, redact_text
@@ -146,6 +151,238 @@ async def test_conversational_request_is_answered_without_false_workflow(
 
     with pytest.raises(InvalidRunAction, match="no file changes"):
         await manager.rollback(run.id)
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_arguments_are_regenerated_with_bounded_correction(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    class RegeneratingProvider:
+        def __init__(self) -> None:
+            self.requests: list[list[dict[str, object]]] = []
+
+        async def complete(self, messages, tools=None, **_kwargs) -> ModelResponse:
+            self.requests.append(messages)
+            if len(self.requests) == 1:
+                raise ToolArgumentsError("submit_plan", "Extra data at character 2552")
+            return _direct_response("已恢复并继续。")
+
+    provider = RegeneratingProvider()
+    manager = AgentManager(replace(settings, model_retry_delay=0), storage, provider)
+
+    run = await manager.start_run("帮我做个项目")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert len(provider.requests) == 2
+    correction = provider.requests[1][-1]
+    assert correction["role"] == "user"
+    assert "submit_plan" in str(correction["content"])
+    assert "exactly one valid JSON object" in str(correction["content"])
+    assert all(
+        "exactly one valid JSON object" not in str(message.get("content", ""))
+        for message in completed.messages
+    )
+    retries = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.MODEL_RETRY
+    ]
+    assert retries[0].payload["category"] == "tool_arguments"
+    assert retries[0].payload["recovery"] == "tool_call_regeneration"
+
+
+@pytest.mark.asyncio
+async def test_response_limit_is_regenerated_concisely_instead_of_failing_run(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    class RegeneratingProvider:
+        def __init__(self) -> None:
+            self.requests: list[list[dict[str, object]]] = []
+
+        async def complete(self, messages, tools=None, **_kwargs) -> ModelResponse:
+            self.requests.append(messages)
+            if len(self.requests) == 1:
+                raise ProviderError(
+                    "Streaming response exceeded the total size limit",
+                    retryable=True,
+                    category="response_limit",
+                )
+            return _direct_response("已用精简响应恢复。")
+
+    provider = RegeneratingProvider()
+    manager = AgentManager(replace(settings, model_retry_delay=0), storage, provider)
+
+    run = await manager.start_run("说明当前目录")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert "Regenerate the next action concisely" in str(
+        provider.requests[1][-1]["content"]
+    )
+    retry = next(
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.MODEL_RETRY
+    )
+    assert retry.payload["recovery"] == "concise_regeneration"
+
+
+@pytest.mark.asyncio
+async def test_response_limit_resume_preserves_concise_regeneration_instruction(
+    settings: Settings,
+) -> None:
+    plan = {
+        "summary": "Review one local note",
+        "steps": [{"id": "review", "title": "Review the note"}],
+        "acceptance_checks": [{"id": "reviewed", "label": "The note is reviewed"}],
+        "impacted_files": ["note.txt"],
+        "risks": ["The note must stay in the workspace"],
+    }
+
+    class InterruptingProvider:
+        def __init__(self) -> None:
+            self.outcomes: list[ModelResponse | ProviderError] = [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall(id="plan", name="submit_plan", arguments=plan)
+                    ]
+                ),
+                *[
+                    ProviderError(
+                        "Streaming response exceeded the total size limit",
+                        retryable=True,
+                        category="response_limit",
+                    )
+                    for _ in range(3)
+                ],
+            ]
+
+        async def complete(self, messages, tools=None, **_kwargs) -> ModelResponse:
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, ProviderError):
+                raise outcome
+            return outcome
+
+    first_storage = Storage(settings.data_dir / "restart.db")
+    try:
+        first_manager = AgentManager(
+            replace(settings, model_retry_delay=0),
+            first_storage,
+            InterruptingProvider(),
+        )
+        run = await first_manager.start_run("Review note.txt", verifier_enabled=False)
+        interrupted = await first_manager.wait(run.id)
+        assert interrupted.state is RunState.INTERRUPTED
+        assert "Regenerate the next action concisely" not in json.dumps(
+            interrupted.messages
+        )
+    finally:
+        first_storage.close()
+
+    class ResumedProvider:
+        def __init__(self) -> None:
+            self.requests: list[list[dict[str, object]]] = []
+
+        async def complete(self, messages, tools=None, **_kwargs) -> ModelResponse:
+            self.requests.append([dict(message) for message in messages])
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "已精简完成。"},
+                    )
+                ]
+            )
+
+    resumed_provider = ResumedProvider()
+    reopened = Storage(settings.data_dir / "restart.db")
+    try:
+        resumed_manager = AgentManager(
+            replace(settings, model_retry_delay=0), reopened, resumed_provider
+        )
+        await resumed_manager.resume(run.id)
+        completed = await resumed_manager.wait(run.id)
+        resumed_events = reopened.get_events(run.id)
+    finally:
+        reopened.close()
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    resumed_request = resumed_provider.requests[0]
+    recovery_text = "Regenerate the next action concisely"
+    assert sum(recovery_text in str(message.get("content", "")) for message in resumed_request) == 1
+    resumed = [
+        event
+        for event in resumed_events
+        if event.type is EventType.RUN_RESUMED
+    ][-1]
+    assert resumed.payload["recovery"] == "concise_regeneration"
+
+
+def test_resume_recovery_does_not_reuse_an_older_interruption_category(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    run = RunRecord(
+        id="stale-provider-recovery",
+        task="Resume the latest interruption only",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.EXECUTING,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="Resume the latest interruption only",
+            )
+        ],
+    )
+    storage.create_run(
+        run,
+        instruction_snapshot=WorkspaceInstructionSnapshot.empty(),
+    )
+    storage.append_event(
+        run.id,
+        EventType.ERROR,
+        {
+            "message": "bounded response overflow",
+            "cause": "model_unavailable",
+            "category": "response_limit",
+            "recoverable": True,
+        },
+    )
+    storage.append_event(
+        run.id,
+        EventType.STATE_CHANGED,
+        {
+            "state": RunState.INTERRUPTED.value,
+            "previous": RunState.EXECUTING.value,
+            "cause": "model_unavailable",
+        },
+    )
+    storage.append_event(run.id, EventType.RUN_RESUMED, {"strategy": "test"})
+    storage.append_event(
+        run.id,
+        EventType.STATE_CHANGED,
+        {
+            "state": RunState.EXECUTING.value,
+            "previous": RunState.INTERRUPTED.value,
+        },
+    )
+    storage.append_event(
+        run.id,
+        EventType.STATE_CHANGED,
+        {
+            "state": RunState.INTERRUPTED.value,
+            "previous": RunState.EXECUTING.value,
+            "cause": "process_shutdown",
+        },
+    )
+    manager = AgentManager(settings, storage, ScriptedProvider([]))
+
+    assert manager._latest_provider_interruption_category(run.id) is None
 
 
 @pytest.mark.asyncio
@@ -313,6 +550,14 @@ async def test_answered_turn_supports_follow_up_and_redacts_credentials(
 def test_all_model_roles_require_simplified_chinese_user_facing_text() -> None:
     for prompt in (PLANNER_SYSTEM_PROMPT, BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT):
         assert "Simplified Chinese" in prompt
+
+
+def test_greenfield_prompts_do_not_recommend_unavailable_network_dependencies() -> None:
+    assert "no external network access" in PLANNER_SYSTEM_PROMPT
+    assert "do not\nrecommend a framework or package stack" in PLANNER_SYSTEM_PROMPT
+    assert "zero-dependency" in PLANNER_SYSTEM_PROMPT
+    assert "do not assume a package install can download" in BUILDER_SYSTEM_PROMPT
+    assert "do not repeat it unchanged" in BUILDER_SYSTEM_PROMPT
 
 
 @pytest.mark.asyncio
@@ -1743,6 +1988,53 @@ def _verification(verdict: str, summary: str) -> ModelResponse:
             )
         ]
     )
+
+
+@pytest.mark.asyncio
+async def test_builder_recovers_after_two_prose_only_completion_attempts(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="plan", name="submit_plan", arguments=_review_plan())
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="create",
+                        name="create_file",
+                        arguments={"path": "note.txt", "content": "done\n"},
+                    )
+                ]
+            ),
+            ModelResponse(content="The work is complete."),
+            ModelResponse(content="Everything is done."),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="finish",
+                        name="finish",
+                        arguments={"summary": "Created note.txt"},
+                    )
+                ]
+            ),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Create note.txt", verifier_enabled=False)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.SUCCEEDED, completed.error
+    assert (settings.workspace / "note.txt").read_text() == "done\n"
+    strict_correction = provider.requests[4][0][-1]
+    assert strict_correction["role"] == "user"
+    assert "last two responses did not call a tool" in strict_correction["content"]
+    assert "Do not answer in prose" in strict_correction["content"]
 
 
 @pytest.mark.asyncio

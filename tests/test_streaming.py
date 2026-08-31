@@ -22,6 +22,7 @@ from traceforge.provider import (
     OpenAICompatibleProvider,
     ProviderError,
     ScriptedProvider,
+    ToolArgumentsError,
 )
 from traceforge.storage import Storage
 from traceforge.streaming import (
@@ -489,7 +490,8 @@ async def test_raw_transport_rejects_oversized_and_compressed_bodies_before_json
     finally:
         await oversized_provider.close()
 
-    assert oversized_error.value.category == "protocol"
+    assert oversized_error.value.category == "response_limit"
+    assert oversized_error.value.retryable is True
     assert oversized.closed is True
 
     oversized_error_body = _HTTPBodyStream(
@@ -921,6 +923,211 @@ async def test_real_raw_deepseek_stream_handles_interleaved_tools_reasoning_and_
     assert body.closed is True
 
 
+def test_stream_accumulator_accepts_cumulative_tool_argument_snapshots() -> None:
+    accumulator = provider_module._ChatCompletionAccumulator(deepseek=True)
+    accumulator.add(
+        _chunk(
+            delta=SimpleNamespace(
+                tool_calls=[
+                    _tool_delta(
+                        0,
+                        call_id="call-plan",
+                        name="submit_plan",
+                        arguments='{"summary":"新项目",',
+                        call_type="function",
+                    )
+                ]
+            )
+        )
+    )
+    accumulator.add(
+        _chunk(
+            delta=SimpleNamespace(
+                tool_calls=[
+                    _tool_delta(
+                        0,
+                        arguments='{"summary":"新项目","steps":[]}',
+                    )
+                ]
+            )
+        )
+    )
+    accumulator.add(_chunk(delta=SimpleNamespace(), finish_reason="tool_calls"))
+
+    response = accumulator.finish()
+
+    assert response.tool_calls[0].arguments == {"summary": "新项目", "steps": []}
+
+
+def test_stream_accumulator_charges_cumulative_snapshots_by_semantic_growth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_module._ChatCompletionAccumulator,
+        "_MAX_TOTAL_CHARACTERS",
+        80,
+    )
+    accumulator = provider_module._ChatCompletionAccumulator(deepseek=True)
+    accumulator.add(
+        _chunk(
+            delta=SimpleNamespace(
+                tool_calls=[
+                    _tool_delta(
+                        0,
+                        call_id="call-plan",
+                        name="submit_plan",
+                        arguments='{"summary":"新项目",',
+                        call_type="function",
+                    )
+                ]
+            )
+        )
+    )
+    accumulator.add(
+        _chunk(
+            delta=SimpleNamespace(
+                tool_calls=[
+                    _tool_delta(
+                        0,
+                        call_id="call-plan",
+                        name="submit_plan",
+                        arguments='{"summary":"新项目","steps":[]}',
+                        call_type="function",
+                    )
+                ]
+            )
+        )
+    )
+    accumulator.add(_chunk(delta=SimpleNamespace(), finish_reason="tool_calls"))
+
+    response = accumulator.finish()
+
+    assert response.tool_calls[0].arguments == {"summary": "新项目", "steps": []}
+
+
+@pytest.mark.asyncio
+async def test_raw_stream_keeps_wire_and_semantic_budgets_independent_for_snapshots(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_module._ChatCompletionAccumulator,
+        "_MAX_TOTAL_CHARACTERS",
+        80,
+    )
+    snapshots = [
+        '{"summary":"新',
+        '{"summary":"新项目",',
+        '{"summary":"新项目","steps":[]}',
+    ]
+    body = _HTTPBodyStream(
+        [
+            *[
+                _sse(
+                    _raw_chunk(
+                        delta={
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call-plan",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_plan",
+                                        "arguments": snapshot,
+                                    },
+                                }
+                            ]
+                        }
+                    )
+                )
+                for snapshot in snapshots
+            ],
+            _sse(_raw_chunk(delta={}, finish_reason="tool_calls")),
+            _sse("[DONE]"),
+        ]
+    )
+    wire_bytes = sum(len(chunk) for chunk in body.chunks)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=body,
+        )
+
+    provider = _raw_provider(
+        replace(
+            settings,
+            model="deepseek-v4-pro",
+            base_url="https://api.deepseek.com/v1",
+        ),
+        monkeypatch,
+        handler,
+    )
+    try:
+        response = await provider.stream_complete(
+            [], on_delta=lambda _delta: asyncio.sleep(0)
+        )
+    finally:
+        await provider.close()
+
+    assert response.tool_calls[0].arguments == {"summary": "新项目", "steps": []}
+    assert wire_bytes > provider_module._ChatCompletionAccumulator._MAX_TOTAL_CHARACTERS
+    assert body.closed is True
+
+
+def test_stream_accumulator_still_limits_semantic_growth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        provider_module._ChatCompletionAccumulator,
+        "_MAX_TOTAL_CHARACTERS",
+        10,
+    )
+    accumulator = provider_module._ChatCompletionAccumulator(deepseek=True)
+
+    with pytest.raises(ProviderError) as raised:
+        accumulator.add(_chunk(delta=SimpleNamespace(content="12345678901")))
+
+    assert raised.value.category == "response_limit"
+    assert raised.value.retryable is True
+
+
+def test_stream_accumulator_rejects_two_distinct_argument_objects() -> None:
+    accumulator = provider_module._ChatCompletionAccumulator(deepseek=True)
+    accumulator.add(
+        _chunk(
+            delta=SimpleNamespace(
+                tool_calls=[
+                    _tool_delta(
+                        0,
+                        call_id="call-plan",
+                        name="submit_plan",
+                        arguments='{"summary":"first"}',
+                        call_type="function",
+                    )
+                ]
+            )
+        )
+    )
+    accumulator.add(
+        _chunk(
+            delta=SimpleNamespace(
+                tool_calls=[_tool_delta(0, arguments='{"summary":"second"}')]
+            )
+        )
+    )
+    accumulator.add(_chunk(delta=SimpleNamespace(), finish_reason="tool_calls"))
+
+    with pytest.raises(ToolArgumentsError) as raised:
+        accumulator.finish()
+
+    assert raised.value.retryable is True
+    assert raised.value.category == "tool_arguments"
+    assert "first" not in str(raised.value)
+    assert "second" not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     "secret",
     ["owner-only-key-123456", "sk-abcdefghijklmnop"],
@@ -1342,7 +1549,8 @@ async def test_openai_stream_enforces_one_global_character_budget(
     with pytest.raises(ProviderError) as raised:
         await provider.stream_complete([], on_delta=lambda _delta: asyncio.sleep(0))
 
-    assert raised.value.category == "protocol"
+    assert raised.value.category == "response_limit"
+    assert raised.value.retryable is True
     assert stream.closed is True
 
 
@@ -1418,10 +1626,6 @@ def test_api_error_retry_policy_bounds_server_directed_delay(
             id="unknown-finish-reason",
         ),
         pytest.param(
-            [_chunk(delta=SimpleNamespace(content="x" * 200_001))],
-            id="oversized-content",
-        ),
-        pytest.param(
             [_chunk(delta=SimpleNamespace(content=["not", "text"]))],
             id="non-string-content",
         ),
@@ -1464,6 +1668,27 @@ async def test_openai_stream_rejects_unsafe_protocol_shapes(
 
     assert raised.value.retryable is False
     assert raised.value.category == "protocol"
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_marks_bounded_output_overflow_for_regeneration(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = _FakeAsyncStream(
+        [_chunk(delta=SimpleNamespace(content="x" * 200_001))]
+    )
+    completions = _FakeCompletions([stream])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    monkeypatch.setattr(provider_module, "AsyncOpenAI", lambda **_kwargs: client)
+    provider = OpenAICompatibleProvider(settings)
+
+    with pytest.raises(ProviderError) as raised:
+        await provider.stream_complete([], on_delta=lambda _delta: asyncio.sleep(0))
+
+    assert raised.value.retryable is True
+    assert raised.value.category == "response_limit"
     assert stream.closed is True
 
 
@@ -1775,6 +2000,74 @@ async def test_oversized_visible_tool_argument_is_aborted_before_schema_rejectio
     assert completed.turns[-1].summary == accepted
     assert len("".join(first_deltas)) <= 20_000
     assert first_abort.payload["reason"] == "visible_output_size_limit"
+
+
+@pytest.mark.asyncio
+async def test_visible_output_stream_counts_cumulative_arguments_by_merged_length(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = "累计参数快照只按最终合并后的长度计费，合法答复应当保持同一个可提交流。"
+    arguments = json.dumps({"content": content}, ensure_ascii=False)
+    monkeypatch.setattr(
+        agent_module._AssistantOutputStream,
+        "_MAX_ARGUMENT_CHARACTERS",
+        len(arguments) + 1,
+    )
+
+    class CumulativeVisibleProvider:
+        supports_streaming = True
+
+        async def complete(self, *_args: object, **_kwargs: object) -> ModelResponse:
+            raise AssertionError("stream_complete should be used")
+
+        async def stream_complete(
+            self,
+            _messages: list[dict[str, object]],
+            _tools: list[dict[str, object]] | None = None,
+            *,
+            on_delta,
+            **_kwargs: object,
+        ) -> ModelResponse:
+            for end in (len(arguments) // 3, len(arguments) * 2 // 3, len(arguments)):
+                await on_delta(
+                    ModelStreamDelta(
+                        tool_calls=[
+                            ModelToolCallDelta(
+                                index=0,
+                                id="answer",
+                                name="respond_to_user",
+                                arguments=arguments[:end],
+                                type="function",
+                            )
+                        ]
+                    )
+                )
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="answer",
+                        name="respond_to_user",
+                        arguments={"content": content},
+                    )
+                ]
+            )
+
+    manager = AgentManager(settings, storage, CumulativeVisibleProvider())
+
+    run = await manager.start_run("解释累计流")
+    completed = await manager.wait(run.id)
+    events = storage.get_events(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.turns[-1].summary == content
+    assert any(event.type is EventType.ASSISTANT_OUTPUT_COMPLETED for event in events)
+    assert not any(
+        event.type is EventType.ASSISTANT_OUTPUT_ABORTED
+        and event.payload.get("reason") == "visible_output_size_limit"
+        for event in events
+    )
 
 
 class _RetryingStreamingProvider:

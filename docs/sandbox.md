@@ -56,7 +56,9 @@ Before either backend starts, TraceForge builds a child environment that:
 
 - removes names matching key/password/passphrase/secret/token/credential and common agent sockets;
 - points `HOME`, `TMPDIR`, `TMP`, `TEMP`, and XDG/package-manager caches at a fresh command temp;
-- keeps a deterministic PATH with the project or TraceForge Python runtime first;
+- keeps a deterministic PATH with a distinct workspace environment when present and the safe base
+  Python runtime, while excluding TraceForge's private environment; `uv run`, executable symlinks,
+  and absolute shebang launchers cannot route back into that private runtime;
 - deletes the entire command temp after completion, timeout, failed spawn, or cancellation.
 
 This defense exists independently of file-system masking. A secret should not reach a child merely
@@ -70,7 +72,8 @@ available it proves:
 1. a command can create a normal file inside the selected workspace;
 2. the same interpreter cannot write to a sibling path outside that workspace;
 3. project `.env` / configured credential contents cannot be read;
-4. an explicit bypass can perform the otherwise-blocked write, and the result says `bypassed`.
+4. executable symlinks and copied shebang launchers cannot borrow TraceForge's private Python;
+5. an explicit bypass can perform the otherwise-blocked write, and the result says `bypassed`.
 
 The permission matrix additionally proves that Manual planned checks stay sandboxed, workspace
 Full access never requests a bypass, hard denials survive all three profiles, and an unknown Full-

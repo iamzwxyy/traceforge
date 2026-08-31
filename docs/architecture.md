@@ -128,8 +128,10 @@ The manager incrementally decodes that JSON string and persists `assistant.outpu
 retry, cancellation, protocol rejection, missing checks, and verifier rejection can therefore never
 merge a discarded draft into its successor. `completed` means the provider response was structurally
 accepted but is still provisional. Only `turn.completed.final_stream_id` commits that same bubble as
-the canonical answer or verified summary. A truncated stream has no terminal finish reason and fails
-closed; there is no complete-response fallback after a partial attempt.
+the canonical answer or verified summary. A transport-truncated stream has no terminal finish reason;
+a model-declared length truncation, bounded-output overflow, or malformed tool-argument object gets a
+fresh stream identity and a safe bounded regeneration prompt. There is no complete-response fallback
+after a partial attempt, and retry exhaustion still stops without accepting partial output.
 
 The persisted `started` event is also the durable owner record for a stream generation. Until a
 matching `aborted` event or a terminal turn links that ID, storage treats the generation as open—even
@@ -142,6 +144,20 @@ stream creation and iteration, rejects compressed bodies, bounds HTTP bytes befo
 closes the SDK transport on timeout/cancellation/boundary failure, honors bounded server retry hints,
 surfaces refusal text, validates chunk types and finish reasons, and applies both per-field and
 whole-stream budgets.
+
+A successful SSE response that crosses the raw byte, event, line, or chunk guard is classified as a
+bounded `response_limit`, not a malformed provider contract. It may receive the same finite concise
+regeneration treatment while every per-attempt transport cap remains enforced. Oversized non-2xx
+error bodies, compression, invalid lengths, and invalid stream shapes remain non-retryable protocol
+failures.
+
+Tool argument assembly accepts standard deltas plus monotonic cumulative snapshots used by some
+OpenAI-compatible streams. An exact retransmission or a later fragment containing the complete
+existing prefix replaces the prior snapshot; unrelated fragments remain concatenated and therefore
+fail strict single-object JSON parsing. The provider raises a typed, redacted `tool_arguments` error,
+and `AgentManager` spends the same application-owned retry budget on a temporary correction context
+without persisting raw malformed output. Response-limit retries use the same mechanism. The event
+ledger records only the category and regeneration strategy.
 
 Before the returned `ModelResponse` can enter phase logic, `AgentManager` constructs a fresh
 canonical response. Public prose and terminal presentation arguments are deep-redacted. Tool-call

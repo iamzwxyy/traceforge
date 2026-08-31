@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import os
 import re
+import shlex
 import shutil
 import signal
 import sys
@@ -449,7 +450,15 @@ class ToolRegistry:
         root = self.workspace.resolve_read(path)
         if not root.is_dir():
             raise ValueError(f"Not a directory: {path}")
-        ignored = {".git", ".venv", "node_modules", "__pycache__", "dist", "build"}
+        ignored = {
+            ".git",
+            ".venv",
+            ".traceforge-uv-venv",
+            "node_modules",
+            "__pycache__",
+            "dist",
+            "build",
+        }
         rows: list[str] = []
         root_depth = len(root.parts)
         for current, directories, files in os.walk(root):
@@ -599,6 +608,7 @@ class ToolRegistry:
                 home=sandbox_home,
                 temp=sandbox_tmp,
                 cache=sandbox_cache,
+                include_agent_runtime=self.settings.demo_mode,
             )
             executable = (
                 shutil.which(argv[0], path=environment["PATH"])
@@ -607,6 +617,13 @@ class ToolRegistry:
             )
             if executable is None:
                 raise ValueError(f"Executable not found: {argv[0]}")
+            if not self.settings.demo_mode and _is_agent_private_executable(
+                Path(executable)
+            ):
+                raise ValueError(
+                    "Commands cannot use TraceForge's private runtime. Create a separate "
+                    "workspace-local environment and run the project through it."
+                )
             command_cwd = self.workspace.resolve_read(cwd)
             if not command_cwd.is_dir():
                 raise ValueError(f"Command cwd is not a directory: {cwd}")
@@ -787,7 +804,12 @@ def scrubbed_environment() -> dict[str, str]:
 
 
 def _command_environment(
-    workspace: Path, *, home: Path, temp: Path, cache: Path
+    workspace: Path,
+    *,
+    home: Path,
+    temp: Path,
+    cache: Path,
+    include_agent_runtime: bool = False,
 ) -> dict[str, str]:
     environment = scrubbed_environment()
     # A TraceForge process commonly runs from its own virtual environment. Do not make
@@ -795,14 +817,53 @@ def _command_environment(
     environment.pop("VIRTUAL_ENV", None)
     environment.pop("VIRTUAL_ENV_PROMPT", None)
     environment.pop("UV_PROJECT_ENVIRONMENT", None)
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    environment.pop("__PYVENV_LAUNCHER__", None)
     runtime_dirs = [
         workspace / ".venv" / "bin",
         workspace / "venv" / "bin",
-        Path(sys.executable).parent,
     ]
+    private_runtime = _agent_private_runtime_directory()
+    if (
+        not include_agent_runtime
+        and private_runtime is not None
+        and _workspace_environment_reuses_agent_runtime(workspace, private_runtime)
+    ):
+        # `uv run` discovers `<project>/.venv` independently from PATH. When TraceForge is
+        # asked to work on its own checkout, that directory is the Agent's private runtime.
+        # Force uv onto a distinct, workspace-local prefix instead of letting it bypass the
+        # executable and PATH checks below.
+        environment["UV_PROJECT_ENVIRONMENT"] = str(
+            (workspace / ".traceforge-uv-venv").resolve()
+        )
+    if include_agent_runtime and private_runtime is not None:
+        runtime_dirs.append(private_runtime)
+    base_runtime = _base_python_runtime_directory()
+    if base_runtime is not None:
+        runtime_dirs.append(base_runtime)
     existing = environment.get("PATH", "").split(os.pathsep)
-    ordered = [str(path) for path in runtime_dirs if path.is_dir()]
-    ordered.extend(path for path in existing if path and path not in ordered)
+    ordered = [
+        str(path)
+        for path in runtime_dirs
+        if path.is_dir()
+        and (
+            include_agent_runtime
+            or private_runtime is None
+            or path.resolve() != private_runtime
+        )
+    ]
+    ordered.extend(
+        path
+        for path in existing
+        if path
+        and path not in ordered
+        and (
+            include_agent_runtime
+            or private_runtime is None
+            or Path(path).resolve() != private_runtime
+        )
+    )
     environment["PATH"] = os.pathsep.join(ordered)
     environment.update(
         {
@@ -813,9 +874,86 @@ def _command_environment(
             "XDG_CACHE_HOME": str(cache),
             "UV_CACHE_DIR": str(cache / "uv"),
             "npm_config_cache": str(cache / "npm"),
+            "PYTHONNOUSERSITE": "1",
+            "PIP_REQUIRE_VIRTUALENV": "1",
         }
     )
     return environment
+
+
+def _agent_private_runtime_directory() -> Path | None:
+    return (
+        Path(sys.executable).parent.resolve()
+        if sys.prefix != sys.base_prefix
+        else None
+    )
+
+
+def _base_python_runtime_directory() -> Path | None:
+    base_executable = getattr(sys, "_base_executable", None)
+    if isinstance(base_executable, str) and base_executable:
+        directory = Path(base_executable).parent
+        if directory.is_dir():
+            return directory.resolve()
+    directory = Path(sys.base_prefix) / "bin"
+    return directory.resolve() if directory.is_dir() else None
+
+
+def _workspace_environment_reuses_agent_runtime(
+    workspace: Path, private_runtime: Path
+) -> bool:
+    for environment_name in (".venv", "venv"):
+        candidate = workspace / environment_name / "bin"
+        if candidate.is_dir() and candidate.resolve() == private_runtime:
+            return True
+    return False
+
+
+def _is_agent_private_executable(executable: Path) -> bool:
+    private_runtime = _agent_private_runtime_directory()
+    if private_runtime is None:
+        return False
+    if _path_references_private_runtime(executable, private_runtime):
+        return True
+    try:
+        with executable.open("rb") as stream:
+            first_line = stream.readline(4_097)
+    except OSError:
+        return False
+    if len(first_line) > 4_096 or not first_line.startswith(b"#!"):
+        return False
+    try:
+        shebang = first_line[2:].decode("utf-8", errors="strict").strip()
+        tokens = shlex.split(shebang)
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return any(
+        token.startswith(os.sep)
+        and _path_references_private_runtime(Path(token), private_runtime)
+        for token in tokens
+    )
+
+
+def _path_references_private_runtime(path: Path, private_runtime: Path) -> bool:
+    """Detect both resolved targets and intermediate links into the Agent runtime."""
+
+    candidate = path if path.is_absolute() else path.absolute()
+    visited: set[Path] = set()
+    try:
+        for _ in range(40):
+            normalized = candidate.absolute()
+            if normalized in visited:
+                break
+            visited.add(normalized)
+            if candidate.parent.resolve() == private_runtime:
+                return True
+            if not candidate.is_symlink():
+                break
+            target = Path(os.readlink(candidate))
+            candidate = target if target.is_absolute() else candidate.parent / target
+        return path.resolve().parent == private_runtime
+    except OSError:
+        return False
 
 
 def _is_dangerous_git(argv: list[str]) -> bool:

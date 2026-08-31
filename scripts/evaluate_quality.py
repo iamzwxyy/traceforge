@@ -67,7 +67,7 @@ SCENARIOS = (
             ),
             (
                 "tests/test_agent.py::"
-                "test_agent_mode_continues_without_plan_approval_but_stays_visible"
+                "test_agent_mode_auto_approves_a_low_risk_plan_but_keeps_it_visible"
             ),
             "tests/test_agent.py::test_plan_mode_always_pauses_for_review_even_when_low_risk",
             "tests/test_agent.py::test_fast_path_scope_drift_requires_action_approval",

@@ -11,6 +11,14 @@ function json(body: unknown) {
   };
 }
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 function activeRun() {
   return {
     id: "stream-run",
@@ -126,7 +134,12 @@ async function mockApp(
   page: Page,
   run: ReturnType<typeof activeRun>,
   events: unknown[],
-  options: { failDiff?: boolean } = {},
+  options: {
+    failDiff?: boolean;
+    onCancel?: () => Promise<void> | void;
+    onResume?: () => Promise<void> | void;
+    onOpenWorkspace?: () => Promise<void> | void;
+  } = {},
 ) {
   let runGets = 0;
   await page.route("**/api/status", (route) => route.fulfill(json({
@@ -172,6 +185,18 @@ async function mockApp(
       ? route.fulfill({ status: 503, contentType: "application/json", body: "{}" })
       : route.fulfill(json({ diff: "" }))
   ));
+  await page.route("**/api/runs/stream-run/cancel", async (route) => {
+    await options.onCancel?.();
+    return route.fulfill(json(run));
+  });
+  await page.route("**/api/runs/stream-run/resume", async (route) => {
+    await options.onResume?.();
+    return route.fulfill(json(run));
+  });
+  await page.route("**/api/runs/stream-run/open-workspace", async (route) => {
+    await options.onOpenWorkspace?.();
+    return route.fulfill(json({ supported: true, opened: true, application: "Finder" }));
+  });
   return () => runGets;
 }
 
@@ -483,4 +508,261 @@ test("an interrupted partial stays truthful even when the initial diff refresh f
   await expect(bubble).toContainText("Durable partial before the process stopped");
   await expect(bubble).toContainText("已中断");
   await expect(bubble).toHaveAttribute("aria-busy", "false");
+});
+
+test("a response-limit interruption can be stopped or resumed once without hiding partial work", async ({ page }) => {
+  await installSocketHarness(page);
+  const run = activeRun();
+  run.state = "interrupted";
+  run.error = "Streaming response exceeded the total size limit. Check connection/model settings, then resume.";
+  run.turns[0].changed_files = ["client/src/App.tsx", "README.md"];
+  const events = [
+    {
+      run_id: run.id,
+      seq: 1,
+      type: "turn.started",
+      payload: { index: 1, request: run.task },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 2,
+      type: "assistant.output.started",
+      payload: { stream_id: "limited", turn_index: 1, surface: "conversation" },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 3,
+      type: "assistant.output.delta",
+      payload: {
+        stream_id: "limited",
+        turn_index: 1,
+        segment_index: 1,
+        delta: "Created the application files before output stopped.",
+      },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 4,
+      type: "assistant.output.aborted",
+      payload: {
+        stream_id: "limited",
+        turn_index: 1,
+        status: "interrupted",
+        reason: "response_limit",
+      },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 5,
+      type: "model.retry",
+      payload: {
+        next_attempt: 2,
+        max_attempts: 2,
+        category: "response_limit",
+        delay_seconds: 0,
+        recovery: "concise_regeneration",
+      },
+      created_at: createdAt,
+    },
+  ];
+  const resumeGate = deferred();
+  const cancelGate = deferred();
+  let resumeRequests = 0;
+  let cancelRequests = 0;
+  let openRequests = 0;
+  await mockApp(page, run, events, {
+    onResume: async () => {
+      resumeRequests += 1;
+      await resumeGate.promise;
+    },
+    onCancel: async () => {
+      cancelRequests += 1;
+      await cancelGate.promise;
+      run.state = "cancelled";
+      run.error = null;
+      run.turns[0].outcome = "cancelled";
+    },
+    onOpenWorkspace: () => {
+      openRequests += 1;
+    },
+  });
+
+  await page.goto("/");
+  const partial = page.getByLabel("第 1 轮保留的部分成果");
+  await expect(partial).toContainText("已保留 2 个文件更改");
+  await expect(partial).toContainText("client/src/App.tsx");
+  await expect(partial).toContainText("README.md");
+  await expect(page.getByText(/模型输出超过安全上限，TraceForge 已完成有界精简重试/)).toBeVisible();
+  await expect(page.getByText(/Streaming response exceeded/)).toHaveCount(0);
+  await expect(page.getByText(/请先修复连接/)).toHaveCount(0);
+  await expectNoWcagViolations(page, "response-limit interruption with partial work");
+
+  await partial.getByRole("button", { name: "打开部分成果所在目录" }).click();
+  await expect.poll(() => openRequests).toBe(1);
+
+  await page.locator(".trace-details > summary").click();
+  await expect(page.getByText("模型输出精简重试", { exact: true })).toBeVisible();
+  await expect(page.getByText(/输出超限 · 0 秒后重试/)).toBeVisible();
+  await expect(page.getByText(/response_limit/)).toHaveCount(0);
+
+  await expect(page.getByRole("button", { name: "停止本轮", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "再次继续", exact: true })).toBeVisible();
+  const resume = page.getByTitle("继续安全暂停的任务");
+  const stop = page.locator(".run-header .danger-ghost");
+  await resume.evaluate((button) => {
+    (button as HTMLButtonElement).click();
+    (button as HTMLButtonElement).click();
+  });
+  await expect.poll(() => resumeRequests).toBe(1);
+  await expect(resume).toBeDisabled();
+  await expect(stop).toBeDisabled();
+  resumeGate.resolve();
+  await expect(page.getByRole("button", { name: "再次继续", exact: true })).toBeEnabled();
+
+  await stop.evaluate((button) => {
+    (button as HTMLButtonElement).click();
+    (button as HTMLButtonElement).click();
+  });
+  await expect.poll(() => cancelRequests).toBe(1);
+  await expect(stop).toBeDisabled();
+  cancelGate.resolve();
+  await expect(page.getByText("任务已停止", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("继续此任务")).toBeVisible();
+  await expect(partial).toContainText("当前轮已停止");
+});
+
+test("an older response-limit retry cannot relabel the latest connection interruption", async ({ page }) => {
+  await installSocketHarness(page);
+  const run = activeRun();
+  run.state = "interrupted";
+  run.error = "Model connection failed";
+  const events = [
+    {
+      run_id: run.id,
+      seq: 1,
+      type: "turn.started",
+      payload: { index: 1, request: run.task },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 2,
+      type: "model.retry",
+      payload: { category: "response_limit", recovery: "concise_regeneration" },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 3,
+      type: "error",
+      payload: { category: "response_limit", cause: "model_unavailable" },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 4,
+      type: "state.changed",
+      payload: { state: "interrupted", previous: "executing" },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 5,
+      type: "run.resumed",
+      payload: { recovery: "concise_regeneration" },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 6,
+      type: "state.changed",
+      payload: { state: "executing", previous: "interrupted" },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 7,
+      type: "error",
+      payload: { category: "connection", cause: "model_unavailable" },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 8,
+      type: "state.changed",
+      payload: { state: "interrupted", previous: "executing" },
+      created_at: createdAt,
+    },
+  ];
+  await mockApp(page, run, events);
+
+  await page.goto("/");
+
+  await expect(page.getByText(/当前尝试未能完成，工作区和运行历史均已保留/)).toBeVisible();
+  await expect(page.getByText(/模型输出超过安全上限/)).toHaveCount(0);
+  await expect(page.getByText("模型连接失败", { exact: true })).toBeVisible();
+});
+
+test("a failed command exposes its error and captured output beside preserved files", async ({ page }) => {
+  await installSocketHarness(page);
+  const run = activeRun();
+  run.state = "failed";
+  run.turns[0].outcome = "failed";
+  run.turns[0].summary = "依赖安装失败，尚未完成验证。";
+  run.turns[0].changed_files = ["package.json"];
+  run.turns[0].completed_at = createdAt;
+  const events = [
+    {
+      run_id: run.id,
+      seq: 1,
+      type: "turn.started",
+      payload: { index: 1, request: run.task },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 2,
+      type: "tool.completed",
+      payload: {
+        call: { name: "run_command", arguments: { command: "npm install" } },
+        result: {
+          ok: false,
+          error: "命令退出码为 1",
+          output: "stdout: package metadata loaded\nstderr: npm ERR! cache miss",
+        },
+      },
+      created_at: createdAt,
+    },
+    {
+      run_id: run.id,
+      seq: 3,
+      type: "turn.completed",
+      payload: {
+        index: 1,
+        outcome: "failed",
+        summary: run.turns[0].summary,
+        changed_files: run.turns[0].changed_files,
+      },
+      created_at: createdAt,
+    },
+  ];
+  await mockApp(page, run, events);
+
+  await page.goto("/");
+  const partial = page.getByLabel("第 1 轮保留的部分成果");
+  await expect(partial).toContainText("package.json");
+  await expect(partial).toContainText("不能视为已经验证的成果");
+  await expect(partial.getByRole("button", { name: "打开部分成果所在目录" })).toBeVisible();
+
+  await page.locator(".trace-details > summary").click();
+  const tool = page.locator(".tool-card.bad");
+  await expect(tool).toContainText("错误摘要");
+  await expect(tool).toContainText("命令退出码为 1");
+  await expect(tool).toContainText("命令输出");
+  await expect(tool).toContainText("stdout: package metadata loaded");
+  await expect(tool).toContainText("stderr: npm ERR! cache miss");
 });

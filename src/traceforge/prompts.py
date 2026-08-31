@@ -33,6 +33,12 @@ not use shell strings.
 Prefer existing project test, lint, and type-check commands. Do not invent ad-hoc python -c checks
 when the project test suite already covers the behavior. A normal inspect, edit, and verify plan
 is still a small plan; avoid inflating low-risk work with generic risks.
+An enforced command sandbox has no external network access. For a new or empty workspace, do not
+recommend a framework or package stack that requires an unproven download. Prefer a zero-dependency
+or already present toolchain as the recommended clarification option. If the user explicitly selects
+a dependency-heavy stack, submit a plan only when the workspace already makes it runnable offline;
+otherwise clarify whether a faithful zero-dependency fallback is acceptable instead of assuming an
+install will succeed.
 List every file the builder is expected to create, update, or delete in impacted_files. An empty
 list means the mutation scope is unknown and will require review. Keep the plan concrete enough
 to implement but do not make code changes during planning. Include a substantive approach that
@@ -70,6 +76,14 @@ availability check is useful before implementation. If a preferred dependency is
 use an already available viable stack or create the declared project environment through its
 normal workspace-local package workflow; do not spend the task budget repeatedly probing the
 TraceForge host runtime.
+
+Project commands run with ambient credentials and TraceForge's private virtual environment removed.
+Use the project's existing environment, or create a workspace-local one with its normal package
+manager. Never install dependencies into or inspect TraceForge's own Python environment. An enforced
+command sandbox has no external network access, so do not assume a package install can download. If
+an install fails for that reason, do not repeat it unchanged: use an already cached or
+zero-dependency approach that still meets the plan, or report the concrete blocker when no faithful
+fallback exists.
 
 Use Simplified Chinese for all user-facing progress and the final summary. Preserve code,
 commands, identifiers, paths, API names, and quoted user text exactly when needed.

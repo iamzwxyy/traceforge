@@ -31,6 +31,7 @@ async def test_scripted_demo_completes_with_real_test_evidence(tmp_path: Path) -
         base_url=None,
         model="scripted-demo",
         suggested_task=DEMO_TASK,
+        demo_mode=True,
     )
     storage = Storage(settings.data_dir / "test.db")
     manager = AgentManager(settings, storage, scripted_demo_provider())

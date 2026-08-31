@@ -101,11 +101,11 @@ def is_routine_check(argv: list[str]) -> bool:
     if executable == "mypy":
         return "--install-types" not in argv[1:]
     if executable in {"python", "python3"}:
-        return (
-            len(argv) > 2
-            and argv[1:3] == ["-m", "pytest"]
-            and not _contains_unsafe_pytest_flag(argv[3:])
-        )
+        if len(argv) <= 2 or argv[1] != "-m":
+            return False
+        if argv[2] == "pytest":
+            return not _contains_unsafe_pytest_flag(argv[3:])
+        return argv[2] == "unittest"
     if executable == "uv" and len(argv) > 2 and argv[1] == "run":
         tool = Path(argv[2]).name
         if tool == "pytest":
@@ -136,7 +136,9 @@ def routine_check_family(argv: list[str]) -> str | None:
         return None
     executable = Path(argv[0]).name
     if executable in {"python", "python3"}:
-        return "python:pytest" if len(argv) > 2 and argv[1:3] == ["-m", "pytest"] else None
+        if len(argv) > 2 and argv[1] == "-m" and argv[2] in {"pytest", "unittest"}:
+            return f"python:{argv[2]}"
+        return None
     if executable == "pytest":
         return "pytest"
     if executable == "ruff" and len(argv) > 1 and argv[1] == "check":

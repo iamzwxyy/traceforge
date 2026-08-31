@@ -63,6 +63,7 @@ from traceforge.provider import (
     ModelStreamDelta,
     ProviderError,
     StreamingModelProvider,
+    ToolArgumentsError,
     close_model_provider,
 )
 from traceforge.storage import (
@@ -159,7 +160,7 @@ class _AssistantOutputStream:
         self._stream_id = uuid4().hex
         self._redactor = StableStreamingRedactor(api_key=api_key)
         self._names: dict[int, str] = {}
-        self._argument_parts: dict[int, list[str]] = {}
+        self._arguments: dict[int, str] = {}
         self._argument_lengths: dict[int, int] = {}
         self._target_index: int | None = None
         self._last_parsed_length = 0
@@ -177,7 +178,10 @@ class _AssistantOutputStream:
             return
         for call in delta.tool_calls:
             name = _append_stream_fragment(self._names.get(call.index, ""), call.name)
-            argument_length = self._argument_lengths.get(call.index, 0) + len(call.arguments)
+            arguments = _append_stream_fragment(
+                self._arguments.get(call.index, ""), call.arguments
+            )
+            argument_length = len(arguments)
             if (
                 len(name) > self._MAX_NAME_CHARACTERS
                 or argument_length > self._MAX_ARGUMENT_CHARACTERS
@@ -186,8 +190,7 @@ class _AssistantOutputStream:
                 await self.abort(status="discarded", reason="visible_output_size_limit")
                 return
             self._names[call.index] = name
-            if call.arguments:
-                self._argument_parts.setdefault(call.index, []).append(call.arguments)
+            self._arguments[call.index] = arguments
             self._argument_lengths[call.index] = argument_length
             if self._target_index is None and name == self._target.tool_name:
                 self._target_index = call.index
@@ -197,7 +200,6 @@ class _AssistantOutputStream:
                 >= self._parse_interval(argument_length)
             ):
                 self._last_parsed_length = argument_length
-                arguments = "".join(self._argument_parts.get(call.index, []))
                 await self._consume_arguments(arguments)
 
     async def resolve(self, response: ModelResponse) -> str | None:
@@ -211,7 +213,7 @@ class _AssistantOutputStream:
             return None
         call = response.tool_calls[0]
         if self._target_index is not None:
-            arguments = "".join(self._argument_parts.get(self._target_index, []))
+            arguments = self._arguments.get(self._target_index, "")
             prefix = json_string_field_prefix(arguments, self._target.field_name)
             raw_content = call.arguments.get(self._target.field_name)
             if not prefix.valid or prefix.value != raw_content or not prefix.complete:
@@ -1130,6 +1132,8 @@ class AgentManager:
             self._controls.pop(run_id, None)
 
     async def _prepare_resume(self, run: RunRecord) -> None:
+        interruption_category = self._latest_provider_interruption_category(run.id)
+        resume_recovery = _provider_resume_recovery_instruction(interruption_category)
         instruction_snapshot = self._workspace_instruction_snapshot(run)
         self.tools.bind_workspace_instruction_snapshot(
             run.id,
@@ -1202,6 +1206,10 @@ class AgentManager:
             "strategy": strategy,
             "incomplete_tool_calls_repaired": repaired_calls,
         }
+        if resume_recovery is not None:
+            resumed_payload["recovery"] = _provider_recovery_strategy(
+                interruption_category
+            )
         if uncertain_approvals:
             resumed_payload["uncertain_action_approvals"] = uncertain_approvals
         await self.broker.emit(
@@ -1255,12 +1263,37 @@ class AgentManager:
                     "content": (
                         f"The previous process stopped during {previous or 'execution'}. "
                         "Inspect current state before issuing any action again."
+                        + (f" {resume_recovery}" if resume_recovery is not None else "")
                     ),
                 }
             )
             await self._transition(run, RunState.EXECUTING)
         else:
+            if resume_recovery is not None:
+                run.messages.append({"role": "system", "content": resume_recovery})
             await self._transition(run, RunState.PLANNING)
+
+    def _latest_provider_interruption_category(self, run_id: str) -> str | None:
+        events = self.storage.get_events(run_id)
+        for index in range(len(events) - 1, -1, -1):
+            event = events[index]
+            if (
+                event.type is not EventType.STATE_CHANGED
+                or event.payload.get("state") != RunState.INTERRUPTED.value
+            ):
+                continue
+            if event.payload.get("cause") != "model_unavailable" or index == 0:
+                return None
+            error_event = events[index - 1]
+            if (
+                error_event.type is not EventType.ERROR
+                or error_event.payload.get("cause") != "model_unavailable"
+                or error_event.payload.get("recoverable") is not True
+            ):
+                return None
+            category = error_event.payload.get("category")
+            return category if isinstance(category, str) else None
+        return None
 
     async def _planning_phase(self, run: RunRecord) -> None:
         request = self._current_request(run)
@@ -1467,16 +1500,26 @@ class AgentManager:
             run.messages.append(self._assistant_message_for_storage(response))
             if not response.tool_calls:
                 no_tool_responses += 1
-                if no_tool_responses >= 2:
+                if no_tool_responses >= 3:
                     raise RuntimeError("Builder stopped without calling finish")
                 run.messages.append(
                     {
                         "role": "user",
                         "content": (
-                            "The non-terminal tool action budget is exhausted. Call finish alone "
-                            "with a concise summary."
-                            if action_budget_exhausted
-                            else "Continue with tools, or call finish alone with a concise summary."
+                            "Your last two responses did not call a tool. This protocol requires "
+                            "a native tool call: call finish alone now if the work is complete, "
+                            "otherwise issue the concrete tool actions still needed. Do not answer "
+                            "in prose."
+                            if no_tool_responses == 2
+                            else (
+                                "The non-terminal tool action budget is exhausted. Call finish "
+                                "alone with a concise summary."
+                                if action_budget_exhausted
+                                else (
+                                    "Continue with tools, or call finish alone with a concise "
+                                    "summary."
+                                )
+                            )
                         ),
                     }
                 )
@@ -2005,6 +2048,7 @@ class AgentManager:
             or (capability.transport == "deepseek_chat" and effort is ReasoningEffort.NONE)
             else effort.value
         )
+        request_messages = messages
         for attempt in range(1, attempts + 1):
             output_stream = self._new_output_stream(run, tools, attempt=attempt)
             try:
@@ -2037,22 +2081,22 @@ class AgentManager:
                     stream_provider = cast(StreamingModelProvider, self.provider)
                     if effort is ReasoningEffort.AUTO:
                         response = await stream_provider.stream_complete(
-                            messages,
+                            request_messages,
                             tools,
                             on_delta=output_stream.on_delta,
                         )
                     else:
                         response = await stream_provider.stream_complete(
-                            messages,
+                            request_messages,
                             tools,
                             reasoning_effort=effort,
                             on_delta=output_stream.on_delta,
                         )
                 elif effort is ReasoningEffort.AUTO:
-                    response = await self.provider.complete(messages, tools)
+                    response = await self.provider.complete(request_messages, tools)
                 else:
                     response = await self.provider.complete(
-                        messages,
+                        request_messages,
                         tools,
                         reasoning_effort=effort,
                     )
@@ -2088,6 +2132,12 @@ class AgentManager:
                     )
                 if not exc.retryable or attempt >= attempts:
                     raise
+                recovery = _provider_recovery_instruction(exc)
+                request_messages = (
+                    [*messages, {"role": "user", "content": recovery}]
+                    if recovery is not None
+                    else messages
+                )
                 retry_delay = (
                     exc.retry_after_seconds
                     if exc.retry_after_seconds is not None
@@ -2102,6 +2152,13 @@ class AgentManager:
                         "max_attempts": attempts,
                         "category": exc.category,
                         "delay_seconds": retry_delay,
+                        "recovery": (
+                            "tool_call_regeneration"
+                            if isinstance(exc, ToolArgumentsError)
+                            else "concise_regeneration"
+                            if exc.category == "response_limit"
+                            else "transport_retry"
+                        ),
                     },
                 )
                 await asyncio.sleep(retry_delay)
@@ -3832,6 +3889,42 @@ def _append_stream_fragment(current: str, fragment: str) -> str:
     if fragment.startswith(current):
         return fragment
     return current + fragment
+
+
+def _provider_recovery_instruction(error: ProviderError) -> str | None:
+    if isinstance(error, ToolArgumentsError):
+        return (
+            f"Your previous {error.tool_name} tool call could not be accepted because its "
+            "arguments were not exactly one valid JSON object. Regenerate the action as a fresh "
+            "native tool call that matches the supplied schema. Do not repeat or concatenate "
+            "argument objects, and do not answer in prose."
+        )
+    return _provider_resume_recovery_instruction(error.category)
+
+
+def _provider_resume_recovery_instruction(category: str | None) -> str | None:
+    if category == "tool_arguments":
+        return (
+            "The previous tool call could not be accepted because its arguments were not exactly "
+            "one valid JSON object. Regenerate the next action as a fresh native tool call that "
+            "matches the supplied schema. Do not repeat or concatenate argument objects, and do "
+            "not answer in prose."
+        )
+    if category == "response_limit":
+        return (
+            "Your previous response exceeded the bounded output limit or ended before its tool "
+            "call was complete. Regenerate the next action concisely as fresh native tool calls. "
+            "Do not repeat prior content or include unnecessary prose."
+        )
+    return None
+
+
+def _provider_recovery_strategy(category: str | None) -> str:
+    return (
+        "tool_call_regeneration"
+        if category == "tool_arguments"
+        else "concise_regeneration"
+    )
 
 
 def _questions_schema() -> dict[str, Any]:
