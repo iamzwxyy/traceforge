@@ -111,6 +111,36 @@ continuation creates a separate linked run with a fresh snapshot namespace.
 
 ### Planning
 
+Before the first provider request, the host recognizes bounded project-overview intents and scans
+only filesystem names for stable project manifests. If the workspace root is itself a project it is
+kept as the canonical scope; one child project is selected automatically; multiple child projects
+produce a host-authored `project_scope` decision whose options come from the filesystem rather than
+the model. This decision is persisted on the active `ConversationTurn`, does not consume either of
+the two model clarification rounds, and is inherited by referential read-only follow-ups in the
+same run. Each displayed candidate already carries a device/inode/ctime identity; selection and
+decision consumption persist atomically. If a candidate or inherited root is moved, deleted, or replaced,
+the host stops instead of silently selecting a surviving sibling. Explicitly naming multiple roots
+or asking to compare them still produces a one-project picker because v1 intentionally exposes one
+bounded root per turn. Read-only references inherit that root, while whole-workspace/other-project
+or explicit switch wording resets it. Inheritance is adjacent-turn only, so an unrelated middle
+turn cannot revive stale scope; a request that also commands test/start/install/update/run/build/
+deploy work stays on the executable path, while implementation history and testing-result
+explanations remain read-only. An adjacent referential/detail question inherits, but another
+unqualified “introduce the project” remains ambiguous and opens the host picker again.
+
+The selected scope is bound into `ToolRegistry` as a virtual root for list/read/search. Each scoped
+operation opens the recorded root as a temporary `dirfd`, validates its device/inode/ctime, and
+walks path components with `openat`-style `dir_fd` calls plus `O_NOFOLLOW`. Scoped search uses the same
+descriptor walker instead of passing a re-resolvable path to `rg`. This pins actual bytes to the
+opened directory while reading; a post-operation identity check discards buffered output when the
+recorded path or directory generation changed. All scoped reads run away from the event loop.
+Listing streams a bounded number of entries without retaining child descriptors; file reads bound line count, line
+size, file bytes, and persisted output; search additionally bounds query length, regex execution
+time, files, tree entries, and total scan bytes. Incomplete walks are explicitly marked.
+Project-overview completion additionally requires a root listing plus a successful root README or
+readable manifest (including an Xcode `project.pbxproj`) read; `submit_plan` is rejected for this
+host-classified read-only turn.
+
 The planning role can list, read, and search, then must choose one structured terminal action.
 `respond_to_user` ends greetings, general questions, explicit read-only analysis, or a remaining
 blocker as `answered`, without a plan, verifier verdict, or Proof Pack. `ask_questions` is reserved

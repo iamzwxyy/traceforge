@@ -223,7 +223,8 @@ code, pre { font-family: var(--mono); }
 .approval-mode-badge.full_access { color: var(--amber); border-color: rgba(240, 182, 91, 0.28); background: rgba(240, 182, 91, 0.08); }
 .reasoning-effort-badge { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 4px; color: #a9c9ff; border: 1px solid rgba(112, 167, 255, 0.25); border-radius: 999px; background: rgba(112, 167, 255, 0.08); font: 700 10px var(--mono); text-transform: uppercase; }
 .reasoning-effort-badge.high, .reasoning-effort-badge.xhigh, .reasoning-effort-badge.max { color: var(--amber); border-color: rgba(240, 182, 91, 0.28); background: rgba(240, 182, 91, 0.08); }
-.workspace-rules-badge { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 4px; color: #b8c7da; border: 1px solid #2d394a; border-radius: 999px; background: rgba(18, 25, 35, 0.9); font: 700 10px var(--mono); text-transform: uppercase; }
+.workspace-rules-badge, .project-scope-badge { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 4px; color: #b8c7da; border: 1px solid #2d394a; border-radius: 999px; background: rgba(18, 25, 35, 0.9); font: 700 10px var(--mono); text-transform: uppercase; }
+.project-scope-badge { max-width: 260px; overflow: hidden; color: #a9c9ff; border-color: rgba(112, 167, 255, 0.25); background: rgba(112, 167, 255, 0.08); text-overflow: ellipsis; white-space: nowrap; }
 .run-header h2 { max-width: 780px; margin: 9px 0 0; overflow: hidden; color: #e7edf5; font-size: 18px; line-height: 1.4; font-weight: 580; text-overflow: ellipsis; white-space: nowrap; }
 .state-badge { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: #121923; font: 700 10px var(--mono); text-transform: uppercase; }
 .state-badge.active { color: #a9c9ff; border-color: rgba(112, 167, 255, 0.25); background: rgba(112, 167, 255, 0.08); }
@@ -326,6 +327,7 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 13px; font-weight: 600; 
 .option-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 .option-card { min-height: 54px; padding: 9px; display: flex; align-items: flex-start; gap: 8px; border: 1px solid var(--line); border-radius: 7px; background: rgba(10, 14, 20, 0.55); cursor: pointer; }
 .option-card:hover, .option-card.selected { border-color: rgba(62, 214, 157, 0.42); background: var(--accent-soft); }
+.option-card:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .option-card input[type="radio"] { position: absolute; opacity: 0; }
 .radio-dot { width: 13px; height: 13px; flex: 0 0 13px; margin-top: 1px; border: 1px solid #465267; border-radius: 50%; }
 .option-card.selected .radio-dot { border: 4px solid var(--accent); }
@@ -333,6 +335,7 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 13px; font-weight: 600; 
 .option-card strong { color: #dbe3ec; font-size: 13px; }
 .option-card strong em { margin-left: 6px; padding: 2px 4px; color: var(--accent); border-radius: 3px; background: rgba(62, 214, 157, 0.1); font: 700 10px var(--mono); font-style: normal; text-transform: uppercase; }
 .option-card small { margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.project-option-evidence { margin-top: 5px; overflow-wrap: anywhere; color: #90a7c3; background: transparent; font: 10px/1.45 var(--mono); }
 .custom-option { align-items: center; }
 .custom-option input { min-width: 0; flex: 1; color: var(--text); border: 0; background: transparent; outline: none; font-size: 13px; }
 .plan-steps { margin: 14px 0 0; padding: 0; display: grid; gap: 7px; list-style: none; counter-reset: plan; }
@@ -533,6 +536,7 @@ legend { margin-bottom: 8px; color: #d8e0e9; font-size: 13px; font-weight: 600; 
 .run-header h2 { margin-top: 7px; color: #252a31; font-size: 17px; letter-spacing: 0; }
 .run-header-meta { color: #606a76; letter-spacing: 0; }
 .state-badge, .approval-mode-badge, .workspace-rules-badge { color: #46515d; border-color: #dce1e6; background: #f6f7f9; }
+.project-scope-badge { color: #356298; border-color: #d5e1f2; background: #f1f6fd; }
 .state-badge.active { color: #255a9f; }
 .state-badge.waiting { color: #82530f; }
 .state-badge.success { color: #116343; }

@@ -51,6 +51,8 @@ import {
 import ReactMarkdown from "react-markdown";
 import {
   availableProofTurnIndexes,
+  clarificationPresentation,
+  currentProjectScope,
   effectiveAssistantOutputStatus,
   inferProviderPreset,
   isActiveState,
@@ -77,6 +79,8 @@ import type {
   InteractionMode,
   PlanGate,
   Project,
+  ProjectCandidate,
+  ProjectScope,
   ProofPack,
   ProviderConfig,
   ProviderProbe,
@@ -1771,6 +1775,7 @@ function RunStage({
   const proofTurnIndexes = availableProofTurnIndexes(run);
   const latestProofTurnIndex = proofTurnIndexes.at(-1) ?? null;
   const currentTurnIndex = run.turns.at(-1)?.index ?? 1;
+  const projectScope = currentProjectScope(run);
   const workspaceRules = latestWorkspaceInstructionManifest(events, currentTurnIndex);
   const currentProofTurnIndex = run.state === "succeeded"
     && proofTurnIndexes.includes(currentTurnIndex)
@@ -1813,6 +1818,7 @@ function RunStage({
             {run.mode === "plan" && run.plan_gate && <PlanGateBadge gate={run.plan_gate} />}
             <ApprovalModeBadge mode={run.approval_mode} />
             <ReasoningEffortBadge effort={run.reasoning_effort} />
+            {projectScope && <ProjectScopeBadge scope={projectScope} />}
             {workspaceRules && <WorkspaceRulesBadge manifest={workspaceRules} />}
             <span>第 {currentTurnIndex} 轮</span>
             {run.parent_run_id && (
@@ -1868,6 +1874,7 @@ function RunStage({
           <ClarificationPanel
             key={run.decision_request_id ?? `clarification:${run.clarification.round}`}
             request={run.clarification}
+            projectCandidates={run.turns.at(-1)?.project_candidates ?? []}
             onSubmit={onAnswer}
           />
         )}
@@ -2440,9 +2447,11 @@ function ToolActivityItem({ event }: { event: RunEvent }) {
 
 function ClarificationPanel({
   request,
+  projectCandidates,
   onSubmit,
 }: {
   request: NonNullable<Run["clarification"]>;
+  projectCandidates: ProjectCandidate[];
   onSubmit: (answers: ClarificationAnswer[]) => Promise<void>;
 }) {
   const [selected, setSelected] = useState<Record<string, string>>({});
@@ -2450,47 +2459,74 @@ function ClarificationPanel({
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false);
   const [localError, setLocalError] = useState<string | null>(null);
-  const complete = request.questions.every((question) => selected[question.id] || custom[question.id]?.trim());
+  const presentation = clarificationPresentation(request.purpose);
+  const candidatesById = new Map(projectCandidates.map((candidate) => [candidate.id, candidate]));
+  const complete = request.questions.every((question) => (
+    selected[question.id]
+    || (presentation.allowsCustomAnswer && custom[question.id]?.trim())
+  ));
   return (
     <div className="decision-panel clarification-panel" aria-busy={submitting}>
-      <div className="decision-heading"><MessageSquareMore size={19} /><div><p>需求澄清 · 第 {request.round} 轮</p><h3>这些选择会影响具体实现</h3></div></div>
+      <div className="decision-heading">
+        {request.purpose === "project_scope" ? <FolderOpen size={19} /> : <MessageSquareMore size={19} />}
+        <div>
+          <p>
+            {presentation.eyebrow}
+            {request.purpose === "requirements" && ` · 第 ${request.round} 轮`}
+          </p>
+          <h3>{presentation.title}</h3>
+        </div>
+      </div>
       {request.questions.map((question) => (
         <fieldset key={question.id} disabled={submitting}>
           <legend>{question.prompt}</legend>
           <div className="option-grid">
-            {question.options.map((option) => (
-              <label className={`option-card ${selected[question.id] === option.id ? "selected" : ""}`} key={option.id}>
+            {question.options.map((option) => {
+              const candidate = candidatesById.get(option.id);
+              return (
+                <label className={`option-card ${selected[question.id] === option.id ? "selected" : ""}`} key={option.id}>
+                  <input
+                    type="radio"
+                    name={question.id}
+                    checked={selected[question.id] === option.id}
+                    onChange={() => {
+                      setSelected((current) => ({ ...current, [question.id]: option.id }));
+                      setCustom((current) => ({ ...current, [question.id]: "" }));
+                    }}
+                  />
+                  <span className="radio-dot" />
+                  <span>
+                    <strong>{option.label}{option.recommended && <em>推荐</em>}</strong>
+                    <small>{option.description}</small>
+                    {candidate && (
+                      <code className="project-option-evidence">
+                        {candidate.path} · {candidate.markers.join(" · ")}
+                      </code>
+                    )}
+                  </span>
+                </label>
+              );
+            })}
+            {presentation.allowsCustomAnswer && (
+              <label className={`option-card custom-option ${custom[question.id] ? "selected" : ""}`}>
+                <span className="radio-dot" />
                 <input
-                  type="radio"
-                  name={question.id}
-                  checked={selected[question.id] === option.id}
-                  onChange={() => {
-                    setSelected((current) => ({ ...current, [question.id]: option.id }));
-                    setCustom((current) => ({ ...current, [question.id]: "" }));
+                  type="text"
+                  placeholder="其他答案…"
+                  value={custom[question.id] ?? ""}
+                  onChange={(event) => {
+                    setCustom((current) => ({ ...current, [question.id]: event.target.value }));
+                    setSelected((current) => ({ ...current, [question.id]: "" }));
                   }}
                 />
-                <span className="radio-dot" />
-                <span><strong>{option.label}{option.recommended && <em>推荐</em>}</strong><small>{option.description}</small></span>
               </label>
-            ))}
-            <label className={`option-card custom-option ${custom[question.id] ? "selected" : ""}`}>
-              <span className="radio-dot" />
-              <input
-                type="text"
-                placeholder="其他答案…"
-                value={custom[question.id] ?? ""}
-                onChange={(event) => {
-                  setCustom((current) => ({ ...current, [question.id]: event.target.value }));
-                  setSelected((current) => ({ ...current, [question.id]: "" }));
-                }}
-              />
-            </label>
+            )}
           </div>
         </fieldset>
       ))}
       {localError && <p className="decision-error" role="alert">{systemMessageLabel(localError)}</p>}
       <div className="decision-actions">
-        <span className="muted">{submitting ? "答复已持久接收，正在应用…" : "TraceForge 会依据这些选择重新规划。"}</span>
+        <span className="muted">{submitting ? "选择已持久接收，正在应用…" : presentation.detail}</span>
         <button
           className="button primary"
           type="button"
@@ -2513,7 +2549,7 @@ function ClarificationPanel({
           }}
         >
           {submitting ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}
-          {submitting ? "正在提交" : "继续"}
+          {submitting ? "正在提交" : presentation.submitLabel}
         </button>
       </div>
     </div>
@@ -2964,6 +3000,20 @@ function WorkspaceRulesBadge({ manifest }: { manifest: WorkspaceInstructionManif
       aria-label={description}
     >
       <ClipboardCheck size={10} />规则 {count}
+    </span>
+  );
+}
+
+function ProjectScopeBadge({ scope }: { scope: ProjectScope }) {
+  const evidence = scope.evidence_read.length > 0
+    ? `已读取 ${scope.evidence_read.join("、")}`
+    : scope.root_listed
+      ? "已核对项目根目录"
+      : `项目标记：${scope.markers.join("、")}`;
+  const description = `当前轮读取范围限定为 ${scope.path}；${evidence}`;
+  return (
+    <span className="project-scope-badge" title={description} aria-label={description}>
+      <FolderOpen size={10} />项目 {scope.label}
     </span>
   );
 }

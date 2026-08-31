@@ -52,7 +52,9 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
 
   await page.locator("textarea").press("Enter");
 
-  await expect(page.getByRole("heading", { name: /选择会影响具体实现/ })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: /选择会影响后续回答或执行范围/ }),
+  ).toBeVisible();
   await page.getByRole("radio", { name: /保留公共 API/ }).check();
   await page.getByRole("button", { name: "继续" }).click();
 
@@ -143,7 +145,9 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.getByText("已回滚", { exact: true }).first()).toBeVisible();
   await page.getByRole("button", { name: "新建任务" }).click();
   await page.getByRole("button", { name: "发送" }).click();
-  await expect(page.getByRole("heading", { name: /选择会影响具体实现/ })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: /选择会影响后续回答或执行范围/ }),
+  ).toBeVisible();
   await page.getByRole("button", { name: "停止", exact: true }).click();
   await expect(page.getByText("任务已停止", { exact: true }).last()).toBeVisible();
   await expect(page.getByText(/已经写入的文件修改仍保留在工作区/)).toBeVisible();

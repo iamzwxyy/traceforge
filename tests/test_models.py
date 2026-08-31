@@ -58,6 +58,36 @@ def test_clarification_request_requires_unique_question_ids() -> None:
         )
 
 
+def test_requirement_clarification_keeps_four_option_runtime_limit() -> None:
+    options = [
+        QuestionOption(id=f"option-{index}", label=f"Option {index}")
+        for index in range(5)
+    ]
+
+    with pytest.raises(ValidationError, match="at most four"):
+        ClarificationRequest(
+            questions=[
+                ClarificationQuestion(
+                    id="scope",
+                    prompt="Which scope?",
+                    options=options,
+                )
+            ]
+        )
+
+    project_picker = ClarificationRequest(
+        purpose="project_scope",
+        questions=[
+            ClarificationQuestion(
+                id="project_scope",
+                prompt="Which project?",
+                options=options,
+            )
+        ],
+    )
+    assert len(project_picker.questions[0].options) == 5
+
+
 def test_clarification_answer_rejects_option_and_custom_text_together() -> None:
     with pytest.raises(ValidationError, match="Exactly one"):
         ClarificationAnswer(

@@ -1,5 +1,7 @@
 import type {
+  ClarificationRequest,
   ProofPack,
+  ProjectScope,
   ReasoningEffort,
   Run,
   RunEvent,
@@ -7,6 +9,41 @@ import type {
   WorkspaceInstructionManifest,
   WorkspaceInstructionReference,
 } from "./types";
+
+export interface ClarificationPresentation {
+  eyebrow: string;
+  title: string;
+  detail: string;
+  submitLabel: string;
+  allowsCustomAnswer: boolean;
+}
+
+export function clarificationPresentation(
+  purpose: ClarificationRequest["purpose"],
+): ClarificationPresentation {
+  if (purpose === "project_scope") {
+    return {
+      eyebrow: "选择项目",
+      title: "选择要处理的项目",
+      detail: "选择后，本轮读取范围会限定在该项目目录内，不会把兄弟目录或项目内部子目录误作项目主体。",
+      submitLabel: "使用此项目",
+      allowsCustomAnswer: false,
+    };
+  }
+  return {
+    eyebrow: "需求澄清",
+    title: "这些选择会影响后续回答或执行范围",
+    detail: "TraceForge 会依据这些选择继续分析、回答或规划。",
+    submitLabel: "继续",
+    allowsCustomAnswer: true,
+  };
+}
+
+export function currentProjectScope(
+  run: Pick<Run, "turns">,
+): ProjectScope | null {
+  return run.turns.at(-1)?.project_scope ?? null;
+}
 
 export interface StatePresentation {
   label: string;

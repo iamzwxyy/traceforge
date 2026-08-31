@@ -148,7 +148,9 @@ class ClarificationQuestion(BaseModel):
 
     id: str = Field(min_length=1, max_length=80)
     prompt: str = Field(min_length=1, max_length=600)
-    options: list[QuestionOption] = Field(min_length=2, max_length=4)
+    # A host-generated project picker may need to show every verified project root. The
+    # planner-facing ask_questions schema is narrowed back to four options in agent.py.
+    options: list[QuestionOption] = Field(min_length=2, max_length=50)
 
     @model_validator(mode="after")
     def validate_options(self) -> ClarificationQuestion:
@@ -165,12 +167,80 @@ class ClarificationRequest(BaseModel):
 
     questions: list[ClarificationQuestion] = Field(min_length=1, max_length=3)
     round: int = Field(default=1, ge=1, le=2)
+    purpose: Literal["requirements", "project_scope"] = "requirements"
 
     @model_validator(mode="after")
     def validate_question_ids(self) -> ClarificationRequest:
         ids = [question.id for question in self.questions]
         if len(ids) != len(set(ids)):
             raise ValueError("Clarification question ids must be unique")
+        if self.purpose == "requirements" and any(
+            len(question.options) > 4 for question in self.questions
+        ):
+            raise ValueError("Requirement clarification questions allow at most four options")
+        if self.purpose == "project_scope" and len(self.questions) != 1:
+            raise ValueError("A project scope selection must contain exactly one question")
+        return self
+
+
+class ProjectCandidate(BaseModel):
+    """A host-verified direct child that can be selected as the logical project root."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^project_[0-9a-f]{16}$")
+    path: str = Field(min_length=1, max_length=255)
+    label: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=1, max_length=400)
+    markers: list[str] = Field(min_length=1, max_length=20)
+    identity: str = Field(pattern=r"^[0-9]+:[0-9]+:[0-9]+$")
+
+    @model_validator(mode="after")
+    def validate_direct_child(self) -> ProjectCandidate:
+        path = PurePosixPath(self.path)
+        if path.is_absolute() or len(path.parts) != 1 or path.parts[0] in {".", ".."}:
+            raise ValueError("Project candidates must be direct workspace children")
+        for marker in self.markers:
+            marker_path = PurePosixPath(marker)
+            if (
+                marker_path.is_absolute()
+                or len(marker_path.parts) > 3
+                or any(part in {".", ".."} for part in marker_path.parts)
+            ):
+                raise ValueError("Project candidate markers must be safe relative files")
+        return self
+
+
+class ProjectScope(BaseModel):
+    """The durable project boundary selected for one conversation turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=255)
+    label: str = Field(min_length=1, max_length=120)
+    markers: list[str] = Field(min_length=1, max_length=20)
+    selected_by: Literal["automatic", "explicit", "clarification", "inherited"]
+    identity: str = Field(pattern=r"^[0-9]+:[0-9]+:[0-9]+$")
+    root_listed: bool = False
+    evidence_read: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_direct_child(self) -> ProjectScope:
+        path = PurePosixPath(self.path)
+        if self.path != "." and (
+            path.is_absolute() or len(path.parts) != 1 or path.parts[0] == ".."
+        ):
+            raise ValueError("A selected project scope must be the root or a direct child")
+        marker_set = set(self.markers)
+        if not marker_set or any(
+            PurePosixPath(marker).is_absolute()
+            or len(PurePosixPath(marker).parts) > 3
+            or any(part in {".", ".."} for part in PurePosixPath(marker).parts)
+            for marker in marker_set
+        ):
+            raise ValueError("Project scope markers must be safe relative files")
+        if not set(self.evidence_read).issubset(marker_set):
+            raise ValueError("Project scope evidence must name one of its root markers")
         return self
 
 
@@ -527,6 +597,8 @@ class ConversationTurn(BaseModel):
     summary: str = Field(default="", max_length=20_000)
     summary_stream_id: str | None = Field(default=None, min_length=1, max_length=64)
     changed_files: list[str] = Field(default_factory=list)
+    project_candidates: list[ProjectCandidate] = Field(default_factory=list, max_length=50)
+    project_scope: ProjectScope | None = None
     started_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
 

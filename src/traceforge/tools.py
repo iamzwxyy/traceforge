@@ -1,24 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hmac
 import os
 import re
 import shlex
 import shutil
 import signal
+import stat
 import sys
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections import deque
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
-from typing import Any, Literal
+from pathlib import Path, PurePosixPath
+from time import monotonic
+from typing import Any, BinaryIO, Literal, cast
+
+import regex
 
 from traceforge.config import Settings
 from traceforge.models import ApprovalMode, FinishRequest, TaskPlan, ToolCall, ToolResult
 from traceforge.patching import FilePatch, PatchError, apply_file_patch, parse_unified_diff
 from traceforge.planning import is_safe_routine_check_variant
+from traceforge.project_scope import is_ignored_workspace_directory
 from traceforge.sandbox import CommandSandbox, SandboxStatus
 from traceforge.streaming import contains_redactable_secret
 from traceforge.workspace import Workspace, WorkspaceViolation, digest
@@ -31,11 +39,66 @@ SENSITIVE_ENV_NAME_PATTERN = re.compile(
 )
 SENSITIVE_ENV_EXACT = {"GPG_AGENT_INFO", "SSH_AUTH_SOCK"}
 
+# Scoped search never hands an unbounded workspace file to Python's regular-expression
+# engine. These limits are deliberately independent from the result-size limit: a search
+# with no matches still needs a finite amount of local work.
+SCOPED_SEARCH_MAX_FILE_BYTES = 2 * 1024 * 1024
+SCOPED_SEARCH_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+SCOPED_SEARCH_MAX_LINE_BYTES = 64 * 1024
+SCOPED_SEARCH_MAX_FILES = 10_000
+SCOPED_SEARCH_MAX_ENTRIES = 20_000
+SEARCH_MAX_QUERY_CHARS = 4_096
+SEARCH_MAX_GLOB_CHARS = 1_024
+SEARCH_REGEX_TIMEOUT_SECONDS = 0.05
+SEARCH_TOTAL_TIMEOUT_SECONDS = 2.0
+SCOPED_LIST_MAX_ENTRIES = 2_000
+SCOPED_LIST_MAX_ROWS = 1_000
+SCOPED_READ_MAX_FILE_BYTES = 2 * 1024 * 1024
+SCOPED_READ_MAX_LINE_BYTES = 256 * 1024
+SCOPED_READ_MAX_LINES = 400
+SCOPED_READ_CHUNK_BYTES = 64 * 1024
+
 
 class PermissionDecision(StrEnum):
     ALLOW = "allow"
     ASK = "ask"
     DENY = "deny"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectScopeBinding:
+    relative_path: str
+    resolved_path: Path
+    device: int
+    inode: int
+    ctime_ns: int | None
+
+
+def _project_identity_token(identity: os.stat_result) -> str:
+    return f"{identity.st_dev}:{identity.st_ino}:{identity.st_ctime_ns}"
+
+
+def _binding_matches_identity(
+    binding: ProjectScopeBinding,
+    identity: os.stat_result,
+) -> bool:
+    return (identity.st_dev, identity.st_ino) == (binding.device, binding.inode) and (
+        binding.ctime_ns is None or identity.st_ctime_ns == binding.ctime_ns
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SearchGlob:
+    components: tuple[re.Pattern[str], ...]
+
+    def matches(self, path_components: tuple[str, ...]) -> bool:
+        if len(path_components) < len(self.components):
+            return False
+        candidate = path_components[-len(self.components) :]
+        return all(
+            pattern.fullmatch(component) is not None
+            for pattern, component in zip(self.components, candidate, strict=True)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +140,17 @@ class ToolRegistry:
         )
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._instruction_grants: dict[str, str] = {}
+        self._project_scopes: dict[str, ProjectScopeBinding] = {}
+        workspace_identity = self.workspace.root.stat(follow_symlinks=False)
+        self._workspace_read_scope = ProjectScopeBinding(
+            relative_path=".",
+            resolved_path=self.workspace.root,
+            device=workspace_identity.st_dev,
+            inode=workspace_identity.st_ino,
+            # The unscoped workspace root legitimately changes as tools create top-level
+            # entries. Persisted project selections below always bind the ctime generation.
+            ctime_ns=None,
+        )
 
     def bind_workspace_instruction_snapshot(
         self,
@@ -89,6 +163,40 @@ class ToolRegistry:
 
     def clear_workspace_instruction_snapshot(self, run_id: str) -> None:
         self._instruction_grants.pop(run_id, None)
+
+    def bind_project_scope(
+        self,
+        run_id: str,
+        relative_path: str,
+        *,
+        expected_identity: str | None = None,
+    ) -> str:
+        lexical = self.workspace.root / relative_path
+        if lexical.is_symlink():
+            raise ValueError("Selected project scope cannot be a symlink")
+        resolved = self.workspace.resolve_read(relative_path)
+        if not resolved.is_dir():
+            raise ValueError("Selected project scope must be a directory")
+        if self.workspace.relative(resolved) != relative_path:
+            raise ValueError("Selected project scope must resolve to its recorded path")
+        identity = lexical.stat(follow_symlinks=False)
+        identity_token = _project_identity_token(identity)
+        if expected_identity is not None and not hmac.compare_digest(
+            identity_token,
+            expected_identity,
+        ):
+            raise ValueError("Selected project scope was replaced after it was persisted")
+        self._project_scopes[run_id] = ProjectScopeBinding(
+            relative_path=relative_path,
+            resolved_path=resolved,
+            device=identity.st_dev,
+            inode=identity.st_ino,
+            ctime_ns=identity.st_ctime_ns,
+        )
+        return identity_token
+
+    def clear_project_scope(self, run_id: str) -> None:
+        self._project_scopes.pop(run_id, None)
 
     @property
     def sandbox_status(self) -> SandboxStatus:
@@ -119,9 +227,9 @@ class ToolRegistry:
                 "search_text",
                 "Search text in workspace files. The query is a regular expression.",
                 {
-                    "query": {"type": "string"},
+                    "query": {"type": "string", "maxLength": SEARCH_MAX_QUERY_CHARS},
                     "path": {"type": "string", "default": "."},
-                    "glob": {"type": "string"},
+                    "glob": {"type": "string", "maxLength": SEARCH_MAX_GLOB_CHARS},
                 },
                 required=["query"],
             ),
@@ -321,17 +429,28 @@ class ToolRegistry:
         sandbox_bypass: bool = False,
     ) -> ToolResult:
         mutation_baseline: dict[str, tuple[bool, str | None]] = {}
+        scope_metadata: dict[str, str] = {}
         try:
             if call.name in {"apply_patch", "create_file", "run_command"}:
                 self._require_workspace_instruction_grant(run_id)
             if call.name in {"apply_patch", "create_file"}:
                 mutation_baseline = self._mutation_baseline(call)
-            if call.name == "list_files":
-                output = self._list_files(**call.arguments)
-            elif call.name == "read_file":
-                output = self._read_file(**call.arguments)
-            elif call.name == "search_text":
-                output = await self._search_text(**call.arguments)
+            if call.name in {"list_files", "read_file", "search_text"}:
+                # Every read uses the same bounded descriptor walker. A selected project narrows
+                # the virtual root; otherwise the immutable workspace root binding is used without
+                # reporting a synthetic project scope to the UI.
+                binding = self._project_scopes.get(run_id)
+                if binding is not None:
+                    output, scope_metadata = await asyncio.to_thread(
+                        self._execute_scoped_read,
+                        binding,
+                        call,
+                    )
+                else:
+                    output, scope_metadata = await asyncio.to_thread(
+                        self._execute_workspace_read,
+                        call,
+                    )
             elif call.name == "apply_patch":
                 output = self._apply_patch(run_id, **call.arguments)
             elif call.name == "create_file":
@@ -359,7 +478,7 @@ class ToolRegistry:
                 metadata=(
                     {"changed_files": self._changed_mutation_paths(mutation_baseline)}
                     if call.name in {"apply_patch", "create_file"}
-                    else {}
+                    else scope_metadata
                 ),
             )
         except (OSError, UnicodeError, ValueError, PatchError, WorkspaceViolation) as exc:
@@ -371,9 +490,296 @@ class ToolRegistry:
                 metadata=(
                     {"changed_files": self._changed_mutation_paths(mutation_baseline)}
                     if call.name in {"apply_patch", "create_file"}
-                    else {}
+                    else scope_metadata
                 ),
             )
+
+    def _execute_scoped_read(
+        self,
+        binding: ProjectScopeBinding,
+        call: ToolCall,
+    ) -> tuple[str, dict[str, str]]:
+        return self._execute_bounded_read(
+            binding,
+            call,
+            include_scope_metadata=True,
+        )
+
+    def _execute_workspace_read(
+        self,
+        call: ToolCall,
+    ) -> tuple[str, dict[str, str]]:
+        return self._execute_bounded_read(
+            self._workspace_read_scope,
+            call,
+            include_scope_metadata=False,
+        )
+
+    def _execute_bounded_read(
+        self,
+        binding: ProjectScopeBinding,
+        call: ToolCall,
+        *,
+        include_scope_metadata: bool,
+    ) -> tuple[str, dict[str, str]]:
+        raw_path = call.arguments.get("path", ".")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError("Tool path must be a non-empty string")
+        relative_parts, effective_path = self._scoped_path_parts(binding, raw_path)
+        display_path = "/".join(relative_parts) or "."
+        metadata = (
+            {
+                "project_scope": binding.relative_path,
+                "requested_path": raw_path,
+                "effective_path": effective_path,
+            }
+            if include_scope_metadata
+            else {}
+        )
+        with self._open_project_scope_fd(binding) as scope_fd:
+            if call.name == "list_files":
+                self._reject_unknown_arguments(call, {"path", "max_depth"})
+                max_depth = call.arguments.get("max_depth", 3)
+                if not isinstance(max_depth, int) or isinstance(max_depth, bool):
+                    raise ValueError("max_depth must be an integer")
+                if not 1 <= max_depth <= 6:
+                    raise ValueError("max_depth must be between 1 and 6")
+                output = self._list_files_scoped(
+                    scope_fd,
+                    binding,
+                    raw_path,
+                    relative_parts,
+                    display_path,
+                    max_depth,
+                )
+            elif call.name == "read_file":
+                self._reject_unknown_arguments(call, {"path", "start_line", "end_line"})
+                start_line = call.arguments.get("start_line", 1)
+                end_line = call.arguments.get("end_line")
+                if not isinstance(start_line, int) or isinstance(start_line, bool):
+                    raise ValueError("start_line must be an integer")
+                if end_line is not None and (
+                    not isinstance(end_line, int) or isinstance(end_line, bool)
+                ):
+                    raise ValueError("end_line must be an integer")
+                if start_line < 1 or (end_line is not None and end_line < 1):
+                    raise ValueError("Line numbers must be positive")
+                if end_line is not None and end_line - start_line + 1 > SCOPED_READ_MAX_LINES:
+                    raise ValueError(
+                        f"read_file can return at most {SCOPED_READ_MAX_LINES} lines"
+                    )
+                output = self._read_file_scoped(
+                    scope_fd,
+                    binding,
+                    raw_path,
+                    relative_parts,
+                    start_line,
+                    end_line,
+                )
+            else:
+                self._reject_unknown_arguments(call, {"query", "path", "glob"})
+                query = call.arguments.get("query")
+                glob = call.arguments.get("glob")
+                if not isinstance(query, str):
+                    raise ValueError("query must be a string")
+                if glob is not None and not isinstance(glob, str):
+                    raise ValueError("glob must be a string")
+                glob_pattern = _compile_search_glob(glob) if glob is not None else None
+                output = self._search_text_scoped(
+                    scope_fd,
+                    binding,
+                    raw_path,
+                    relative_parts,
+                    display_path,
+                    query,
+                    glob_pattern,
+                )
+
+            output = _bounded_tool_output(
+                output,
+                character_limit=max(0, self.settings.model_output_limit),
+                byte_limit=max(0, self.settings.stored_output_limit),
+            )
+
+            # The descriptor above pins all actual reads to the selected directory. Rechecking
+            # device/inode/ctime after the operation makes concurrent mutation or rename visible
+            # and discards locally buffered output, including after rename-away/restore races.
+            self._validated_project_scope(binding)
+        return output, metadata
+
+    @staticmethod
+    def _reject_unknown_arguments(call: ToolCall, allowed: set[str]) -> None:
+        unexpected = sorted(set(call.arguments) - allowed)
+        if unexpected:
+            raise ValueError(
+                f"Unexpected arguments for {call.name}: {', '.join(unexpected)}"
+            )
+
+    @staticmethod
+    def _scoped_path_parts(
+        binding: ProjectScopeBinding,
+        raw_path: str,
+    ) -> tuple[tuple[str, ...], str]:
+        if "\x00" in raw_path:
+            raise WorkspaceViolation("Path must not contain a null byte")
+        supplied = PurePosixPath(raw_path)
+        if supplied.is_absolute():
+            raise WorkspaceViolation("Absolute paths are not allowed")
+        parts = list(supplied.parts)
+        if any(part == ".." for part in parts):
+            raise WorkspaceViolation(
+                f"Path escapes selected project scope '{binding.relative_path}': {raw_path}"
+            )
+        if any(_is_git_path_component(part) for part in parts):
+            raise WorkspaceViolation("Reading .git path components is not allowed")
+        if _contains_secret_path_component(raw_path):
+            raise WorkspaceViolation(
+                "Secret-bearing environment paths (.env-family path components) "
+                "cannot be read by the agent"
+            )
+        relative_parts = tuple(part for part in parts if part not in {"", "."})
+        effective_parts = (
+            relative_parts
+            if binding.relative_path == "."
+            else (binding.relative_path, *relative_parts)
+        )
+        effective_path = "/".join(effective_parts) or "."
+        return relative_parts, effective_path
+
+    @contextmanager
+    def _open_project_scope_fd(
+        self,
+        binding: ProjectScopeBinding,
+    ) -> Iterator[int]:
+        lexical = self.workspace.root / binding.relative_path
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(lexical, flags)
+        except OSError as exc:
+            raise WorkspaceViolation(
+                f"Selected project scope '{binding.relative_path}' is no longer available"
+            ) from exc
+        try:
+            identity = os.fstat(descriptor)
+            if not stat.S_ISDIR(identity.st_mode) or not _binding_matches_identity(
+                binding,
+                identity,
+            ):
+                raise WorkspaceViolation(
+                    f"Selected project scope '{binding.relative_path}' was replaced after selection"
+                )
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    def _open_scoped_directory(
+        self,
+        scope_fd: int,
+        binding: ProjectScopeBinding,
+        raw_path: str,
+        parts: tuple[str, ...],
+    ) -> int:
+        descriptor = os.dup(scope_fd)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            for part in parts:
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except OSError as exc:
+            os.close(descriptor)
+            raise WorkspaceViolation(
+                "Path is unavailable or unsafe inside selected project scope "
+                f"'{binding.relative_path}': {raw_path}"
+            ) from exc
+
+    @staticmethod
+    def _open_relative_directory(
+        base_fd: int,
+        parts: tuple[str, ...],
+    ) -> int:
+        descriptor = os.dup(base_fd)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            for part in parts:
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except OSError:
+            os.close(descriptor)
+            raise
+
+    def _open_scoped_node(
+        self,
+        scope_fd: int,
+        binding: ProjectScopeBinding,
+        raw_path: str,
+        parts: tuple[str, ...],
+    ) -> tuple[int, os.stat_result]:
+        if not parts:
+            descriptor = os.dup(scope_fd)
+            return descriptor, os.fstat(descriptor)
+        parent = self._open_scoped_directory(scope_fd, binding, raw_path, parts[:-1])
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = os.open(parts[-1], flags, dir_fd=parent)
+        except OSError as exc:
+            raise WorkspaceViolation(
+                "Path is unavailable or unsafe inside selected project scope "
+                f"'{binding.relative_path}': {raw_path}"
+            ) from exc
+        finally:
+            os.close(parent)
+        try:
+            return descriptor, os.fstat(descriptor)
+        except OSError:
+            os.close(descriptor)
+            raise
+
+    def _validated_project_scope(self, binding: ProjectScopeBinding) -> Path:
+        lexical = self.workspace.root / binding.relative_path
+        try:
+            identity = lexical.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise WorkspaceViolation(
+                f"Selected project scope '{binding.relative_path}' is no longer available"
+            ) from exc
+        if lexical.is_symlink() or not lexical.is_dir():
+            raise WorkspaceViolation(
+                f"Selected project scope '{binding.relative_path}' changed after selection"
+            )
+        if not _binding_matches_identity(binding, identity):
+            raise WorkspaceViolation(
+                f"Selected project scope '{binding.relative_path}' was replaced after selection"
+            )
+        resolved = lexical.resolve(strict=True)
+        if resolved != binding.resolved_path:
+            raise WorkspaceViolation(
+                f"Selected project scope '{binding.relative_path}' changed after selection"
+            )
+        return resolved
 
     def _require_workspace_instruction_grant(self, run_id: str) -> None:
         try:
@@ -446,92 +852,472 @@ class ToolRegistry:
             os.killpg(process.pid, signal.SIGKILL)
             await process.wait()
 
-    def _list_files(self, path: str = ".", max_depth: int = 3) -> str:
-        root = self.workspace.resolve_read(path)
-        if not root.is_dir():
-            raise ValueError(f"Not a directory: {path}")
-        ignored = {
-            ".git",
-            ".venv",
-            ".traceforge-uv-venv",
-            "node_modules",
-            "__pycache__",
-            "dist",
-            "build",
-        }
+    def _list_files_scoped(
+        self,
+        scope_fd: int,
+        binding: ProjectScopeBinding,
+        raw_path: str,
+        parts: tuple[str, ...],
+        display_path: str,
+        max_depth: int,
+    ) -> str:
+        root_fd = self._open_scoped_directory(scope_fd, binding, raw_path, parts)
         rows: list[str] = []
-        root_depth = len(root.parts)
-        for current, directories, files in os.walk(root):
-            current_path = Path(current)
-            depth = len(current_path.parts) - root_depth
-            directories[:] = sorted(item for item in directories if item not in ignored)
-            if depth >= max_depth:
-                directories[:] = []
-            relative_dir = self.workspace.relative(current_path)
-            if relative_dir != ".":
-                rows.append(f"{relative_dir}/")
-            rows.extend(
-                self.workspace.relative(current_path / name)
-                for name in sorted(files)
-                if not _is_secret_file(name)
-            )
-            if len(rows) >= 1_000:
-                rows.append("... output truncated at 1,000 entries")
-                break
+        queue: deque[tuple[tuple[str, ...], int]] = deque([((), 0)])
+        scanned_entries = 0
+        truncated = False
+        incomplete = False
+        try:
+            while queue and not truncated:
+                relative_parts, depth = queue.popleft()
+                try:
+                    current_fd = self._open_relative_directory(root_fd, relative_parts)
+                except OSError:
+                    incomplete = True
+                    continue
+                try:
+                    remaining_entries = SCOPED_LIST_MAX_ENTRIES - scanned_entries
+                    if remaining_entries <= 0:
+                        truncated = True
+                        continue
+                    names: list[str] = []
+                    directory_capped = False
+                    try:
+                        with os.scandir(current_fd) as iterator:
+                            for entry in iterator:
+                                if len(names) >= remaining_entries:
+                                    directory_capped = True
+                                    break
+                                names.append(entry.name)
+                    except OSError:
+                        incomplete = True
+                        continue
+                    directories: list[str] = []
+                    files: list[str] = []
+                    for name in sorted(names):
+                        scanned_entries += 1
+                        # A Git worktree commonly represents `.git` as a regular file rather
+                        # than a directory. Apply the component boundary before branching on
+                        # file type so listing cannot expose either representation.
+                        if _is_git_path_component(name) or _is_secret_file(name):
+                            continue
+                        try:
+                            item_status = os.stat(
+                                name,
+                                dir_fd=current_fd,
+                                follow_symlinks=False,
+                            )
+                        except OSError:
+                            incomplete = True
+                            continue
+                        if stat.S_ISDIR(item_status.st_mode) and not (
+                            is_ignored_workspace_directory(name)
+                        ):
+                            directories.append(name)
+                        elif stat.S_ISREG(item_status.st_mode) and not _is_secret_file(name):
+                            files.append(name)
+
+                    if depth < max_depth:
+                        for name in directories:
+                            child_parts = (*relative_parts, name)
+                            rows.append(
+                                f"{self._scoped_display_path(display_path, child_parts)}/"
+                            )
+                            queue.append((child_parts, depth + 1))
+                            if len(rows) >= SCOPED_LIST_MAX_ROWS:
+                                truncated = True
+                                break
+                    if not truncated:
+                        for name in files:
+                            rows.append(
+                                self._scoped_display_path(
+                                    display_path,
+                                    (*relative_parts, name),
+                                )
+                            )
+                            if len(rows) >= SCOPED_LIST_MAX_ROWS:
+                                truncated = True
+                                break
+                    truncated = truncated or directory_capped
+                finally:
+                    os.close(current_fd)
+        finally:
+            os.close(root_fd)
+        if truncated:
+            rows.append("... output truncated")
+        elif incomplete:
+            rows.append("... listing incomplete")
         return "\n".join(rows) or "(empty directory)"
 
-    def _read_file(self, path: str, start_line: int = 1, end_line: int | None = None) -> str:
-        file_path = self.workspace.resolve_read(path)
-        if not file_path.is_file():
-            raise ValueError(f"Not a file: {path}")
-        if _is_secret_file(file_path.name):
-            raise ValueError("Secret-bearing environment files cannot be read by the agent")
-        content = file_path.read_text(encoding="utf-8")
-        lines = content.splitlines()
-        if end_line is None:
-            end_line = min(start_line + 399, len(lines))
-        if end_line < start_line:
+    def _read_file_scoped(
+        self,
+        scope_fd: int,
+        binding: ProjectScopeBinding,
+        raw_path: str,
+        parts: tuple[str, ...],
+        start_line: int,
+        end_line: int | None,
+    ) -> str:
+        if end_line is not None and end_line < start_line:
             raise ValueError("end_line must not be before start_line")
-        selected = lines[start_line - 1 : end_line]
-        return "\n".join(
+        descriptor, file_status = self._open_scoped_node(
+            scope_fd,
+            binding,
+            raw_path,
+            parts,
+        )
+        if not stat.S_ISREG(file_status.st_mode):
+            os.close(descriptor)
+            raise ValueError(f"Not a file: {raw_path}")
+        if not parts or _is_secret_file(parts[-1]):
+            os.close(descriptor)
+            raise ValueError("Secret-bearing environment files cannot be read by the agent")
+        content = bytearray()
+        file_truncated = file_status.st_size > SCOPED_READ_MAX_FILE_BYTES
+        with _binary_stream_from_fd(descriptor) as stream:
+            while len(content) < SCOPED_READ_MAX_FILE_BYTES:
+                chunk = stream.read(
+                    min(
+                        SCOPED_READ_CHUNK_BYTES,
+                        SCOPED_READ_MAX_FILE_BYTES - len(content),
+                    )
+                )
+                if not chunk:
+                    break
+                content.extend(chunk)
+            try:
+                file_truncated = file_truncated or os.fstat(stream.fileno()).st_size > len(
+                    content
+                )
+            except OSError:
+                file_truncated = True
+        raw_content = bytes(content)
+        try:
+            text = raw_content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if not (
+                file_truncated
+                and exc.reason == "unexpected end of data"
+                and exc.end == len(raw_content)
+            ):
+                raise
+            raw_content = raw_content[: exc.start]
+            text = raw_content.decode("utf-8")
+            content = bytearray(raw_content)
+        lines = text.splitlines()
+        if file_truncated and content and not content.endswith((b"\n", b"\r")):
+            lines = lines[:-1]
+        if start_line > len(lines):
+            if file_truncated:
+                raise ValueError(
+                    "Scoped file read limit was reached before the requested start_line"
+                )
+            raise ValueError("start_line is beyond the end of the file")
+        requested_end = end_line if end_line is not None else start_line + 399
+        selected = lines[start_line - 1 : requested_end]
+        if any(len(line.encode("utf-8")) > SCOPED_READ_MAX_LINE_BYTES for line in selected):
+            raise ValueError(
+                f"A requested line exceeds the {SCOPED_READ_MAX_LINE_BYTES}-byte read limit"
+            )
+        output = "\n".join(
             f"{number:>6} | {line}" for number, line in enumerate(selected, start=start_line)
         )
+        if file_truncated and requested_end > len(lines):
+            output += f"\n... file read truncated at {SCOPED_READ_MAX_FILE_BYTES} bytes"
+        return output
 
-    async def _search_text(self, query: str, path: str = ".", glob: str | None = None) -> str:
-        target = self.workspace.resolve_read(path)
-        argv = ["rg", "-n", "--no-heading", "--color", "never"]
-        argv.extend(["--glob", "!.env", "--glob", "!.env.*", "--glob", ".env.example"])
-        if glob:
-            argv.extend(["--glob", glob])
-        argv.extend([query, str(target)])
-        if shutil.which("rg"):
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await process.communicate()
-            if process.returncode not in {0, 1}:
-                raise ValueError(stderr.decode(errors="replace"))
-            output = stdout.decode(errors="replace")
-            return output[: self.settings.model_output_limit] or "No matches"
-        expression = re.compile(query)
+    def _search_text_scoped(
+        self,
+        scope_fd: int,
+        binding: ProjectScopeBinding,
+        raw_path: str,
+        parts: tuple[str, ...],
+        display_path: str,
+        query: str,
+        glob_pattern: SearchGlob | None,
+    ) -> str:
+        deadline = monotonic() + SEARCH_TOTAL_TIMEOUT_SECONDS
+        expression = _compile_search_pattern(query)
+        _remaining_search_time(deadline)
+        target_fd, target_status = self._open_scoped_node(
+            scope_fd,
+            binding,
+            raw_path,
+            parts,
+        )
         matches: list[str] = []
-        files = [target] if target.is_file() else target.rglob(glob or "*")
-        for file_path in files:
-            if not file_path.is_file() or ".git" in file_path.parts:
-                continue
-            if _is_secret_file(file_path.name):
-                continue
+        rendered_length = 0
+        scanned_bytes = 0
+        scanned_files = 0
+        scan_incomplete = False
+        output_limit = max(0, self.settings.model_output_limit)
+
+        def append_match(display_path: str, number: int, line: str) -> bool:
+            """Append at most the remaining output budget; return true when it is full."""
+            nonlocal rendered_length
+            separator_length = 1 if matches else 0
+            remaining = output_limit - rendered_length - separator_length
+            if remaining <= 0:
+                return True
+            prefix = f"{display_path}:{number}:"
+            if len(prefix) >= remaining:
+                rendered = prefix[:remaining]
+                was_truncated = len(prefix) > remaining or bool(line)
+            else:
+                line_budget = remaining - len(prefix)
+                rendered = prefix + line[:line_budget]
+                was_truncated = len(line) > line_budget
+            matches.append(rendered)
+            rendered_length += separator_length + len(rendered)
+            return was_truncated
+
+        def search_file(
+            descriptor: int,
+            file_status: os.stat_result,
+            display_path: str,
+        ) -> tuple[bool, bool, bool]:
+            """Return (output_full, scan_incomplete, stop_scan), consuming the fd."""
+            nonlocal scanned_bytes, scanned_files
+            scanned_files += 1
+            if file_status.st_size > SCOPED_SEARCH_MAX_FILE_BYTES:
+                os.close(descriptor)
+                return False, True, False
+            if scanned_bytes >= SCOPED_SEARCH_MAX_TOTAL_BYTES:
+                os.close(descriptor)
+                return False, True, True
+
+            file_bytes = 0
             try:
-                for number, line in enumerate(file_path.read_text().splitlines(), start=1):
-                    if expression.search(line):
-                        matches.append(f"{self.workspace.relative(file_path)}:{number}:{line}")
-                        if len("\n".join(matches)) >= self.settings.model_output_limit:
-                            return "\n".join(matches) + "\n... output truncated"
-            except (UnicodeDecodeError, OSError):
-                continue
-        return "\n".join(matches) or "No matches"
+                with _binary_stream_from_fd(descriptor) as stream:
+                    number = 0
+                    pending = b""
+                    while True:
+                        _remaining_search_time(deadline)
+                        file_remaining = SCOPED_SEARCH_MAX_FILE_BYTES - file_bytes
+                        total_remaining = SCOPED_SEARCH_MAX_TOTAL_BYTES - scanned_bytes
+                        if file_remaining <= 0 or total_remaining <= 0:
+                            return False, True, total_remaining <= 0
+                        read_limit = min(
+                            SCOPED_SEARCH_MAX_LINE_BYTES,
+                            file_remaining,
+                            total_remaining,
+                        )
+                        chunk = stream.read(read_limit)
+                        if not chunk:
+                            if pending:
+                                number += 1
+                                try:
+                                    line = pending.decode("utf-8").rstrip("\r")
+                                except UnicodeDecodeError:
+                                    return False, False, False
+                                if _search_pattern_matches(
+                                    expression,
+                                    line,
+                                    deadline=deadline,
+                                ) and append_match(display_path, number, line):
+                                    return True, False, True
+                            break
+                        file_bytes += len(chunk)
+                        scanned_bytes += len(chunk)
+                        buffer = pending + chunk
+                        cursor = 0
+                        while (newline := buffer.find(b"\n", cursor)) >= 0:
+                            raw_line = buffer[cursor : newline + 1]
+                            if len(raw_line) > SCOPED_SEARCH_MAX_LINE_BYTES:
+                                return False, True, False
+                            number += 1
+                            try:
+                                line = raw_line.decode("utf-8").rstrip("\r\n")
+                            except UnicodeDecodeError:
+                                # Binary and non-UTF-8 files are not searchable text evidence.
+                                return False, False, False
+                            if _search_pattern_matches(
+                                expression,
+                                line,
+                                deadline=deadline,
+                            ) and append_match(display_path, number, line):
+                                return True, False, True
+                            cursor = newline + 1
+                        pending = buffer[cursor:]
+                        if len(pending) > SCOPED_SEARCH_MAX_LINE_BYTES:
+                            return False, True, False
+                        try:
+                            at_eof = os.fstat(stream.fileno()).st_size <= file_bytes
+                        except OSError:
+                            return False, True, False
+                        if at_eof:
+                            if pending:
+                                number += 1
+                                try:
+                                    line = pending.decode("utf-8").rstrip("\r")
+                                except UnicodeDecodeError:
+                                    return False, False, False
+                                if _search_pattern_matches(
+                                    expression,
+                                    line,
+                                    deadline=deadline,
+                                ) and append_match(display_path, number, line):
+                                    return True, False, True
+                            break
+            except OSError:
+                return False, True, False
+            return False, False, False
+
+        if stat.S_ISREG(target_status.st_mode):
+            if (
+                not parts
+                or _is_secret_file(parts[-1])
+                or (glob_pattern is not None and not glob_pattern.matches(parts))
+            ):
+                os.close(target_fd)
+                return "No matches"
+            output_full, scan_incomplete, _stop_scan = search_file(
+                target_fd,
+                target_status,
+                display_path,
+            )
+            _remaining_search_time(deadline)
+            return self._render_scoped_search_matches(
+                matches,
+                output_full or scan_incomplete,
+                output_limit,
+            )
+        if not stat.S_ISDIR(target_status.st_mode):
+            os.close(target_fd)
+            raise ValueError(f"Not a file or directory: {raw_path}")
+
+        queue: deque[tuple[str, ...]] = deque([()])
+        file_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        output_full = False
+        stop_scan = False
+        scanned_entries = 0
+
+        try:
+            while queue and not output_full and not stop_scan:
+                _remaining_search_time(deadline)
+                relative_parts = queue.popleft()
+                try:
+                    current_fd = self._open_relative_directory(target_fd, relative_parts)
+                except OSError:
+                    scan_incomplete = True
+                    continue
+                try:
+                    remaining_entries = SCOPED_SEARCH_MAX_ENTRIES - scanned_entries
+                    if remaining_entries <= 0:
+                        scan_incomplete = True
+                        stop_scan = True
+                        continue
+                    names: list[str] = []
+                    directory_capped = False
+                    try:
+                        with os.scandir(current_fd) as iterator:
+                            for entry in iterator:
+                                _remaining_search_time(deadline)
+                                if len(names) >= remaining_entries:
+                                    directory_capped = True
+                                    break
+                                names.append(entry.name)
+                    except OSError:
+                        scan_incomplete = True
+                        continue
+                    for name in sorted(names):
+                        _remaining_search_time(deadline)
+                        scanned_entries += 1
+                        # Do not rely on the directory-only ignore branch below: linked
+                        # worktrees use a regular `.git` file containing an external gitdir.
+                        if _is_git_path_component(name) or _is_secret_file(name):
+                            continue
+                        try:
+                            item_status = os.stat(
+                                name,
+                                dir_fd=current_fd,
+                                follow_symlinks=False,
+                            )
+                        except OSError:
+                            scan_incomplete = True
+                            continue
+                        item_parts = (*relative_parts, name)
+                        if stat.S_ISDIR(item_status.st_mode):
+                            if is_ignored_workspace_directory(name):
+                                continue
+                            queue.append(item_parts)
+                            continue
+                        if (
+                            not stat.S_ISREG(item_status.st_mode)
+                            or _is_secret_file(name)
+                            or (
+                                glob_pattern is not None
+                                and not glob_pattern.matches(item_parts)
+                            )
+                        ):
+                            continue
+                        if scanned_files >= SCOPED_SEARCH_MAX_FILES:
+                            scan_incomplete = True
+                            stop_scan = True
+                            break
+                        file_fd: int | None = None
+                        try:
+                            file_fd = os.open(name, file_flags, dir_fd=current_fd)
+                            opened_status = os.fstat(file_fd)
+                            if not stat.S_ISREG(opened_status.st_mode):
+                                os.close(file_fd)
+                                file_fd = None
+                                continue
+                        except OSError:
+                            if file_fd is not None:
+                                os.close(file_fd)
+                            scan_incomplete = True
+                            continue
+                        assert file_fd is not None
+                        file_output_full, file_incomplete, file_stop_scan = search_file(
+                            file_fd,
+                            opened_status,
+                            self._scoped_display_path(display_path, item_parts),
+                        )
+                        scan_incomplete = scan_incomplete or file_incomplete
+                        output_full = output_full or file_output_full
+                        stop_scan = stop_scan or file_stop_scan
+                        if output_full or stop_scan:
+                            break
+                    if directory_capped:
+                        scan_incomplete = True
+                        stop_scan = True
+                finally:
+                    os.close(current_fd)
+        finally:
+            os.close(target_fd)
+        _remaining_search_time(deadline)
+        return self._render_scoped_search_matches(
+            matches,
+            output_full or scan_incomplete,
+            output_limit,
+        )
+
+    @staticmethod
+    def _scoped_display_path(base: str, parts: tuple[str, ...]) -> str:
+        prefix = () if base == "." else tuple(PurePosixPath(base).parts)
+        return "/".join((*prefix, *parts)) or "."
+
+    @staticmethod
+    def _render_scoped_search_matches(
+        matches: list[str],
+        truncated: bool,
+        output_limit: int,
+    ) -> str:
+        output = "\n".join(matches)
+        if truncated:
+            marker = "... output truncated"
+            separator = "\n" if output else ""
+            reserved = len(separator) + len(marker)
+            if reserved >= output_limit:
+                return marker[:output_limit]
+            output = output[: output_limit - reserved] + separator + marker
+        return output[:output_limit] or "No matches"[:output_limit]
 
     def _apply_patch(self, run_id: str, patch: str) -> str:
         patches = parse_unified_diff(patch)
@@ -968,4 +1754,118 @@ def _is_dangerous_remove(argv: list[str]) -> bool:
 
 
 def _is_secret_file(name: str) -> bool:
-    return name == ".env" or (name.startswith(".env.") and name != ".env.example")
+    folded = name.casefold()
+    return folded == ".env" or (
+        folded.startswith(".env.") and folded != ".env.example"
+    )
+
+
+def _contains_secret_path_component(path: str) -> bool:
+    return any(_is_secret_file(part) for part in PurePosixPath(path).parts)
+
+
+def _is_git_path_component(name: str) -> bool:
+    return name.casefold() == ".git"
+
+
+@contextmanager
+def _binary_stream_from_fd(descriptor: int) -> Iterator[BinaryIO]:
+    try:
+        stream = cast(BinaryIO, os.fdopen(descriptor, "rb", buffering=0))
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    with stream:
+        yield stream
+
+
+def _bounded_tool_output(
+    output: str,
+    *,
+    character_limit: int,
+    byte_limit: int,
+) -> str:
+    encoded = output.encode("utf-8")
+    if len(output) <= character_limit and len(encoded) <= byte_limit:
+        return output
+    marker = "... output truncated"
+    marker_only = _utf8_prefix(marker, character_limit, byte_limit)
+    separator = "\n"
+    reserved_characters = len(separator) + len(marker)
+    reserved_bytes = len((separator + marker).encode("utf-8"))
+    if character_limit <= reserved_characters or byte_limit <= reserved_bytes:
+        return marker_only
+    prefix = _utf8_prefix(
+        output,
+        character_limit - reserved_characters,
+        byte_limit - reserved_bytes,
+    )
+    return prefix + separator + marker if prefix else marker_only
+
+
+def _utf8_prefix(text: str, character_limit: int, byte_limit: int) -> str:
+    if character_limit <= 0 or byte_limit <= 0:
+        return ""
+    candidate = text[:character_limit]
+    encoded = candidate.encode("utf-8")
+    if len(encoded) <= byte_limit:
+        return candidate
+    return encoded[:byte_limit].decode("utf-8", errors="ignore")
+
+
+def _compile_search_glob(pattern: str) -> SearchGlob:
+    if len(pattern) > SEARCH_MAX_GLOB_CHARS:
+        raise ValueError(f"Glob must be at most {SEARCH_MAX_GLOB_CHARS} characters")
+    parsed = PurePosixPath(pattern)
+    if parsed.is_absolute():
+        raise ValueError("Glob must be relative to the search root")
+    if not parsed.parts:
+        raise ValueError("Glob must not be empty")
+    # PurePosixPath relative globs are right-aligned against candidate path
+    # components. Compile every component once so scans do no repeated glob parsing
+    # or regular-expression compilation.
+    return SearchGlob(
+        components=tuple(re.compile(fnmatch.translate(part)) for part in parsed.parts)
+    )
+
+
+def _compile_search_pattern(query: str) -> regex.Pattern[str]:
+    if len(query) > SEARCH_MAX_QUERY_CHARS:
+        raise ValueError(
+            f"Regular expression must be at most {SEARCH_MAX_QUERY_CHARS} characters"
+        )
+    try:
+        return regex.compile(query)
+    except regex.error as exc:
+        raise ValueError(f"Invalid regular expression: {exc}") from exc
+
+
+def _remaining_search_time(deadline: float) -> float:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise ValueError("Text search exceeded its overall time limit")
+    return remaining
+
+
+def _search_pattern_matches(
+    expression: regex.Pattern[str],
+    line: str,
+    *,
+    deadline: float,
+) -> bool:
+    remaining = _remaining_search_time(deadline)
+    timeout = min(SEARCH_REGEX_TIMEOUT_SECONDS, remaining)
+    overall_deadline_is_tighter = remaining <= SEARCH_REGEX_TIMEOUT_SECONDS
+    try:
+        return expression.search(
+            line,
+            timeout=timeout,
+            concurrent=True,
+        ) is not None
+    except TimeoutError as exc:
+        if overall_deadline_is_tighter:
+            raise ValueError("Text search exceeded its overall time limit") from exc
+        raise ValueError("Regular expression search exceeded its time limit") from exc

@@ -3,6 +3,8 @@ import {
   availableProofTurnIndexes,
   backgroundRunRefreshDelay,
   buildActivityChapters,
+  clarificationPresentation,
+  currentProjectScope,
   effectiveAssistantOutputStatus,
   inferProviderPreset,
   latestWorkspaceInstructionManifest,
@@ -174,6 +176,40 @@ describe("mission control helpers", () => {
   it("presents evidence-backed success distinctly", () => {
     expect(presentState("succeeded")).toEqual({ label: "已证实", tone: "success" });
     expect(presentState("answered")).toEqual({ label: "已答复", tone: "success" });
+  });
+
+  it("presents project selection as a bounded read scope and keeps the selected scope visible", () => {
+    expect(clarificationPresentation("project_scope")).toEqual({
+      eyebrow: "选择项目",
+      title: "选择要处理的项目",
+      detail: "选择后，本轮读取范围会限定在该项目目录内，不会把兄弟目录或项目内部子目录误作项目主体。",
+      submitLabel: "使用此项目",
+      allowsCustomAnswer: false,
+    });
+    expect(clarificationPresentation("requirements")).toMatchObject({
+      title: "这些选择会影响后续回答或执行范围",
+      allowsCustomAnswer: true,
+    });
+
+    const scope = {
+      path: "eval_center_middleware",
+      label: "eval_center_middleware",
+      markers: ["go.mod", "README.md"],
+      selected_by: "clarification" as const,
+      identity: "1:2:3",
+      root_listed: true,
+      evidence_read: ["README.md"],
+    };
+    const run = {
+      turns: [
+        { project_scope: scope },
+        { project_scope: null },
+        { project_scope: { ...scope, selected_by: "inherited" as const } },
+      ],
+    } as unknown as Run;
+
+    expect(currentProjectScope(run)).toEqual({ ...scope, selected_by: "inherited" });
+    expect(currentProjectScope({ turns: [] } as unknown as Run)).toBeNull();
   });
 
   it("settles provisional output labels when the run terminates", () => {

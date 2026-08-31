@@ -15,7 +15,19 @@ Its differentiator is a defensible engineering loop with useful human control.
 
 - **Natural answers before workflow.** Greetings, capability questions, general explanations, and
   explicit read-only analysis end as an honest answer with no fabricated plan or proof. A
-  clarification card appears only after executable intent is clear and a material choice remains.
+  requirements-clarification card appears only after executable intent is clear and a material
+  choice remains. A separate host-generated project picker resolves ambiguous overview requests in
+  multi-project folders before the model runs.
+- **Deterministic project scope.** Direct child projects are detected from real root manifests while
+  temp/cache/build directories, symlinks, README-only folders, and loose report files are excluded.
+  The host snapshots candidate device/inode/ctime identities before selection, and the chosen
+  project becomes a durable per-turn virtual read root. Read-only follow-ups inherit that exact identity;
+  only an adjacent project-focused turn can inherit it, workspace/other-project/explicit-switch
+  requests reset it, and mixed test/start/install/update/run/build/deploy commands stay executable.
+  Repeating the same ambiguous overview starts the same host picker instead of allowing conversation
+  history to guess a nested folder. Scoped reads are off the event loop; list/read/search have hard
+  entry, line, file, tree, scan-byte, regex-time, and persisted-output limits. A project overview
+  cannot end until the model has listed the root and read a root README or manifest.
 - **Agent by default, Plan when requested.** Executable tasks inspect, plan internally, implement,
   and verify without a plan-approval ceremony. Plan mode is an explicit composer toggle that
   pauses on a complete downloadable Markdown plan whenever implementation is actually needed.

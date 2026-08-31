@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import traceforge.agent as agent_module
 from traceforge.agent import AgentManager, InvalidRunAction, PlanDecision, RunConflictError
 from traceforge.config import Settings
 from traceforge.models import (
@@ -19,10 +21,13 @@ from traceforge.models import (
     ClarificationRequest,
     ConversationTurn,
     DecisionKind,
+    DecisionRequest,
     DecisionStatus,
     EventType,
     InteractionMode,
     PlanGate,
+    ProjectCandidate,
+    ProjectScope,
     QuestionOption,
     ReasoningEffort,
     RunRecord,
@@ -33,6 +38,7 @@ from traceforge.models import (
     Verdict,
     WorkspaceInstructionSnapshot,
 )
+from traceforge.project_scope import ProjectInventory
 from traceforge.prompts import (
     BUILDER_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
@@ -46,7 +52,7 @@ from traceforge.provider import (
     ToolArgumentsError,
 )
 from traceforge.sandbox import SandboxStatus
-from traceforge.storage import SecureCheckpointError, Storage
+from traceforge.storage import SecureCheckpointError, Storage, decision_payload_sha256
 from traceforge.streaming import contains_redactable_json_secret, redact_text
 
 
@@ -116,6 +122,30 @@ def _question_response(
             )
         ]
     )
+
+
+def test_legacy_requirements_clarification_subject_remains_acceptable() -> None:
+    clarification = ClarificationRequest(
+        questions=[
+            ClarificationQuestion(
+                id="choice",
+                prompt="Choose",
+                options=[QuestionOption(id="a", label="A"), QuestionOption(id="b", label="B")],
+            )
+        ]
+    )
+    legacy_subject = clarification.model_dump(mode="json")
+    legacy_subject.pop("purpose")
+    receipt = DecisionRequest(
+        run_id="legacy-run",
+        request_id="legacy-request",
+        kind=DecisionKind.CLARIFICATION,
+        turn_index=1,
+        subject_sha256=decision_payload_sha256(legacy_subject),
+        status=DecisionStatus.PENDING,
+    )
+
+    AgentManager._require_clarification_subject(receipt, clarification)
 
 
 @pytest.mark.asyncio
@@ -477,7 +507,7 @@ async def test_planner_prose_correction_resets_after_clarification_and_research(
     )
     manager = AgentManager(settings, storage, provider)
 
-    run = await manager.start_run("介绍一下项目")
+    run = await manager.start_run("研究一下服务定位并说明结论")
     await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
     await manager.answer_clarification(
         run.id, [ClarificationAnswer(question_id="project", option_id="a")]
@@ -504,6 +534,1154 @@ async def test_planner_prose_correction_resets_after_clarification_and_research(
     persisted = json.dumps(completed.messages, ensure_ascii=False)
     assert broad_overview in persisted
     assert researched_overview in persisted
+
+
+def _create_multi_project_workspace(root: Path) -> None:
+    alpha = root / "alpha"
+    alpha.mkdir()
+    (alpha / "go.mod").write_text("module example.com/alpha\n", encoding="utf-8")
+    (alpha / "README.md").write_text("# Alpha service\n", encoding="utf-8")
+    beta = root / "beta"
+    beta.mkdir()
+    (beta / "package.json").write_text('{"name":"beta"}\n', encoding="utf-8")
+    (beta / "README.md").write_text("# BETA SECRET\n", encoding="utf-8")
+    temporary = root / ".tmp_dependency"
+    temporary.mkdir()
+    (temporary / "pyproject.toml").write_text("[project]\nname='noise'\n", encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_multi_project_overview_is_host_clarified_consistently(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider([])
+    manager = AgentManager(settings, storage, provider)
+    snapshots: list[list[dict[str, object]]] = []
+
+    for _index in range(2):
+        run = await manager.start_run("介绍一下项目")
+        await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+        waiting = storage.get_run(run.id)
+        assert waiting.clarification is not None
+        assert waiting.clarification.purpose == "project_scope"
+        assert provider.requests == []
+        assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
+            "alpha",
+            "beta",
+        ]
+        snapshots.append(
+            [
+                candidate.model_dump(mode="json")
+                for candidate in waiting.turns[-1].project_candidates
+            ]
+        )
+        cancelled = await manager.cancel(run.id)
+        assert cancelled.state is RunState.CANCELLED
+
+    assert snapshots[0] == snapshots[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "repeated_prompt",
+    [
+        "介绍一下项目",
+        "项目是做什么的?",
+        "分析一下项目",
+        "介绍一个项目",
+        "介绍任意项目",
+        "What is the project?",
+        "Describe a project",
+        "Describe any project",
+    ],
+)
+async def test_repeated_unqualified_overview_reopens_picker_in_same_task(
+    settings: Settings,
+    storage: Storage,
+    repeated_prompt: str,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall(id="list-alpha", name="list_files", arguments={})]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="read-alpha",
+                        name="read_file",
+                        arguments={"path": "README.md"},
+                    )
+                ]
+            ),
+            _direct_response("Alpha overview", call_id="answer-alpha"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("介绍一下项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    first_picker = storage.get_run(run.id)
+    alpha = next(
+        candidate
+        for candidate in first_picker.turns[-1].project_candidates
+        if candidate.path == "alpha"
+    )
+    first_request = storage.get_active_decision(run.id)
+    assert first_request is not None
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="project_scope", option_id=alpha.id)],
+        request_id=first_request.request_id,
+    )
+    first_answer = await manager.wait(run.id)
+    assert first_answer.state is RunState.ANSWERED
+    assert first_answer.turns[-1].project_scope is not None
+    assert first_answer.turns[-1].project_scope.path == "alpha"
+
+    await manager.follow_up(run.id, repeated_prompt)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    repeated = storage.get_run(run.id)
+
+    assert repeated.clarification is not None
+    assert repeated.clarification.purpose == "project_scope"
+    assert repeated.turns[-1].project_scope is None
+    assert [candidate.path for candidate in repeated.turns[-1].project_candidates] == [
+        "alpha",
+        "beta",
+    ]
+    assert len(provider.requests) == 3
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_project_discovery_runs_off_the_event_loop(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    event_loop_thread = threading.get_ident()
+    worker_threads: list[int] = []
+    real_discover = agent_module.discover_project_candidates
+
+    def record_discovery(root: Path) -> ProjectInventory:
+        worker_threads.append(threading.get_ident())
+        return real_discover(root)
+
+    monkeypatch.setattr(agent_module, "discover_project_candidates", record_discovery)
+    provider = ScriptedProvider([])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍一下项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+
+    assert worker_threads and worker_threads[0] != event_loop_thread
+    assert provider.requests == []
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "介绍 alpha 和 beta 项目",
+        "比较 alpha 和 beta 项目",
+        "Compare alpha and beta projects",
+    ],
+)
+async def test_multiple_explicit_projects_still_require_one_bounded_selection(
+    settings: Settings,
+    storage: Storage,
+    prompt: str,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    gamma = settings.workspace / "gamma"
+    gamma.mkdir()
+    (gamma / "Cargo.toml").write_text("[package]\nname='gamma'\n")
+    provider = ScriptedProvider([])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run(prompt)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.clarification is not None
+    assert waiting.clarification.purpose == "project_scope"
+    assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
+        "alpha",
+        "beta",
+    ]
+    assert provider.requests == []
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt",
+    ["比较这些项目", "介绍这两个项目", "compare both repositories"],
+)
+async def test_implicit_multi_project_request_requires_bounded_selection(
+    settings: Settings,
+    storage: Storage,
+    prompt: str,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider([])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run(prompt)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.clarification is not None
+    assert waiting.clarification.purpose == "project_scope"
+    assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
+        "alpha",
+        "beta",
+    ]
+    assert provider.requests == []
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_explicit_project_beyond_picker_cap_is_still_selected_safely(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    for index in range(55):
+        project = settings.workspace / f"project-{index:03d}"
+        project.mkdir()
+        (project / "package.json").write_text(
+            f'{{"name":"project-{index:03d}"}}\n',
+            encoding="utf-8",
+        )
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="read",
+                        name="read_file",
+                        arguments={"path": "package.json"},
+                    )
+                ]
+            ),
+            _direct_response("Project 051 overview"),
+            ModelResponse(
+                tool_calls=[ToolCall(id="list-follow", name="list_files", arguments={})]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="read-follow",
+                        name="read_file",
+                        arguments={"path": "package.json"},
+                    )
+                ]
+            ),
+            _direct_response("Project 051 details", call_id="answer-follow"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍 project-051 项目")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.turns[-1].project_scope is not None
+    assert completed.turns[-1].project_scope.path == "project-051"
+    assert completed.turns[-1].project_scope.selected_by == "explicit"
+    assert completed.turns[-1].project_candidates == []
+    assert len(provider.requests) == 3
+
+    await manager.follow_up(run.id, "再详细介绍一下")
+    followed = await manager.wait(run.id)
+
+    assert followed.state is RunState.ANSWERED, followed.error
+    assert followed.turns[-1].project_scope is not None
+    assert followed.turns[-1].project_scope.path == "project-051"
+    assert followed.turns[-1].project_scope.selected_by == "inherited"
+    assert len(provider.requests) == 6
+
+
+@pytest.mark.asyncio
+async def test_too_many_explicit_projects_fail_closed_before_picker_validation(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    names = [f"a{index:02d}" for index in range(81)]
+    candidates = [
+        ProjectCandidate(
+            id=f"project_{index:016x}",
+            path=name,
+            label=name,
+            description=f"Test project · {name}/package.json",
+            markers=["package.json"],
+            identity="1:2:3",
+        )
+        for index, name in enumerate(names)
+    ]
+    monkeypatch.setattr(
+        agent_module,
+        "discover_project_candidates",
+        lambda _root: ProjectInventory(
+            candidates=tuple(candidates[:50]),
+            root_is_project=False,
+            root_markers=(),
+            root_identity=None,
+            complete=False,
+        ),
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "lookup_explicit_project_candidates",
+        lambda _root, _request: tuple(candidates[50:]),
+    )
+    # Put cap-exceeding names first so the bounded targeted lookup complements the
+    # first 50 discovered candidates instead of rediscovering only those same entries.
+    prompt = "比较 " + " ".join([*names[50:], *names[:50]])
+    provider = ScriptedProvider([])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run(prompt)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.turns[-1].project_scope is None
+    assert completed.turns[-1].project_candidates == []
+    assert "超过 50 个" in completed.turns[-1].summary
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+async def test_project_picker_rejects_a_directory_replaced_while_waiting(
+    settings: Settings,
+    storage: Storage,
+    restart: bool,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider([])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍一下项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+    alpha = next(
+        candidate
+        for candidate in waiting.turns[-1].project_candidates
+        if candidate.path == "alpha"
+    )
+    providers = [provider]
+    if restart:
+        await manager.shutdown()
+        assert storage.get_run(run.id).state is RunState.INTERRUPTED
+    original_alpha = settings.workspace / "alpha"
+    original_alpha.rename(settings.workspace / "alpha-original")
+    replacement = settings.workspace / "alpha"
+    replacement.mkdir()
+    (replacement / "go.mod").write_text("module attacker.example/replacement\n")
+    (replacement / "README.md").write_text("REPLACEMENT CONTENT MUST NOT BE READ\n")
+
+    if restart:
+        resumed_provider = ScriptedProvider([])
+        providers.append(resumed_provider)
+        manager = AgentManager(settings, storage, resumed_provider)
+        await manager.resume(run.id)
+        await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="project_scope", option_id=alpha.id)],
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED
+    assert "等待选择期间已被移动、删除或替换" in completed.turns[-1].summary
+    assert all(candidate_provider.requests == [] for candidate_provider in providers)
+    assert "REPLACEMENT CONTENT" not in json.dumps(completed.messages)
+
+
+@pytest.mark.asyncio
+async def test_selected_project_scope_blocks_siblings_and_requires_root_evidence(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            _direct_response("Too early", call_id="early-answer"),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="wrong-plan",
+                        name="submit_plan",
+                        arguments=_plan_arguments(["uv", "run", "pytest"]),
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="escape",
+                        name="read_file",
+                        arguments={"path": "../beta/README.md"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[ToolCall(id="root-list", name="list_files", arguments={})]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="root-read",
+                        name="read_file",
+                        arguments={"path": "README.md"},
+                    )
+                ]
+            ),
+            _direct_response("Alpha is a Go service.", call_id="final-answer"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍一下项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+    alpha = next(
+        candidate
+        for candidate in waiting.turns[-1].project_candidates
+        if candidate.path == "alpha"
+    )
+    original_save_run = storage.save_run
+    original_consume_decision = storage.consume_decision
+    atomic_precommit_snapshots = 0
+
+    def reject_non_atomic_scope_save(candidate_run: RunRecord) -> None:
+        active_turn = candidate_run.turns[-1]
+        if (
+            candidate_run.clarification is not None
+            and candidate_run.clarification.purpose == "project_scope"
+            and active_turn.project_scope is not None
+        ):
+            raise AssertionError("Project scope must be persisted with decision consumption")
+        original_save_run(candidate_run)
+
+    def inspect_atomic_scope_commit(candidate_run: RunRecord, *args, **kwargs):
+        nonlocal atomic_precommit_snapshots
+        if candidate_run.turns[-1].project_scope is not None:
+            persisted = storage.get_run(candidate_run.id)
+            assert persisted.clarification is not None
+            assert persisted.clarification.purpose == "project_scope"
+            assert persisted.turns[-1].project_scope is None
+            assert [item.path for item in persisted.turns[-1].project_candidates] == [
+                "alpha",
+                "beta",
+            ]
+            atomic_precommit_snapshots += 1
+        return original_consume_decision(candidate_run, *args, **kwargs)
+
+    monkeypatch.setattr(storage, "save_run", reject_non_atomic_scope_save)
+    monkeypatch.setattr(storage, "consume_decision", inspect_atomic_scope_commit)
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="project_scope", option_id=alpha.id)],
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.turns[-1].project_scope is not None
+    assert completed.turns[-1].project_scope.path == "alpha"
+    assert completed.turns[-1].project_scope.selected_by == "clarification"
+    assert completed.turns[-1].project_scope.root_listed is True
+    assert completed.turns[-1].project_scope.evidence_read == ["README.md"]
+    assert completed.turns[-1].project_candidates == []
+    assert atomic_precommit_snapshots == 1
+    assert len(provider.requests) == 6
+    persisted_messages = json.dumps(completed.messages, ensure_ascii=False)
+    assert "Project overview rejected because required root evidence is missing" in (
+        persisted_messages
+    )
+    assert "read-only project overview" in persisted_messages
+    assert "escapes selected project scope 'alpha'" in persisted_messages
+    assert "BETA SECRET" not in persisted_messages
+    tool_payloads = [
+        json.loads(message["content"])
+        for message in completed.messages
+        if message.get("role") == "tool"
+    ]
+    effective_paths = {
+        payload["metadata"]["effective_path"]
+        for payload in tool_payloads
+        if payload.get("metadata", {}).get("effective_path")
+    }
+    assert effective_paths == {"alpha", "alpha/README.md"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "follow_prompt",
+    ["它用了什么数据库?", "主要功能是什么?", "用什么语言写的?"],
+)
+async def test_explicit_project_overview_skips_picker_and_follow_up_inherits_scope(
+    settings: Settings,
+    storage: Storage,
+    follow_prompt: str,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list-1", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read-1", name="read_file", arguments={"path": "go.mod"})
+                ]
+            ),
+            _direct_response("Alpha overview", call_id="answer-1"),
+            ModelResponse(tool_calls=[ToolCall(id="list-2", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read-2", name="read_file", arguments={"path": "README.md"})
+                ]
+            ),
+            _direct_response("More Alpha details", call_id="answer-2"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍 alpha 项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+    assert first.turns[-1].project_scope is not None
+    assert first.turns[-1].project_scope.path == "alpha"
+    assert first.turns[-1].project_scope.selected_by == "explicit"
+    assert EventType.CLARIFICATION_REQUESTED not in {
+        event.type for event in storage.get_events(run.id)
+    }
+
+    await manager.follow_up(run.id, follow_prompt)
+    completed = await manager.wait(run.id)
+    assert completed.state is RunState.ANSWERED
+    assert completed.turns[-1].project_scope is not None
+    assert completed.turns[-1].project_scope.path == "alpha"
+    assert completed.turns[-1].project_scope.selected_by == "inherited"
+    assert len(provider.requests) == 6
+
+
+@pytest.mark.asyncio
+async def test_negated_project_switch_keeps_the_adjacent_verified_scope(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list-1", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read-1", name="read_file", arguments={"path": "README.md"})
+                ]
+            ),
+            _direct_response("Alpha overview", call_id="answer-1"),
+            ModelResponse(tool_calls=[ToolCall(id="list-2", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read-2", name="read_file", arguments={"path": "README.md"})
+                ]
+            ),
+            _direct_response("Still Alpha", call_id="answer-2"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("介绍 alpha 项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+
+    await manager.follow_up(run.id, "不要换成 beta, 继续介绍这个项目")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.turns[-1].project_scope is not None
+    assert completed.turns[-1].project_scope.path == "alpha"
+    assert completed.turns[-1].project_scope.selected_by == "inherited"
+    assert EventType.CLARIFICATION_REQUESTED not in {
+        event.type
+        for event in storage.get_events(run.id)
+        if event.payload.get("turn_index") == completed.turns[-1].index
+    }
+    assert len(provider.requests) == 6
+    assert "BETA SECRET" not in json.dumps(completed.messages)
+
+
+@pytest.mark.asyncio
+async def test_negated_candidate_does_not_hide_a_positive_project_selection(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list-beta", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="read-beta",
+                        name="read_file",
+                        arguments={"path": "README.md"},
+                    )
+                ]
+            ),
+            _direct_response("Beta overview", call_id="answer-beta"),
+            ModelResponse(
+                tool_calls=[ToolCall(id="list-alpha", name="list_files", arguments={})]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="read-alpha",
+                        name="read_file",
+                        arguments={"path": "README.md"},
+                    )
+                ]
+            ),
+            _direct_response("Alpha overview", call_id="answer-alpha"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("介绍 beta 项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+
+    await manager.follow_up(run.id, "不要换成 beta, 继续介绍 alpha 项目")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.turns[-1].project_scope is not None
+    assert completed.turns[-1].project_scope.path == "alpha"
+    assert completed.turns[-1].project_scope.selected_by == "explicit"
+    assert len(provider.requests) == 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt",
+    ["分析整个工作区", "比较这些项目", "介绍多个项目"],
+)
+async def test_workspace_or_multi_scope_reset_requires_a_fresh_bounded_selection(
+    settings: Settings,
+    storage: Storage,
+    prompt: str,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read", name="read_file", arguments={"path": "README.md"})
+                ]
+            ),
+            _direct_response("Alpha overview"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("介绍 alpha 项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+    assert first.turns[-1].project_scope is not None
+    assert first.turns[-1].project_scope.path == "alpha"
+
+    await manager.follow_up(run.id, prompt)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.clarification is not None
+    assert waiting.clarification.purpose == "project_scope"
+    assert waiting.turns[-1].project_scope is None
+    assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
+        "alpha",
+        "beta",
+    ]
+    assert len(provider.requests) == 3
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_other_project_reset_selects_the_only_other_verified_project(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list-alpha", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="read-alpha",
+                        name="read_file",
+                        arguments={"path": "README.md"},
+                    )
+                ]
+            ),
+            _direct_response("Alpha overview", call_id="answer-alpha"),
+            ModelResponse(tool_calls=[ToolCall(id="list-beta", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="read-beta",
+                        name="read_file",
+                        arguments={"path": "README.md"},
+                    )
+                ]
+            ),
+            _direct_response("Beta overview", call_id="answer-beta"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("介绍 alpha 项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+
+    await manager.follow_up(run.id, "介绍其他项目")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.turns[-1].project_scope is not None
+    assert completed.turns[-1].project_scope.path == "beta"
+    assert completed.turns[-1].project_scope.selected_by == "automatic"
+    assert len(provider.requests) == 6
+
+
+@pytest.mark.asyncio
+async def test_other_project_picker_excludes_the_adjacent_project(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    gamma = settings.workspace / "gamma"
+    gamma.mkdir()
+    (gamma / "Cargo.toml").write_text("[package]\nname='gamma'\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read", name="read_file", arguments={"path": "README.md"})
+                ]
+            ),
+            _direct_response("Alpha overview"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("介绍 alpha 项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+
+    await manager.follow_up(run.id, "介绍其他项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.clarification is not None
+    assert waiting.clarification.purpose == "project_scope"
+    assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
+        "beta",
+        "gamma",
+    ]
+    assert len(provider.requests) == 3
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_current", [False, True])
+async def test_other_project_reset_reports_when_no_other_verified_project_exists(
+    settings: Settings,
+    storage: Storage,
+    replace_current: bool,
+) -> None:
+    alpha = settings.workspace / "alpha"
+    alpha.mkdir()
+    (alpha / "go.mod").write_text("module example.com/alpha\n", encoding="utf-8")
+    (alpha / "README.md").write_text("# Alpha service\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read", name="read_file", arguments={"path": "README.md"})
+                ]
+            ),
+            _direct_response("Alpha overview"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("介绍一下项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+    if replace_current:
+        for child in alpha.iterdir():
+            child.unlink()
+        alpha.rmdir()
+        alpha.mkdir()
+        (alpha / "go.mod").write_text(
+            "module example.com/replaced-alpha\n", encoding="utf-8"
+        )
+
+    await manager.follow_up(run.id, "介绍其他项目")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.turns[-1].project_scope is None
+    assert "没有发现除 alpha 之外的其他可验证项目根" in completed.turns[-1].summary
+    assert len(provider.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_other_project_reset_does_not_reselect_a_manifest_bearing_workspace_root(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    (settings.workspace / "pyproject.toml").write_text(
+        "[project]\nname='workspace-container'\n"
+    )
+    (settings.workspace / "README.md").write_text("# Workspace container\n")
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read", name="read_file", arguments={"path": "README.md"})
+                ]
+            ),
+            _direct_response("Workspace overview"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("介绍一下项目")
+    first = await manager.wait(run.id)
+
+    assert first.state is RunState.ANSWERED, first.error
+    assert first.turns[-1].project_scope is not None
+    assert first.turns[-1].project_scope.path == "."
+
+    await manager.follow_up(run.id, "介绍其他项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.clarification is not None
+    assert waiting.clarification.purpose == "project_scope"
+    assert waiting.turns[-1].project_scope is None
+    assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
+        "alpha",
+        "beta",
+    ]
+    assert len(provider.requests) == 3
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_project_scope_does_not_revive_across_an_unrelated_turn(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read", name="read_file", arguments={"path": "README.md"})
+                ]
+            ),
+            _direct_response("Alpha overview"),
+            _direct_response("你好, 我是 TraceForge。", call_id="greeting"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("介绍 alpha 项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+    assert first.turns[-1].project_scope is not None
+
+    await manager.follow_up(run.id, "你好")
+    greeting = await manager.wait(run.id)
+    assert greeting.state is RunState.ANSWERED
+    assert greeting.turns[-1].project_scope is None
+
+    await manager.follow_up(run.id, "介绍一下项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.clarification is not None
+    assert waiting.clarification.purpose == "project_scope"
+    assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
+        "alpha",
+        "beta",
+    ]
+    assert len(provider.requests) == 4
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_generic_follow_up_never_switches_from_a_missing_or_replaced_project(
+    settings: Settings,
+    storage: Storage,
+    replacement: bool,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read", name="read_file", arguments={"path": "README.md"})
+                ]
+            ),
+            _direct_response("Alpha overview"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+    run = await manager.start_run("介绍 alpha 项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+
+    alpha = settings.workspace / "alpha"
+    alpha.rename(settings.workspace / "alpha-original")
+    if replacement:
+        alpha.mkdir()
+        (alpha / "go.mod").write_text("module attacker.example/replacement\n")
+        (alpha / "README.md").write_text("replacement project\n")
+
+    await manager.follow_up(run.id, "再详细介绍一下")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED
+    assert completed.turns[-1].project_scope is None
+    assert "没有自动切换到其他项目" in completed.turns[-1].summary
+    assert len(provider.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_resume_rebinds_the_persisted_project_scope_before_provider_use(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    alpha = settings.workspace / "alpha"
+    alpha.mkdir()
+    (alpha / "go.mod").write_text("module example.com/alpha\n")
+    identity_stat = alpha.stat(follow_symlinks=False)
+    scope = ProjectScope(
+        path="alpha",
+        label="alpha",
+        markers=["go.mod"],
+        selected_by="explicit",
+        identity=(
+            f"{identity_stat.st_dev}:{identity_stat.st_ino}:"
+            f"{identity_stat.st_ctime_ns}"
+        ),
+    )
+    run = RunRecord(
+        id="resume-project-scope",
+        task="介绍 alpha 项目",
+        workspace=str(settings.workspace),
+        state=RunState.INTERRUPTED,
+        interrupted_from=RunState.PLANNING,
+        turns=[
+            ConversationTurn(
+                index=1,
+                request="介绍 alpha 项目",
+                project_scope=scope,
+            )
+        ],
+    )
+    storage.create_run(run, instruction_snapshot=WorkspaceInstructionSnapshot.empty())
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read", name="read_file", arguments={"path": "go.mod"})
+                ]
+            ),
+            _direct_response("Recovered Alpha overview"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    await manager.resume(run.id)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.turns[-1].project_scope is not None
+    assert completed.turns[-1].project_scope.identity == scope.identity
+    assert completed.turns[-1].project_scope.root_listed is True
+    assert completed.turns[-1].project_scope.evidence_read == ["go.mod"]
+
+
+@pytest.mark.asyncio
+async def test_root_manifest_keeps_overview_at_workspace_root(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    (settings.workspace / "pyproject.toml").write_text(
+        "[project]\nname='root-project'\n",
+        encoding="utf-8",
+    )
+    (settings.workspace / "README.md").write_text("# Root project\n", encoding="utf-8")
+    child = settings.workspace / "packages"
+    child.mkdir()
+    (child / "package.json").write_text('{"name":"nested"}\n', encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="root-list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="root-manifest",
+                        name="read_file",
+                        arguments={"path": "pyproject.toml"},
+                    )
+                ]
+            ),
+            _direct_response("This is the root project."),
+            ModelResponse(tool_calls=[ToolCall(id="child-list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="child-manifest",
+                        name="read_file",
+                        arguments={"path": "package.json"},
+                    )
+                ]
+            ),
+            _direct_response("This is the explicitly selected child project."),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍一下项目")
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    scope = completed.turns[-1].project_scope
+    assert scope is not None
+    assert scope.path == "."
+    assert scope.selected_by == "automatic"
+    assert scope.root_listed is True
+    assert scope.evidence_read == ["pyproject.toml"]
+    assert EventType.CLARIFICATION_REQUESTED not in {
+        event.type for event in storage.get_events(run.id)
+    }
+
+    await manager.follow_up(run.id, "介绍 packages 项目")
+    child_answer = await manager.wait(run.id)
+    child_scope = child_answer.turns[-1].project_scope
+    assert child_scope is not None
+    assert child_scope.path == "packages"
+    assert child_scope.selected_by == "explicit"
+
+
+@pytest.mark.asyncio
+async def test_project_picker_does_not_consume_requirements_clarification_rounds(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read", name="read_file", arguments={"path": "go.mod"})
+                ]
+            ),
+            _question_response("requirements-1", prompt="Which audience?"),
+            _question_response("requirements-2", prompt="Which depth?"),
+            _direct_response("Final scoped overview"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍一下项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+    alpha = next(
+        candidate
+        for candidate in waiting.turns[-1].project_candidates
+        if candidate.path == "alpha"
+    )
+    project_request = storage.get_active_decision(run.id)
+    assert project_request is not None
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="project_scope", option_id=alpha.id)],
+        request_id=project_request.request_id,
+    )
+
+    async with asyncio.timeout(3):
+        while True:
+            first = storage.get_run(run.id)
+            first_request = storage.get_active_decision(run.id)
+            if (
+                first.state is RunState.AWAITING_CLARIFICATION
+                and first.clarification is not None
+                and first.clarification.purpose == "requirements"
+                and first.clarification.round == 1
+                and first_request is not None
+            ):
+                break
+            await asyncio.sleep(0.01)
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="choice", option_id="a")],
+        request_id=first_request.request_id,
+    )
+
+    async with asyncio.timeout(3):
+        while True:
+            second = storage.get_run(run.id)
+            second_request = storage.get_active_decision(run.id)
+            if (
+                second.state is RunState.AWAITING_CLARIFICATION
+                and second.clarification is not None
+                and second.clarification.purpose == "requirements"
+                and second.clarification.round == 2
+                and second_request is not None
+                and second_request.request_id != first_request.request_id
+            ):
+                break
+            await asyncio.sleep(0.01)
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="choice", option_id="b")],
+        request_id=second_request.request_id,
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    project_events = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.CLARIFICATION_REQUESTED
+        and event.payload.get("purpose") == "project_scope"
+    ]
+    requirements_events = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.CLARIFICATION_REQUESTED
+        and event.payload.get("purpose") == "requirements"
+    ]
+    assert len(project_events) == 1
+    assert [event.payload["round"] for event in requirements_events] == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -3050,6 +4228,7 @@ async def test_terminal_transition_scrubs_private_reasoning_before_state_persist
     )
     storage.create_run(run)
     manager = AgentManager(settings, storage, ScriptedProvider([]))
+    manager.tools.bind_project_scope(run.id, ".")
 
     def reject_checkpoint() -> None:
         persisted = storage.get_run(run.id)
@@ -3068,6 +4247,32 @@ async def test_terminal_transition_scrubs_private_reasoning_before_state_persist
     assert persisted.state is RunState.INTERRUPTED
     assert persisted.interrupted_from is RunState.VERIFYING
     assert persisted.provider_reasoning_cleanup_pending is True
+    assert run.id not in manager.tools._project_scopes
+
+
+@pytest.mark.asyncio
+async def test_provider_interruption_releases_live_project_scope(
+    settings: Settings, storage: Storage
+) -> None:
+    manager = AgentManager(settings, storage, ScriptedProvider([]))
+    run = RunRecord(
+        id="scoped-provider-interruption",
+        task="Introduce the selected project",
+        workspace=str(settings.workspace),
+        state=RunState.PLANNING,
+    )
+    storage.create_run(run)
+    manager.tools.bind_project_scope(run.id, ".")
+
+    transitioned = await manager._transition(
+        run,
+        RunState.INTERRUPTED,
+        interruption_reason="model_unavailable",
+    )
+
+    assert transitioned is True
+    assert storage.get_run(run.id).state is RunState.INTERRUPTED
+    assert run.id not in manager.tools._project_scopes
 
 
 @pytest.mark.asyncio

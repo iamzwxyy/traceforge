@@ -121,6 +121,30 @@ Completion review is a third, separate concept. After fresh checks, the verifier
 through a read-only tool surface and cannot mutate files or execute commands. Its pass/fail decision
 does not grant runtime permissions; a rejection only returns bounded findings to the builder.
 
+Ambiguous project overviews in a container workspace use an additional host-owned read boundary.
+Candidate project roots come from bounded manifest-name discovery, not model prose; hidden/temp/
+cache/build directories and symlinks are excluded. Candidate device/inode/ctime identities are
+captured before the picker is shown, and the chosen root is persisted atomically with decision consumption.
+It becomes the virtual root for `list_files`, `read_file`, and `search_text`. Every scoped operation
+opens a temporary root descriptor, checks it against the persisted identity, and traverses each
+component relative to that descriptor with symlink following disabled; scoped search uses the same
+descriptor walker rather than an external pathname-based process. This rejects parent traversal,
+sibling projects, file or directory symlink aliases, deletion, directory replacement, and
+rename-away/restore races without returning buffered content after the identity changes. This
+scope picker is a target-resolution decision, not a grant to mutate files or execute commands.
+
+`.git` path components and `.env`-family basenames are compared case-insensitively before any
+descriptor traversal, so aliases such as `.GIT` and `.ENV.prod` cannot bypass the boundary on the
+default case-insensitive macOS filesystem (and are rejected consistently on Linux).
+
+Scoped list/read/search form a bounded resource boundary. They run outside the API event loop and
+use streaming directory iteration or unbuffered descriptor reads. Listing caps entries and rows;
+file reads cap requested lines, individual line size, scanned file bytes, and UTF-8 persisted
+output. Search additionally caps regular-expression length, per-match time, one total wall-clock
+deadline, files visited, total scanned bytes, and returned text. Invalid or timed-out expressions
+become ordinary failed tool results; oversized/incomplete walks are marked without persisting
+over-budget content.
+
 ## Per-turn action-permission profiles
 
 Every turn freezes one `ApprovalMode` in SQLite and in its immutable conversation-turn snapshot.

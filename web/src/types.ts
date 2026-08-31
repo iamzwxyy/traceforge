@@ -43,6 +43,26 @@ export interface ClarificationQuestion {
 export interface ClarificationRequest {
   questions: ClarificationQuestion[];
   round: number;
+  purpose: "requirements" | "project_scope";
+}
+
+export interface ProjectCandidate {
+  id: string;
+  path: string;
+  label: string;
+  description: string;
+  markers: string[];
+  identity: string;
+}
+
+export interface ProjectScope {
+  path: string;
+  label: string;
+  markers: string[];
+  selected_by: "automatic" | "explicit" | "clarification" | "inherited";
+  identity: string;
+  root_listed: boolean;
+  evidence_read: string[];
 }
 
 export interface AcceptanceCheck {
@@ -149,6 +169,8 @@ export interface ConversationTurn {
   summary: string;
   summary_stream_id: string | null;
   changed_files: string[];
+  project_candidates: ProjectCandidate[];
+  project_scope: ProjectScope | null;
   started_at: string;
   completed_at: string | null;
 }

@@ -4,6 +4,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -893,6 +894,1545 @@ async def test_read_list_search_and_error_results(
     assert not secret.ok and "Secret-bearing" in (secret.error or "")
     assert not backwards.ok and "must not be before" in (backwards.error or "")
     assert found.ok and "notes.txt:2:beta" in found.output
+
+
+@pytest.mark.asyncio
+async def test_unscoped_search_rejects_explicit_environment_paths_and_aliases(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="env-search-boundary", task="Inspect", workspace=str(workspace.root)),
+    )
+    secret = "PASSWORD=plain-environment-secret\n"
+    (workspace.root / ".env").write_text(secret)
+    (workspace.root / ".ENV").write_text(secret)
+    (workspace.root / ".env.prod").write_text(secret)
+    protected_directory = workspace.root / "nested" / ".EnV.prod"
+    protected_directory.mkdir(parents=True)
+    (protected_directory / "settings.txt").write_text(secret)
+    (workspace.root / "environment-alias").symlink_to(workspace.root / ".env")
+    (workspace.root / ".env.example").write_text("EXAMPLE_VALUE=placeholder\n")
+
+    async def reject_subprocess(*_args, **_kwargs):
+        raise AssertionError("protected paths must be rejected before rg starts")
+
+    monkeypatch.setattr(tools_module.shutil, "which", lambda _name: "/usr/bin/rg")
+    monkeypatch.setattr(
+        tools_module.asyncio,
+        "create_subprocess_exec",
+        reject_subprocess,
+    )
+    protected_paths = [
+        ".env",
+        ".ENV",
+        ".env.prod",
+        "nested/.EnV.prod/settings.txt",
+        "environment-alias",
+    ]
+    for index, path in enumerate(protected_paths):
+        result = await registry.execute(
+            "env-search-boundary",
+            ToolCall(
+                id=f"protected-{index}",
+                name="search_text",
+                arguments={"query": "PASSWORD", "path": path},
+            ),
+        )
+        assert not result.ok
+        if path != "environment-alias":
+            assert "Secret-bearing environment paths" in (result.error or "")
+        assert "plain-environment-secret" not in f"{result.output}\n{result.error}"
+
+    monkeypatch.setattr(tools_module.shutil, "which", lambda _name: None)
+    example = await registry.execute(
+        "env-search-boundary",
+        ToolCall(
+            id="allowed-example",
+            name="search_text",
+            arguments={"query": "EXAMPLE_VALUE", "path": ".env.example"},
+        ),
+    )
+    assert example.ok, example.error
+    assert ".env.example:1:EXAMPLE_VALUE=placeholder" in example.output
+
+
+@pytest.mark.asyncio
+async def test_unscoped_listing_streams_a_bounded_number_of_directory_entries(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(20):
+        (workspace.root / f"entry-{index:02}.txt").write_text("bounded\n")
+    monkeypatch.setattr(tools_module, "SCOPED_LIST_MAX_ENTRIES", 5)
+    monkeypatch.setattr(tools_module, "SCOPED_LIST_MAX_ROWS", 100)
+
+    def reject_listdir(_path: object) -> list[str]:
+        raise AssertionError("bounded workspace listing must stream with scandir")
+
+    monkeypatch.setattr(tools_module.os, "listdir", reject_listdir)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="workspace-list-cap", task="Inspect", workspace=str(workspace.root)),
+    )
+
+    result = await registry.execute(
+        "workspace-list-cap",
+        ToolCall(id="list", name="list_files", arguments={}),
+    )
+
+    assert result.ok, result.error
+    assert result.output.endswith("... output truncated")
+    assert len([line for line in result.output.splitlines() if line.startswith("entry-")]) <= 5
+    assert result.metadata == {}
+
+
+@pytest.mark.asyncio
+async def test_unscoped_file_reads_and_search_outputs_obey_hard_resource_caps(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (workspace.root / "oversized.txt").write_text("line\n" * 100)
+    (workspace.root / "long-line.txt").write_text("x" * 40 + "\n")
+    (workspace.root / "matches.txt").write_text(
+        "\n".join(f"needle value {index:03} " + "y" * 20 for index in range(20)) + "\n"
+    )
+    monkeypatch.setattr(tools_module, "SCOPED_READ_MAX_FILE_BYTES", 64)
+    monkeypatch.setattr(tools_module, "SCOPED_READ_MAX_LINE_BYTES", 32)
+    limited = replace(settings, model_output_limit=48, stored_output_limit=40)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        limited,
+        RunRecord(id="workspace-read-caps", task="Inspect", workspace=str(workspace.root)),
+    )
+
+    oversized = await registry.execute(
+        "workspace-read-caps",
+        ToolCall(
+            id="oversized",
+            name="read_file",
+            arguments={"path": "oversized.txt", "start_line": 20, "end_line": 20},
+        ),
+    )
+    long_line = await registry.execute(
+        "workspace-read-caps",
+        ToolCall(id="long-line", name="read_file", arguments={"path": "long-line.txt"}),
+    )
+    searched = await registry.execute(
+        "workspace-read-caps",
+        ToolCall(id="search", name="search_text", arguments={"query": "needle"}),
+    )
+
+    assert not oversized.ok and "read limit" in (oversized.error or "")
+    assert not long_line.ok and "requested line exceeds" in (long_line.error or "")
+    assert searched.ok, searched.error
+    assert searched.output.endswith("... output truncated")
+    assert len(searched.output) <= limited.model_output_limit
+    assert len(searched.output.encode("utf-8")) <= limited.stored_output_limit
+    assert searched.metadata == {}
+
+
+@pytest.mark.asyncio
+async def test_unscoped_reads_run_off_loop_and_reject_rename_to_external_symlink(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raced = workspace.root / "race.txt"
+    raced.write_text("original workspace content\n")
+    outside = workspace.root.parent / "outside-secret.txt"
+    secret = "external secret from rename race"
+    outside.write_text(secret)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="workspace-race", task="Inspect", workspace=str(workspace.root)),
+    )
+    event_loop_thread = threading.get_ident()
+    worker_threads: list[int] = []
+    real_execute = registry._execute_workspace_read
+    real_open = registry._open_scoped_node
+    swapped = False
+
+    def record_execute(call: ToolCall):
+        worker_threads.append(threading.get_ident())
+        return real_execute(call)
+
+    def swap_before_open(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            raced.rename(workspace.root / "race-original.txt")
+            raced.symlink_to(outside)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_execute_workspace_read", record_execute)
+    monkeypatch.setattr(registry, "_open_scoped_node", swap_before_open)
+    result = await registry.execute(
+        "workspace-race",
+        ToolCall(id="read", name="read_file", arguments={"path": "race.txt"}),
+    )
+
+    assert swapped is True
+    assert not result.ok
+    assert secret not in f"{result.output}\n{result.error}"
+    assert worker_threads and worker_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_project_scope_is_the_virtual_root_for_read_tools_and_can_be_cleared(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    beta = workspace.root / "beta"
+    (alpha / "src").mkdir(parents=True)
+    (alpha / "alpha").mkdir()
+    beta.mkdir()
+    (alpha / "README.md").write_text("alpha project\nneedle-alpha\n")
+    (alpha / "alpha" / "README.md").write_text(
+        "nested alpha directory\ninner-only\n"
+    )
+    (alpha / "src" / "main.py").write_text("print('alpha')\n")
+    (beta / "README.md").write_text("beta private payload\n")
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-read", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-read", "alpha")
+
+    listed = await registry.execute(
+        "scoped-read", ToolCall(id="list", name="list_files", arguments={})
+    )
+    read = await registry.execute(
+        "scoped-read",
+        ToolCall(id="read", name="read_file", arguments={"path": "README.md"}),
+    )
+    explicit = await registry.execute(
+        "scoped-read",
+        ToolCall(
+            id="explicit",
+            name="read_file",
+            arguments={"path": "alpha/README.md"},
+        ),
+    )
+    monkeypatch.setattr(tools_module.shutil, "which", lambda _name: None)
+    searched = await registry.execute(
+        "scoped-read",
+        ToolCall(
+            id="search",
+            name="search_text",
+            arguments={"query": "needle-alpha"},
+        ),
+    )
+
+    assert listed.ok
+    listed_paths = set(listed.output.splitlines())
+    assert {"README.md", "src/", "alpha/", "alpha/README.md"} <= listed_paths
+    assert "beta" not in listed.output
+    assert listed.metadata == {
+        "project_scope": "alpha",
+        "requested_path": ".",
+        "effective_path": "alpha",
+    }
+    assert read.ok and "needle-alpha" in read.output
+    assert read.metadata["effective_path"] == "alpha/README.md"
+    assert explicit.ok and "inner-only" in explicit.output
+    assert "needle-alpha" not in explicit.output
+    assert explicit.metadata["effective_path"] == "alpha/alpha/README.md"
+    assert searched.ok and "README.md:2:needle-alpha" in searched.output
+    assert "alpha/README.md:2:needle-alpha" not in searched.output
+    assert searched.metadata["effective_path"] == "alpha"
+    assert "beta private payload" not in "".join(
+        result.output for result in (listed, read, explicit, searched)
+    )
+
+    registry.clear_project_scope("scoped-read")
+    unscoped = await registry.execute(
+        "scoped-read", ToolCall(id="unscoped", name="list_files", arguments={})
+    )
+    assert unscoped.ok and "alpha/" in unscoped.output and "beta/" in unscoped.output
+    assert unscoped.metadata == {}
+
+
+@pytest.mark.asyncio
+async def test_project_scope_rejects_parent_and_symlink_escapes_without_leaking_content(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    beta = workspace.root / "beta"
+    alpha.mkdir()
+    beta.mkdir()
+    secret = "beta private payload must stay hidden"
+    (beta / "secret.txt").write_text(secret)
+    (alpha / "link").symlink_to(beta, target_is_directory=True)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-escape", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-escape", "alpha")
+
+    traversal = await registry.execute(
+        "scoped-escape",
+        ToolCall(
+            id="traversal",
+            name="read_file",
+            arguments={"path": "../beta/secret.txt"},
+        ),
+    )
+    linked_list = await registry.execute(
+        "scoped-escape",
+        ToolCall(
+            id="linked-list",
+            name="list_files",
+            arguments={"path": "link"},
+        ),
+    )
+    linked_search = await registry.execute(
+        "scoped-escape",
+        ToolCall(
+            id="linked-search",
+            name="search_text",
+            arguments={"query": "private payload", "path": "link"},
+        ),
+    )
+
+    for result in (traversal, linked_list, linked_search):
+        assert not result.ok
+        assert "selected project scope" in (result.error or "")
+        assert secret not in f"{result.output}\n{result.error}"
+
+
+@pytest.mark.asyncio
+async def test_scoped_reads_reject_casefolded_git_and_environment_aliases(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    git_directory = alpha / ".GIT"
+    git_directory.mkdir(parents=True)
+    (git_directory / "config").write_text("private git config\n")
+    (alpha / ".ENV").write_text("SECRET=uppercase\n")
+    (alpha / ".ENV.prod").write_text("SECRET=production\n")
+    (alpha / ".ENV.EXAMPLE").write_text("SAFE=example\n")
+    protected_directory = alpha / ".EnV.local"
+    protected_directory.mkdir()
+    directory_secret = "SECRET=protected-directory-payload"
+    (protected_directory / "settings.txt").write_text(directory_secret + "\n")
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-casefold", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-casefold", "alpha")
+
+    listed = await registry.execute(
+        "scoped-casefold", ToolCall(id="list", name="list_files", arguments={})
+    )
+    git_read = await registry.execute(
+        "scoped-casefold",
+        ToolCall(id="git", name="read_file", arguments={"path": ".GIT/config"}),
+    )
+    env_read = await registry.execute(
+        "scoped-casefold",
+        ToolCall(id="env", name="read_file", arguments={"path": ".ENV"}),
+    )
+    env_prod_read = await registry.execute(
+        "scoped-casefold",
+        ToolCall(id="env-prod", name="read_file", arguments={"path": ".ENV.prod"}),
+    )
+    example_read = await registry.execute(
+        "scoped-casefold",
+        ToolCall(id="example", name="read_file", arguments={"path": ".ENV.EXAMPLE"}),
+    )
+    git_search = await registry.execute(
+        "scoped-casefold",
+        ToolCall(
+            id="search",
+            name="search_text",
+            arguments={"query": "private", "path": ".GIT"},
+        ),
+    )
+    env_directory_read = await registry.execute(
+        "scoped-casefold",
+        ToolCall(
+            id="env-directory-read",
+            name="read_file",
+            arguments={"path": ".EnV.local/settings.txt"},
+        ),
+    )
+    env_directory_search = await registry.execute(
+        "scoped-casefold",
+        ToolCall(
+            id="env-directory-search",
+            name="search_text",
+            arguments={"query": "protected-directory-payload"},
+        ),
+    )
+
+    assert listed.ok
+    listed_paths = set(listed.output.splitlines())
+    assert ".GIT" not in listed_paths
+    assert ".ENV" not in listed_paths
+    assert ".ENV.prod" not in listed_paths
+    assert ".EnV.local/" not in listed_paths
+    assert ".ENV.EXAMPLE" in listed_paths
+    for result in (git_read, env_read, env_prod_read, git_search, env_directory_read):
+        assert not result.ok
+        assert "private git config" not in f"{result.output}\n{result.error}"
+        assert "SECRET=" not in f"{result.output}\n{result.error}"
+    assert env_directory_search.ok and env_directory_search.output == "No matches"
+    assert directory_secret not in env_directory_search.output
+    assert example_read.ok and "SAFE=example" in example_read.output
+
+    registry.clear_project_scope("scoped-casefold")
+    unscoped_list = await registry.execute(
+        "scoped-casefold", ToolCall(id="unscoped-list", name="list_files", arguments={})
+    )
+    unscoped_search = await registry.execute(
+        "scoped-casefold",
+        ToolCall(
+            id="unscoped-search",
+            name="search_text",
+            arguments={"query": "protected-directory-payload"},
+        ),
+    )
+    unscoped_read = await registry.execute(
+        "scoped-casefold",
+        ToolCall(
+            id="unscoped-read",
+            name="read_file",
+            arguments={"path": "alpha/.EnV.local/settings.txt"},
+        ),
+    )
+    assert unscoped_list.ok and ".EnV.local" not in unscoped_list.output
+    assert unscoped_search.ok and unscoped_search.output == "No matches"
+    assert not unscoped_read.ok
+    assert directory_secret not in (
+        f"{unscoped_list.output}\n{unscoped_search.output}\n"
+        f"{unscoped_read.output}\n{unscoped_read.error}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_listing_bounds_non_rendered_entries_without_holding_child_fds(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    outside = workspace.root / "outside.txt"
+    alpha.mkdir()
+    outside.write_text("outside\n")
+    for index in range(20):
+        (alpha / f"link-{index:02d}").symlink_to(outside)
+    monkeypatch.setattr(tools_module, "SCOPED_LIST_MAX_ENTRIES", 5)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-list-cap", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-list-cap", "alpha")
+    real_open = tools_module.os.open
+    real_dup = tools_module.os.dup
+    descriptors: list[int] = []
+
+    def record_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def record_dup(descriptor: int) -> int:
+        duplicate = real_dup(descriptor)
+        descriptors.append(duplicate)
+        return duplicate
+
+    def reject_unbounded_listdir(_descriptor):
+        raise AssertionError("scoped listing must stream bounded directory entries")
+
+    monkeypatch.setattr(tools_module.os, "open", record_open)
+    monkeypatch.setattr(tools_module.os, "dup", record_dup)
+    monkeypatch.setattr(tools_module.os, "listdir", reject_unbounded_listdir)
+    result = await registry.execute(
+        "scoped-list-cap", ToolCall(id="list", name="list_files", arguments={})
+    )
+
+    assert result.ok, result.error
+    assert result.output == "... output truncated"
+    assert "outside" not in result.output
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.asyncio
+async def test_scoped_read_enforces_line_scan_and_persisted_output_budgets(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "long-line.txt").write_text("x" * 200 + "\n")
+    (alpha / "oversized.txt").write_text("x" * 1_000)
+    (alpha / "many-lines.txt").write_text(("😀" * 7 + "\n") * 20)
+    monkeypatch.setattr(tools_module, "SCOPED_READ_MAX_FILE_BYTES", 512)
+    monkeypatch.setattr(tools_module, "SCOPED_READ_MAX_LINE_BYTES", 32)
+    limited = replace(settings, model_output_limit=128, stored_output_limit=32)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        limited,
+        RunRecord(id="scoped-read-cap", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-read-cap", "alpha")
+
+    huge_range = await registry.execute(
+        "scoped-read-cap",
+        ToolCall(
+            id="range",
+            name="read_file",
+            arguments={"path": "many-lines.txt", "start_line": 1, "end_line": 1_000_000},
+        ),
+    )
+    long_line = await registry.execute(
+        "scoped-read-cap",
+        ToolCall(id="long", name="read_file", arguments={"path": "long-line.txt"}),
+    )
+    oversized = await registry.execute(
+        "scoped-read-cap",
+        ToolCall(id="oversized", name="read_file", arguments={"path": "oversized.txt"}),
+    )
+    bounded = await registry.execute(
+        "scoped-read-cap",
+        ToolCall(
+            id="bounded",
+            name="read_file",
+            arguments={"path": "many-lines.txt", "start_line": 1, "end_line": 1},
+        ),
+    )
+
+    assert not huge_range.ok
+    assert "at most" in (huge_range.error or "")
+    assert not long_line.ok
+    assert "requested line exceeds" in (long_line.error or "")
+    assert not oversized.ok
+    assert "read limit" in (oversized.error or "")
+    assert bounded.ok, bounded.error
+    assert bounded.output.endswith("... output truncated")
+    assert len(bounded.output) <= limited.model_output_limit
+    assert len(bounded.output.encode("utf-8")) <= limited.stored_output_limit
+
+
+@pytest.mark.asyncio
+async def test_scoped_read_drops_only_a_partial_utf8_tail_at_the_file_budget(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "utf8.txt").write_text("first\n😀 trailing content\n")
+    monkeypatch.setattr(tools_module, "SCOPED_READ_MAX_FILE_BYTES", 8)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-utf8-cap", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-utf8-cap", "alpha")
+
+    result = await registry.execute(
+        "scoped-utf8-cap",
+        ToolCall(
+            id="read",
+            name="read_file",
+            arguments={"path": "utf8.txt", "start_line": 1, "end_line": 1},
+        ),
+    )
+
+    assert result.ok, result.error
+    assert result.output == "     1 | first"
+
+
+@pytest.mark.asyncio
+async def test_scoped_recursive_search_and_reads_never_follow_file_symlinks(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    beta = workspace.root / "beta"
+    alpha.mkdir()
+    beta.mkdir()
+    (alpha / "safe.txt").write_text("safe alpha payload\n")
+    secret = "sibling secret reachable only through a file symlink"
+    (beta / "secret.txt").write_text(secret)
+    (alpha / "secret-link.txt").symlink_to(beta / "secret.txt")
+    for ignored_name in ("node_modules", "build", "vendor"):
+        ignored = alpha / ignored_name
+        ignored.mkdir()
+        (ignored / "dependency.txt").write_text(secret)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-file-link", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-file-link", "alpha")
+
+    listed = await registry.execute(
+        "scoped-file-link", ToolCall(id="list", name="list_files", arguments={})
+    )
+    read = await registry.execute(
+        "scoped-file-link",
+        ToolCall(
+            id="read",
+            name="read_file",
+            arguments={"path": "secret-link.txt"},
+        ),
+    )
+    searched = await registry.execute(
+        "scoped-file-link",
+        ToolCall(id="search", name="search_text", arguments={"query": "sibling secret"}),
+    )
+
+    assert listed.ok and "secret-link" not in listed.output
+    assert all(name not in listed.output for name in ("node_modules", "build", "vendor"))
+    assert not read.ok and "selected project scope" in (read.error or "")
+    assert searched.ok and searched.output == "No matches"
+    assert secret not in "\n".join(
+        f"{result.output}\n{result.error}" for result in (listed, read, searched)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("git_name", [".git", ".GIT"])
+async def test_scoped_listing_and_search_hide_regular_git_metadata_files(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    git_name: str,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    external_path = "/Users/alice/private/repository/.git/worktrees/alpha"
+    (alpha / git_name).write_text(f"gitdir: {external_path}\n")
+    (alpha / "README.md").write_text("safe project content\n")
+    run_id = f"scoped-git-file-{git_name.casefold()}"
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id=run_id, task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope(run_id, "alpha")
+
+    listed = await registry.execute(
+        run_id,
+        ToolCall(id="list", name="list_files", arguments={}),
+    )
+    searched = await registry.execute(
+        run_id,
+        ToolCall(id="search", name="search_text", arguments={"query": "gitdir"}),
+    )
+
+    assert listed.ok, listed.error
+    assert searched.ok, searched.error
+    assert git_name not in listed.output
+    assert searched.output == "No matches"
+    assert external_path not in f"{listed.output}\n{searched.output}"
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_invalid_regex_is_a_normal_tool_failure(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "README.md").write_text("alpha\n")
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-invalid-regex", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-invalid-regex", "alpha")
+    real_open = tools_module.os.open
+    root_descriptors: list[int] = []
+
+    def record_root_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if dir_fd is None and os.fspath(path) == os.fspath(alpha):
+            root_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(tools_module.os, "open", record_root_open)
+
+    result = await registry.execute(
+        "scoped-invalid-regex",
+        ToolCall(id="search", name="search_text", arguments={"query": "["}),
+    )
+
+    assert not result.ok
+    assert result.output == ""
+    assert "Invalid regular expression" in (result.error or "")
+    assert len(root_descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(root_descriptors[0])
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_times_out_pathological_regex_as_a_tool_failure(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "pathological.txt").write_text("a" * 10_000 + "!\n")
+    monkeypatch.setattr(tools_module, "SEARCH_REGEX_TIMEOUT_SECONDS", 0.000_001)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-regex-timeout", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-regex-timeout", "alpha")
+
+    result = await registry.execute(
+        "scoped-regex-timeout",
+        ToolCall(id="search", name="search_text", arguments={"query": "(a+)+$"}),
+    )
+
+    assert not result.ok
+    assert result.output == ""
+    assert result.error == "Regular expression search exceeded its time limit"
+
+
+def test_search_matcher_caps_each_line_to_the_per_match_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_timeouts: list[float] = []
+
+    class FastPattern:
+        def search(self, _line: str, *, timeout: float, concurrent: bool):
+            assert concurrent is True
+            observed_timeouts.append(timeout)
+            return None
+
+    monkeypatch.setattr(tools_module, "SEARCH_REGEX_TIMEOUT_SECONDS", 0.125)
+    monkeypatch.setattr(tools_module, "monotonic", lambda: 10.0)
+
+    matched = tools_module._search_pattern_matches(
+        FastPattern(),
+        "ordinary text",
+        deadline=20.0,
+    )
+
+    assert matched is False
+    assert observed_timeouts == pytest.approx([0.125])
+
+
+@pytest.mark.asyncio
+async def test_search_enforces_one_cumulative_deadline_across_many_lines(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "many-lines.txt").write_text("first\nsecond\nthird\n")
+    clock = [0.0]
+    observed_timeouts: list[float] = []
+
+    class SlowPattern:
+        def search(self, _line: str, *, timeout: float, concurrent: bool):
+            assert concurrent is True
+            observed_timeouts.append(timeout)
+            work = 0.6
+            if work >= timeout:
+                clock[0] += timeout
+                raise TimeoutError
+            clock[0] += work
+            return None
+
+    monkeypatch.setattr(tools_module, "SEARCH_TOTAL_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(tools_module, "SEARCH_REGEX_TIMEOUT_SECONDS", 0.75)
+    monkeypatch.setattr(tools_module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(tools_module, "_compile_search_pattern", lambda _query: SlowPattern())
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="search-total-timeout", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("search-total-timeout", "alpha")
+
+    result = await registry.execute(
+        "search-total-timeout",
+        ToolCall(id="search", name="search_text", arguments={"query": "anything"}),
+    )
+
+    assert not result.ok
+    assert result.output == ""
+    assert result.error == "Text search exceeded its overall time limit"
+    assert observed_timeouts == pytest.approx([0.75, 0.4])
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_rejects_an_unbounded_regex_query(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-regex-size", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-regex-size", "alpha")
+
+    result = await registry.execute(
+        "scoped-regex-size",
+        ToolCall(
+            id="search",
+            name="search_text",
+            arguments={"query": "a" * (tools_module.SEARCH_MAX_QUERY_CHARS + 1)},
+        ),
+    )
+
+    assert not result.ok
+    assert "must be at most" in (result.error or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scoped", [False, True])
+async def test_search_rejects_an_unbounded_glob_before_starting_the_scan(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+    scoped: bool,
+) -> None:
+    target = workspace.root / "alpha" if scoped else workspace.root
+    if scoped:
+        target.mkdir()
+    (target / "README.md").write_text("needle\n")
+    run_id = f"search-glob-size-{scoped}"
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id=run_id, task="Inspect", workspace=str(workspace.root)),
+    )
+    if scoped:
+        registry.bind_project_scope(run_id, "alpha")
+
+    def unexpected_scan(*_args, **_kwargs):
+        raise AssertionError("search scan must not start for an oversized glob")
+
+    monkeypatch.setattr(registry, "_search_text_scoped", unexpected_scan)
+    result = await registry.execute(
+        run_id,
+        ToolCall(
+            id="search",
+            name="search_text",
+            arguments={
+                "query": "needle",
+                "glob": "x" * (tools_module.SEARCH_MAX_GLOB_CHARS + 1),
+            },
+        ),
+    )
+
+    assert not result.ok
+    assert result.output == ""
+    assert result.error == (
+        f"Glob must be at most {tools_module.SEARCH_MAX_GLOB_CHARS} characters"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_compiles_glob_components_once_before_walking_files(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (workspace.root / "src").mkdir()
+    (workspace.root / "nested" / "src").mkdir(parents=True)
+    (workspace.root / "src" / "a.py").write_text("needle a\n")
+    (workspace.root / "src" / "b.py").write_text("needle b\n")
+    (workspace.root / "src" / "ignored.txt").write_text("needle text\n")
+    (workspace.root / "nested" / "src" / "c.py").write_text("needle c\n")
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="search-glob-compiled", task="Inspect", workspace=str(workspace.root)),
+    )
+    real_compile = tools_module.re.compile
+    compiled_components: list[str] = []
+
+    def record_compile(pattern: str, *args, **kwargs):
+        compiled_components.append(pattern)
+        return real_compile(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(tools_module.re, "compile", record_compile)
+    result = await registry.execute(
+        "search-glob-compiled",
+        ToolCall(
+            id="search",
+            name="search_text",
+            arguments={"query": "needle", "glob": "src/*.py"},
+        ),
+    )
+
+    assert result.ok, result.error
+    assert "src/a.py" in result.output
+    assert "src/b.py" in result.output
+    assert "nested/src/c.py" in result.output
+    assert "ignored.txt" not in result.output
+    assert len(compiled_components) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "needle" + "x" * 32_000 + "\n",
+        "needle on a short line\n" * 1_000,
+    ],
+)
+async def test_scoped_search_hard_caps_a_single_long_match_before_persisting_it(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    content: str,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "matches.txt").write_text(content)
+    limited = replace(settings, model_output_limit=128)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        limited,
+        RunRecord(id="scoped-output-cap", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-output-cap", "alpha")
+
+    result = await registry.execute(
+        "scoped-output-cap",
+        ToolCall(id="search", name="search_text", arguments={"query": "needle"}),
+    )
+
+    assert result.ok, result.error
+    assert "needle" in result.output
+    assert result.output.endswith("... output truncated")
+    assert len(result.output) <= limited.model_output_limit
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_bounds_oversized_files_and_no_match_total_scan(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "a-oversized.txt").write_text("hidden-needle " + "x" * 200)
+    (alpha / "b.txt").write_text("ordinary text " + "y" * 50)
+    (alpha / "c.txt").write_text("more ordinary text " + "z" * 50)
+    monkeypatch.setattr(tools_module, "SCOPED_SEARCH_MAX_FILE_BYTES", 96)
+    monkeypatch.setattr(tools_module, "SCOPED_SEARCH_MAX_TOTAL_BYTES", 100)
+    monkeypatch.setattr(tools_module, "SCOPED_SEARCH_MAX_LINE_BYTES", 64)
+    real_fdopen = tools_module.os.fdopen
+    bytes_returned: list[int] = []
+
+    class TrackingStream:
+        def __init__(self, stream) -> None:
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            self.stream.close()
+
+        def readline(self, size: int = -1):
+            value = self.stream.readline(size)
+            bytes_returned.append(len(value))
+            return value
+
+        def read(self, size: int = -1):
+            value = self.stream.read(size)
+            bytes_returned.append(len(value))
+            return value
+
+        def fileno(self) -> int:
+            return self.stream.fileno()
+
+    def track_fdopen(descriptor, *args, **kwargs):
+        stream = real_fdopen(descriptor, *args, **kwargs)
+        mode = kwargs.get("mode", args[0] if args else "r")
+        return TrackingStream(stream) if "b" in mode else stream
+
+    monkeypatch.setattr(tools_module.os, "fdopen", track_fdopen)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-scan-cap", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-scan-cap", "alpha")
+
+    result = await registry.execute(
+        "scoped-scan-cap",
+        ToolCall(id="search", name="search_text", arguments={"query": "absent"}),
+    )
+
+    assert result.ok, result.error
+    assert result.output == "... output truncated"
+    assert "hidden-needle" not in result.output
+    assert len(result.output) <= settings.model_output_limit
+    assert sum(bytes_returned) <= tools_module.SCOPED_SEARCH_MAX_TOTAL_BYTES
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_stops_opening_files_when_the_file_budget_is_exhausted(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "a-first.txt").write_text("ordinary\n")
+    (alpha / "z-never.txt").write_text("late needle\n")
+    monkeypatch.setattr(tools_module, "SCOPED_SEARCH_MAX_FILES", 1)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-file-cap", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-file-cap", "alpha")
+    real_open = tools_module.os.open
+    opened_names: list[str] = []
+
+    def record_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None:
+            opened_names.append(os.fspath(path))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(tools_module.os, "open", record_open)
+    result = await registry.execute(
+        "scoped-file-cap",
+        ToolCall(id="search", name="search_text", arguments={"query": "needle"}),
+    )
+
+    assert result.ok, result.error
+    assert result.output == "... output truncated"
+    assert "a-first.txt" in opened_names
+    assert "z-never.txt" not in opened_names
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_never_evaluates_a_line_larger_than_its_line_budget(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "minified.js").write_text("needle" + "x" * 200)
+    monkeypatch.setattr(tools_module, "SCOPED_SEARCH_MAX_FILE_BYTES", 512)
+    monkeypatch.setattr(tools_module, "SCOPED_SEARCH_MAX_TOTAL_BYTES", 1_024)
+    monkeypatch.setattr(tools_module, "SCOPED_SEARCH_MAX_LINE_BYTES", 64)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-line-cap", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-line-cap", "alpha")
+
+    result = await registry.execute(
+        "scoped-line-cap",
+        ToolCall(id="search", name="search_text", arguments={"query": "needle"}),
+    )
+
+    assert result.ok, result.error
+    assert result.output == "... output truncated"
+    assert "needle" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_scoped_filesystem_search_runs_off_the_event_loop(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "README.md").write_text("alpha needle\n")
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-thread", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-thread", "alpha")
+    event_loop_thread = threading.get_ident()
+    worker_threads: list[int] = []
+    real_execute = registry._execute_scoped_read
+
+    def record_execute(binding: tools_module.ProjectScopeBinding, call: ToolCall):
+        worker_threads.append(threading.get_ident())
+        registry.clear_project_scope("scoped-thread")
+        return real_execute(binding, call)
+
+    monkeypatch.setattr(registry, "_execute_scoped_read", record_execute)
+    result = await registry.execute(
+        "scoped-thread",
+        ToolCall(id="search", name="search_text", arguments={"query": "needle"}),
+    )
+
+    assert result.ok, result.error
+    assert "alpha needle" in result.output
+    assert len(worker_threads) == 1
+    assert worker_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_rejects_file_changed_to_symlink_between_stat_and_open(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    beta = workspace.root / "beta"
+    alpha.mkdir()
+    beta.mkdir()
+    raced = alpha / "race.txt"
+    raced.write_text("ordinary alpha content\n")
+    secret = "sibling payload from a raced symlink"
+    (beta / "secret.txt").write_text(secret)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scoped-link-race", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scoped-link-race", "alpha")
+    real_open = tools_module.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "race.txt" and dir_fd is not None and not swapped:
+            swapped = True
+            raced.unlink()
+            raced.symlink_to(beta / "secret.txt")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(tools_module.os, "open", swap_before_open)
+    searched = await registry.execute(
+        "scoped-link-race",
+        ToolCall(id="search", name="search_text", arguments={"query": "sibling payload"}),
+    )
+
+    assert swapped is True
+    assert not searched.ok
+    assert "replaced after selection" in (searched.error or "")
+    assert secret not in f"{searched.output}\n{searched.error}"
+
+
+@pytest.mark.asyncio
+async def test_bound_project_scope_fails_closed_if_scope_is_replaced_by_symlink(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    beta = workspace.root / "beta"
+    alpha.mkdir()
+    beta.mkdir()
+    (alpha / "README.md").write_text("original alpha\n")
+    secret = "replacement beta payload must stay hidden"
+    (beta / "README.md").write_text(secret)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scope-swap", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scope-swap", "alpha")
+
+    alpha.rename(workspace.root / "alpha-original")
+    alpha.symlink_to(beta, target_is_directory=True)
+
+    results = [
+        await registry.execute(
+            "scope-swap", ToolCall(id="list", name="list_files", arguments={})
+        ),
+        await registry.execute(
+            "scope-swap",
+            ToolCall(id="read", name="read_file", arguments={"path": "README.md"}),
+        ),
+        await registry.execute(
+            "scope-swap",
+            ToolCall(
+                id="search",
+                name="search_text",
+                arguments={"query": "replacement beta payload"},
+            ),
+        ),
+    ]
+
+    for result in results:
+        assert not result.ok
+        assert secret not in f"{result.output}\n{result.error}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call", "hook_name"),
+    [
+        (ToolCall(id="list", name="list_files", arguments={}), "_open_scoped_directory"),
+        (
+            ToolCall(id="read", name="read_file", arguments={"path": "README.md"}),
+            "_open_scoped_node",
+        ),
+        (
+            ToolCall(id="search", name="search_text", arguments={"query": "replacement"}),
+            "_open_scoped_node",
+        ),
+    ],
+)
+async def test_scoped_operations_discard_output_if_root_is_replaced_after_fd_open(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+    call: ToolCall,
+    hook_name: str,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "README.md").write_text("original alpha\n")
+    run_id = f"scope-replaced-during-{call.name}"
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id=run_id, task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope(run_id, "alpha")
+    original_hook = getattr(registry, hook_name)
+    replacement_secret = "replacement content must be discarded"
+    swapped = False
+
+    def replace_after_scope_open(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            alpha.rename(workspace.root / "alpha-original")
+            alpha.mkdir()
+            (alpha / "README.md").write_text(replacement_secret)
+            (alpha / "replacement-only.txt").write_text(replacement_secret)
+        return original_hook(*args, **kwargs)
+
+    monkeypatch.setattr(registry, hook_name, replace_after_scope_open)
+    result = await registry.execute(run_id, call)
+
+    assert swapped is True
+    assert not result.ok
+    assert "replaced after selection" in (result.error or "")
+    assert replacement_secret not in f"{result.output}\n{result.error}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call", "hook_name"),
+    [
+        (
+            ToolCall(id="list", name="list_files", arguments={}),
+            "_open_scoped_directory",
+        ),
+        (
+            ToolCall(id="read", name="read_file", arguments={"path": "README.md"}),
+            "_open_scoped_node",
+        ),
+        (
+            ToolCall(
+                id="search",
+                name="search_text",
+                arguments={"query": "original|replacement"},
+            ),
+            "_open_scoped_node",
+        ),
+    ],
+)
+async def test_scoped_operations_discard_output_after_aba_root_swap(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+    call: ToolCall,
+    hook_name: str,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "README.md").write_text("original alpha payload\n")
+    run_id = f"scope-aba-{call.name}"
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id=run_id, task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope(run_id, "alpha")
+    original_hook = getattr(registry, hook_name)
+    replacement_secret = "replacement ABA secret"
+    swapped = False
+
+    def aba_around_target_open(*args, **kwargs):
+        nonlocal swapped
+        if swapped:
+            return original_hook(*args, **kwargs)
+        swapped = True
+        original_path = workspace.root / "alpha-original"
+        replacement_path = workspace.root / "alpha-replacement"
+        alpha.rename(original_path)
+        alpha.mkdir()
+        (alpha / "README.md").write_text(replacement_secret)
+        (alpha / "replacement-only.txt").write_text(replacement_secret)
+        try:
+            opened = original_hook(*args, **kwargs)
+        finally:
+            alpha.rename(replacement_path)
+            original_path.rename(alpha)
+        return opened
+
+    monkeypatch.setattr(registry, hook_name, aba_around_target_open)
+    result = await registry.execute(run_id, call)
+
+    assert swapped is True
+    assert not result.ok
+    assert "replaced after selection" in (result.error or "")
+    assert replacement_secret not in f"{result.output}\n{result.error}"
+
+
+@pytest.mark.asyncio
+async def test_scoped_operations_close_temporary_root_descriptors(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "README.md").write_text("alpha needle\n")
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scope-fd-close", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope("scope-fd-close", "alpha")
+    real_open = tools_module.os.open
+    real_dup = tools_module.os.dup
+    root_descriptors: list[int] = []
+    all_descriptors: list[int] = []
+
+    def record_root_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        all_descriptors.append(descriptor)
+        if dir_fd is None and os.fspath(path) == os.fspath(alpha):
+            root_descriptors.append(descriptor)
+        return descriptor
+
+    def record_dup(descriptor: int) -> int:
+        duplicate = real_dup(descriptor)
+        all_descriptors.append(duplicate)
+        return duplicate
+
+    monkeypatch.setattr(tools_module.os, "open", record_root_open)
+    monkeypatch.setattr(tools_module.os, "dup", record_dup)
+    calls = [
+        ToolCall(id="list", name="list_files", arguments={}),
+        ToolCall(id="read", name="read_file", arguments={"path": "README.md"}),
+        ToolCall(id="search", name="search_text", arguments={"query": "needle"}),
+    ]
+    for call in calls:
+        descriptor_offset = len(all_descriptors)
+        result = await registry.execute("scope-fd-close", call)
+        assert result.ok, result.error
+        descriptor = root_descriptors[-1]
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+        for temporary_descriptor in all_descriptors[descriptor_offset:]:
+            with pytest.raises(OSError):
+                os.fstat(temporary_descriptor)
+
+    assert len(root_descriptors) == len(calls)
+
+
+def test_binary_stream_wrapper_closes_descriptor_if_fdopen_fails(
+    workspace: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = workspace.root / "fdopen-failure.txt"
+    path.write_text("content\n")
+    descriptor = os.open(path, os.O_RDONLY)
+
+    def reject_fdopen(*_args, **_kwargs):
+        raise OSError("synthetic fdopen failure")
+
+    monkeypatch.setattr(tools_module.os, "fdopen", reject_fdopen)
+    with pytest.raises(OSError, match="synthetic fdopen failure"):
+        with tools_module._binary_stream_from_fd(descriptor):
+            raise AssertionError("unreachable")
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_persisted_project_scope_identity_rejects_replaced_directory_on_rebind(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "README.md").write_text("original alpha\n")
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scope-rebind", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    identity = registry.bind_project_scope("scope-rebind", "alpha")
+
+    alpha.rename(workspace.root / "alpha-original")
+    alpha.mkdir()
+    (alpha / "README.md").write_text("replacement alpha\n")
+
+    restarted_registry = ToolRegistry(workspace, settings)
+    with pytest.raises(ValueError, match="replaced after it was persisted"):
+        restarted_registry.bind_project_scope(
+            "scope-rebind",
+            "alpha",
+            expected_identity=identity,
+        )
+
+
+def test_persisted_project_scope_identity_rejects_same_inode_with_new_ctime(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    (alpha / "README.md").write_text("alpha\n")
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="scope-ctime", task="Inspect alpha", workspace=str(workspace.root)),
+    )
+    current_identity = registry.bind_project_scope("scope-ctime", "alpha")
+    device, inode, ctime_ns = current_identity.split(":")
+    prior_directory_instance = f"{device}:{inode}:{int(ctime_ns) + 1}"
+
+    restarted_registry = ToolRegistry(workspace, settings)
+    with pytest.raises(ValueError, match="replaced after it was persisted"):
+        restarted_registry.bind_project_scope(
+            "scope-ctime",
+            "alpha",
+            expected_identity=prior_directory_instance,
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_files_is_breadth_first_and_ignores_large_workspace_noise(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    noisy = workspace.root / ".tmp_eval_sdk_install"
+    noisy.mkdir()
+    for index in range(1_050):
+        (noisy / f"dependency-{index:04}.py").write_text("ignored\n")
+    for ignored_name in (".idea", ".trae", "_tmp_clone"):
+        ignored = workspace.root / ignored_name
+        ignored.mkdir()
+        (ignored / "package.json").write_text('{"name":"ignored"}\n')
+    alpha = workspace.root / "alpha"
+    zeta = workspace.root / "zeta"
+    alpha.mkdir()
+    zeta.mkdir()
+    (alpha / "pyproject.toml").write_text("[project]\nname='alpha'\n")
+    (zeta / "go.mod").write_text("module example.com/zeta\n")
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id="breadth-first", task="Inspect", workspace=str(workspace.root)),
+    )
+
+    listed = await registry.execute(
+        "breadth-first", ToolCall(id="list", name="list_files", arguments={})
+    )
+
+    assert listed.ok
+    assert "alpha/" in listed.output and "zeta/" in listed.output
+    assert "alpha/pyproject.toml" in listed.output
+    assert "zeta/go.mod" in listed.output
+    assert "output truncated" not in listed.output
+    for ignored_name in (".tmp_eval_sdk_install", ".idea", ".trae", "_tmp_clone"):
+        assert ignored_name not in listed.output
 
 
 @pytest.mark.asyncio
