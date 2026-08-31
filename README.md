@@ -14,20 +14,38 @@ Its differentiator is a defensible engineering loop with useful human control.
 ## Why it stands out
 
 - **Natural answers before workflow.** Greetings, capability questions, general explanations, and
-  explicit read-only analysis end as an honest answer with no fabricated plan or proof. A
-  requirements-clarification card appears only after executable intent is clear and a material
-  choice remains. A separate host-generated project picker resolves ambiguous overview requests in
-  multi-project folders before the model runs.
+  explicit read-only analysis end as an honest answer with no fabricated plan or proof. For both
+  read and executable work, the Planner may ask a requirements question only after inspection when
+  a material choice remains; the host enforces the question schema, stable semantic identity,
+  round limit, and durable answer binding. Before the model runs, a separate host resolver handles
+  every request it classifies as workspace-dependent. It composes the speech act, requested effect,
+  local object evidence, project-target roles, clause polarity, and target cardinality over one
+  canonical semantic view that masks fenced code, inline code, and quoted content literals. An
+  unspecified single-target request in a multi-project folder opens a filesystem-backed project
+  picker; conversations and general knowledge do not acquire a project target from that resolver.
+  A fail-safe `undetermined` software task may inspect and clarify, but any proposed plan requires
+  explicit review instead of being silently auto-approved. This route recognizes imperative,
+  causative, obligation-modal, desired-result, and Chinese disposal constructions while excluding
+  questions, definitions, advice, and other epistemic complements.
 - **Deterministic project scope.** Direct child projects are detected from real root manifests while
   temp/cache/build directories, symlinks, README-only folders, and loose report files are excluded.
-  The host snapshots candidate device/inode/ctime identities before selection, and the chosen
-  project becomes a durable per-turn virtual read root. Read-only follow-ups inherit that exact identity;
-  only an adjacent project-focused turn can inherit it, workspace/other-project/explicit-switch
-  requests reset it, and mixed test/start/install/update/run/build/deploy commands stay executable.
-  Repeating the same ambiguous overview starts the same host picker instead of allowing conversation
-  history to guess a nested folder. Scoped reads are off the event loop; list/read/search have hard
-  entry, line, file, tree, scan-byte, regex-time, and persisted-output limits. A project overview
-  cannot end until the model has listed the root and read a root README or manifest.
+  Each turn exposes a structured `RequestResolution` and, when needed, a filesystem-verified
+  `ProjectTarget`. The host snapshots candidate device/inode/ctime identities before selection,
+  and the chosen project becomes the durable virtual root for reads, writes, and commands. An
+  explicit project or reliable adjacent reference resolves automatically; an unspecified target
+  among multiple projects opens the same bounded picker for introductions, fixes, tests, searches,
+  deployments, and other workspace-dependent work. Repeating an unqualified request cannot revive
+  a stale target; only an explicit adjacent reference such as “this project” can inherit it. A
+  verified `alpha or beta` alternative opens a picker limited to those choices, while a joint
+  `alpha and beta` request remains unsupported by the one-root turn model. Negated alternatives
+  such as `beta instead of alpha` select only the positive target. If the workspace root has its own manifest, it
+  participates beside direct-child projects instead of silently overriding them. A request that
+  explicitly requires multiple projects is reported as unsupported by the current one-root turn
+  model rather than narrowed to one project. Target selection only answers “which project?”—it grants
+  no execution authority, and the existing approval, path-guard, and sandbox policies still decide
+  whether an action may run. Scoped reads remain bounded by entry, line, file, tree, scan-byte,
+  regex-time, and persisted-output limits. Only a manifest-backed whole-project overview
+  additionally requires a root listing and one root README or manifest read before it can finish.
 - **Agent by default, Plan when requested.** Executable tasks inspect, plan internally, implement,
   and verify without a plan-approval ceremony. Plan mode is an explicit composer toggle that
   pauses on a complete downloadable Markdown plan whenever implementation is actually needed.
@@ -318,10 +336,18 @@ uv run python scripts/evaluate_real_model.py \
   --reasoning-effort high
 ```
 
-The current suite has 520 backend tests at 87.53% coverage (with a hard 85% gate), 35 frontend
-unit tests, and 38 serial Chrome tests covering the full evidence loop, automated WCAG A/AA checks,
-keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are locked; CI also
-runs an Ubuntu quality job and a macOS smoke job.
+The backend, frontend, and serial Chrome suites cover the full evidence loop, automated WCAG A/AA
+checks, keyboard-safe dialogs and drawers, responsive layouts, and reload recovery. Dependencies are
+locked; CI also runs an Ubuntu quality job and a macOS smoke job.
+
+Requirement-resolution regressions use a bounded deterministic Chinese/English prompt matrix.
+Each case asserts its expected route and target for unspecified, explicit, inherited, workspace,
+alternative, joint multiple-target, general-knowledge, local-artifact, literal/snippet,
+explanatory, negated, result-state, and executable requests. Separate Agent tests verify
+provider-call suppression, project-picker persistence, host ownership of the project-root question,
+stable requirements semantic keys, adjacent-turn behavior, and the `undetermined` approval ceiling.
+This matrix guards the documented semantic families; it is not presented as a global
+natural-language precision or recall measurement.
 
 ## Repository map
 

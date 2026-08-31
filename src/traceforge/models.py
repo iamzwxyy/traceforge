@@ -147,7 +147,22 @@ class ClarificationQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1, max_length=80)
+    semantic_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z0-9][a-z0-9_.:-]*$",
+    )
     prompt: str = Field(min_length=1, max_length=600)
+    dimension: Literal["target", "scope", "constraint", "acceptance"] | None = None
+    material_effect: Literal[
+        "answer",
+        "files",
+        "behavior",
+        "architecture",
+        "acceptance",
+    ] | None = None
+    rationale: str | None = Field(default=None, min_length=1, max_length=600)
     # A host-generated project picker may need to show every verified project root. The
     # planner-facing ask_questions schema is narrowed back to four options in agent.py.
     options: list[QuestionOption] = Field(min_length=2, max_length=50)
@@ -174,6 +189,13 @@ class ClarificationRequest(BaseModel):
         ids = [question.id for question in self.questions]
         if len(ids) != len(set(ids)):
             raise ValueError("Clarification question ids must be unique")
+        semantic_keys = [
+            question.semantic_key
+            for question in self.questions
+            if question.semantic_key is not None
+        ]
+        if len(semantic_keys) != len(set(semantic_keys)):
+            raise ValueError("Clarification semantic keys must be unique")
         if self.purpose == "requirements" and any(
             len(question.options) > 4 for question in self.questions
         ):
@@ -183,8 +205,33 @@ class ClarificationRequest(BaseModel):
         return self
 
 
+class ResolvedClarification(BaseModel):
+    """One durable user choice, retained after transient planner messages are cleared."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    purpose: Literal["requirements", "project_scope"]
+    question_id: str = Field(min_length=1, max_length=80)
+    semantic_key: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z0-9][a-z0-9_.:-]*$",
+    )
+    prompt: str = Field(min_length=1, max_length=600)
+    dimension: Literal["target", "scope", "constraint", "acceptance"]
+    material_effect: Literal[
+        "answer",
+        "files",
+        "behavior",
+        "architecture",
+        "acceptance",
+    ]
+    answer: str = Field(min_length=1, max_length=1_000)
+    option_id: str | None = Field(default=None, min_length=1, max_length=80)
+
+
 class ProjectCandidate(BaseModel):
-    """A host-verified direct child that can be selected as the logical project root."""
+    """A host-verified workspace root or direct child offered as a project target."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -198,8 +245,10 @@ class ProjectCandidate(BaseModel):
     @model_validator(mode="after")
     def validate_direct_child(self) -> ProjectCandidate:
         path = PurePosixPath(self.path)
-        if path.is_absolute() or len(path.parts) != 1 or path.parts[0] in {".", ".."}:
-            raise ValueError("Project candidates must be direct workspace children")
+        if self.path != "." and (
+            path.is_absolute() or len(path.parts) != 1 or path.parts[0] == ".."
+        ):
+            raise ValueError("Project candidates must be the workspace root or a direct child")
         for marker in self.markers:
             marker_path = PurePosixPath(marker)
             if (
@@ -208,6 +257,110 @@ class ProjectCandidate(BaseModel):
                 or any(part in {".", ".."} for part in marker_path.parts)
             ):
                 raise ValueError("Project candidate markers must be safe relative files")
+        return self
+
+
+class ProjectTarget(BaseModel):
+    """A durable semantic project target that does not itself grant tool permission."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=255)
+    label: str = Field(min_length=1, max_length=120)
+    markers: list[str] = Field(default_factory=list, max_length=20)
+    selected_by: Literal["automatic", "explicit", "clarification", "inherited"]
+    identity: str = Field(pattern=r"^[0-9]+:[0-9]+:[0-9]+$")
+
+    @model_validator(mode="after")
+    def validate_target(self) -> ProjectTarget:
+        path = PurePosixPath(self.path)
+        if self.path != "." and (
+            path.is_absolute() or len(path.parts) != 1 or path.parts[0] == ".."
+        ):
+            raise ValueError("A project target must be the workspace root or a direct child")
+        marker_set = set(self.markers)
+        if any(
+            PurePosixPath(marker).is_absolute()
+            or len(PurePosixPath(marker).parts) > 3
+            or any(part in {".", ".."} for part in PurePosixPath(marker).parts)
+            for marker in marker_set
+        ):
+            raise ValueError("Project target markers must be safe relative files")
+        return self
+
+
+class RequestResolution(BaseModel):
+    """A host-consumable interpretation of one request before planning or answering."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_kind: Literal["conversation", "read", "execute", "undetermined"]
+    workspace_dependent: bool
+    target_reference: Literal[
+        "none",
+        "unspecified",
+        "explicit",
+        "inherited",
+        "workspace",
+        "multiple",
+        "other",
+    ]
+    target_status: Literal[
+        "not_required",
+        "resolved",
+        "clarification_required",
+        "unsupported",
+    ]
+    ambiguity_dimensions: list[
+        Literal["target", "scope", "constraint", "acceptance"]
+    ] = Field(default_factory=list, max_length=4)
+    overview_required: bool = False
+    reasons: list[str] = Field(min_length=1, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> RequestResolution:
+        if len(self.ambiguity_dimensions) != len(set(self.ambiguity_dimensions)):
+            raise ValueError("Request ambiguity dimensions must be unique")
+        if self.work_kind == "conversation":
+            if (
+                self.workspace_dependent
+                or self.target_reference != "none"
+                or self.target_status != "not_required"
+            ):
+                raise ValueError(
+                    "A conversation must be workspace independent and require no target"
+                )
+        elif (
+            not self.workspace_dependent
+            or self.target_reference == "none"
+            or self.target_status == "not_required"
+        ):
+            raise ValueError("Workspace requests must use a workspace target")
+        if self.target_reference == "multiple" and self.target_status != "unsupported":
+            raise ValueError("A multiple target is unsupported by the one-root turn model")
+        if self.target_reference in {"explicit", "workspace"} and (
+            self.target_status != "resolved"
+        ):
+            raise ValueError("An explicit or workspace target must be resolved")
+        if self.target_status in {"clarification_required", "unsupported"} and (
+            "target" not in self.ambiguity_dimensions
+        ):
+            raise ValueError("An unresolved target must declare target ambiguity")
+        if self.target_status == "not_required":
+            if self.workspace_dependent or self.target_reference != "none":
+                raise ValueError("A request without a target must be workspace independent")
+        elif not self.workspace_dependent:
+            raise ValueError("A request with a target must depend on the workspace")
+        if self.overview_required and (
+            self.work_kind != "read" or not self.workspace_dependent
+        ):
+            raise ValueError("Project overview evidence applies only to workspace reads")
+        normalized_reasons = [reason.strip() for reason in self.reasons]
+        if any(not reason or len(reason) > 500 for reason in normalized_reasons):
+            raise ValueError("Resolution reasons must contain 1 to 500 characters")
+        if len(normalized_reasons) != len(set(normalized_reasons)):
+            raise ValueError("Resolution reasons must be unique")
+        self.reasons = normalized_reasons
         return self
 
 
@@ -598,9 +751,41 @@ class ConversationTurn(BaseModel):
     summary_stream_id: str | None = Field(default=None, min_length=1, max_length=64)
     changed_files: list[str] = Field(default_factory=list)
     project_candidates: list[ProjectCandidate] = Field(default_factory=list, max_length=50)
+    resolved_clarifications: list[ResolvedClarification] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+    request_resolution: RequestResolution | None = None
+    project_target: ProjectTarget | None = None
     project_scope: ProjectScope | None = None
     started_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_request_target(self) -> ConversationTurn:
+        if self.request_resolution is None:
+            return self
+        if self.request_resolution.target_status == "resolved":
+            if self.project_target is None:
+                raise ValueError("A resolved request target must persist its project target")
+        elif self.project_target is not None:
+            raise ValueError("Only a resolved request may persist a project target")
+        if self.project_scope is not None:
+            if self.project_target is None:
+                raise ValueError("A project evidence scope requires its resolved target")
+            if (
+                self.project_scope.path != self.project_target.path
+                or self.project_scope.identity != self.project_target.identity
+                or self.project_scope.markers != self.project_target.markers
+            ):
+                raise ValueError("Project evidence scope must match its resolved target")
+        if (
+            self.request_resolution.overview_required
+            and self.request_resolution.target_status == "resolved"
+            and self.project_scope is None
+        ):
+            raise ValueError("A resolved project overview requires an evidence scope")
+        return self
 
 
 class ProofRollback(BaseModel):

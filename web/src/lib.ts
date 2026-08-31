@@ -1,8 +1,11 @@
 import type {
+  AmbiguityDimension,
   ClarificationRequest,
   ProofPack,
   ProjectScope,
+  ProjectTarget,
   ReasoningEffort,
+  RequestResolution,
   Run,
   RunEvent,
   RunState,
@@ -24,18 +27,68 @@ export function clarificationPresentation(
   if (purpose === "project_scope") {
     return {
       eyebrow: "选择项目",
-      title: "选择要处理的项目",
-      detail: "选择后，本轮读取范围会限定在该项目目录内，不会把兄弟目录或项目内部子目录误作项目主体。",
-      submitLabel: "使用此项目",
+      title: "选择本轮的目标项目",
+      detail: "选择只确定本轮目标，不授予执行权限。读取、写入和命令都受该项目边界约束；执行仍按当前审批与沙箱策略处理。",
+      submitLabel: "确认目标项目",
       allowsCustomAnswer: false,
     };
   }
   return {
     eyebrow: "需求澄清",
-    title: "这些选择会影响后续回答或执行范围",
-    detail: "TraceForge 会依据这些选择继续分析、回答或规划。",
+    title: "确认会实质影响结果的选择",
+    detail: "问题只涉及仍会改变目标、范围、约束或验收的选择。需求澄清最多两轮，项目目标选择不占用该额度。",
     submitLabel: "继续",
     allowsCustomAnswer: true,
+  };
+}
+
+export function currentProjectTarget(
+  run: Pick<Run, "turns">,
+): ProjectTarget | null {
+  const turn = run.turns.at(-1);
+  return turn?.project_target ?? turn?.project_scope ?? null;
+}
+
+export function currentRequestResolution(
+  run: Pick<Run, "turns">,
+): RequestResolution | null {
+  return run.turns.at(-1)?.request_resolution ?? null;
+}
+
+export interface RequestResolutionPresentation {
+  workKind: string;
+  targetStatus: string;
+  ambiguityDimensions: string[];
+}
+
+const ambiguityDimensionLabels: Record<AmbiguityDimension, string> = {
+  target: "目标",
+  scope: "范围",
+  constraint: "约束",
+  acceptance: "验收",
+};
+
+export function requestResolutionPresentation(
+  resolution: RequestResolution,
+): RequestResolutionPresentation {
+  const workKind = {
+    conversation: "对话",
+    read: "只读",
+    execute: "执行",
+    undetermined: "待判定",
+  }[resolution.work_kind];
+  const targetStatus = {
+    not_required: "无需项目目标",
+    resolved: "目标已确定",
+    clarification_required: "需要选择项目",
+    unsupported: "当前目标范围不受支持",
+  }[resolution.target_status];
+  return {
+    workKind,
+    targetStatus,
+    ambiguityDimensions: resolution.ambiguity_dimensions.map(
+      (dimension) => ambiguityDimensionLabels[dimension],
+    ),
   };
 }
 

@@ -96,11 +96,17 @@ def _direct_response(content: str, *, call_id: str = "respond") -> ModelResponse
     )
 
 
+def _execution_request(_scenario: str, *, path: str = "note.txt") -> str:
+    return f"Update {path} in the workspace."
+
+
 def _question_response(
     call_id: str,
     *,
     question_id: str = "choice",
+    semantic_key: str | None = None,
     prompt: str = "Choose one",
+    dimension: str = "scope",
 ) -> ModelResponse:
     return ModelResponse(
         tool_calls=[
@@ -111,7 +117,34 @@ def _question_response(
                     "questions": [
                         {
                             "id": question_id,
+                            "semantic_key": semantic_key or f"scope.{question_id}",
                             "prompt": prompt,
+                            "dimension": dimension,
+                            "material_effect": "behavior",
+                            "rationale": "The alternatives change the requested behavior.",
+                            "options": [
+                                {"id": "a", "label": "A"},
+                                {"id": "b", "label": "B"},
+                            ],
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+
+
+def _unclassified_question_response(call_id: str) -> ModelResponse:
+    return ModelResponse(
+        tool_calls=[
+            ToolCall(
+                id=call_id,
+                name="ask_questions",
+                arguments={
+                    "questions": [
+                        {
+                            "id": "choice",
+                            "prompt": "Choose one",
                             "options": [
                                 {"id": "a", "label": "A"},
                                 {"id": "b", "label": "B"},
@@ -177,10 +210,89 @@ async def test_conversational_request_is_answered_without_false_workflow(
         schema["function"]["name"] for schema in (provider.requests[0][1] or [])
     }
     assert "respond_to_user" in tool_names
-    assert "Simplified Chinese" in str(provider.requests[0][0][0]["content"])
+    first_system = str(provider.requests[0][0][0]["content"])
+    assert "Simplified Chinese" in first_system
+    assert "TraceForge host request resolution (trusted classification):" in first_system
+    assert '"work_kind":\n"conversation"' in first_system
+    assert '"workspace_dependent":\nfalse' in first_system
+    assert '"target_reference":\n"none"' in first_system
+    assert '"target_status":\n"not_required"' in first_system
+    assert '"overview_required":\nfalse' in first_system
+    assert '"ambiguity_dimensions":\n[]' in first_system
 
     with pytest.raises(InvalidRunAction, match="no file changes"):
         await manager.rollback(run.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", ["你好", "What is binary search?"])
+async def test_workspace_independent_conversation_rejects_provider_reads_and_plan(
+    settings: Settings,
+    storage: Storage,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="blocked-list", name="list_files", arguments={})
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="blocked-read",
+                        name="read_file",
+                        arguments={"path": "README.md"},
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="blocked-plan",
+                        name="submit_plan",
+                        arguments=_plan_arguments(["python", "-m", "pytest"]),
+                    )
+                ]
+            ),
+            _direct_response("Direct conversational answer"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    async def reject_workspace_execution(*_args, **_kwargs):
+        raise AssertionError("workspace tools must not execute for a conversation")
+
+    monkeypatch.setattr(manager.tools, "execute", reject_workspace_execution)
+    run = await manager.start_run(prompt)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.plan is None
+    assert completed.turns[-1].project_target is None
+    resolution = completed.turns[-1].request_resolution
+    assert resolution is not None
+    assert resolution.workspace_dependent is False
+    assert resolution.work_kind == "conversation"
+    assert len(provider.requests) == 4
+    blocked_results = [
+        ToolResult.model_validate_json(str(message["content"]))
+        for message in completed.messages
+        if message.get("tool_call_id")
+        in {"blocked-list", "blocked-read", "blocked-plan"}
+    ]
+    assert len(blocked_results) == 3
+    assert all(not result.ok for result in blocked_results)
+    assert all(
+        "workspace-independent conversation" in (result.error or "")
+        for result in blocked_results
+    )
+    event_types = [event.type for event in storage.get_events(run.id)]
+    assert EventType.TOOL_COMPLETED not in event_types
+    assert EventType.PLAN_GATED not in event_types
+    assert storage.list_snapshots(run.id) == []
 
 
 @pytest.mark.asyncio
@@ -303,7 +415,10 @@ async def test_response_limit_resume_preserves_concise_regeneration_instruction(
             first_storage,
             InterruptingProvider(),
         )
-        run = await first_manager.start_run("Review note.txt", verifier_enabled=False)
+        run = await first_manager.start_run(
+            _execution_request("response-limit recovery"),
+            verifier_enabled=False,
+        )
         interrupted = await first_manager.wait(run.id)
         assert interrupted.state is RunState.INTERRUPTED
         assert "Regenerate the next action concisely" not in json.dumps(
@@ -585,6 +700,559 @@ async def test_ambiguous_multi_project_overview_is_host_clarified_consistently(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "prompt",
+    [
+        "检查项目依赖",
+        "搜索认证逻辑",
+        "修复登录问题",
+        "运行测试",
+        "部署服务",
+        "Check dependencies",
+        "Search for the authentication flow",
+        "Fix the login issue",
+        "Run the tests",
+        "Deploy the service",
+    ],
+)
+async def test_all_workspace_request_families_share_host_target_resolution(
+    settings: Settings,
+    storage: Storage,
+    prompt: str,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider([])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run(prompt)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+    turn = waiting.turns[-1]
+
+    assert waiting.clarification is not None
+    assert waiting.clarification.purpose == "project_scope"
+    assert turn.request_resolution is not None
+    assert turn.request_resolution.workspace_dependent is True
+    assert turn.request_resolution.target_status == "clarification_required"
+    assert turn.request_resolution.ambiguity_dimensions == ["target"]
+    assert [candidate.path for candidate in turn.project_candidates] == ["alpha", "beta"]
+    assert turn.project_target is None
+    assert provider.requests == []
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "expected_path", "work_kind"),
+    [
+        ("检查 alpha 项目的依赖", "alpha", "read"),
+        ("Search the beta codebase", "beta", "read"),
+        ("修复 alpha 项目的登录问题", "alpha", "execute"),
+        ("Run the beta project tests", "beta", "execute"),
+        ("部署 beta 项目的服务", "beta", "execute"),
+    ],
+)
+async def test_explicit_targets_resolve_before_the_first_model_request(
+    settings: Settings,
+    storage: Storage,
+    prompt: str,
+    expected_path: str,
+    work_kind: str,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider([_direct_response("目标已解析。")])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run(prompt)
+    completed = await manager.wait(run.id)
+    turn = completed.turns[-1]
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert turn.project_target is not None
+    assert turn.project_target.path == expected_path
+    assert turn.project_target.selected_by == "explicit"
+    assert turn.request_resolution is not None
+    assert turn.request_resolution.work_kind == work_kind
+    assert turn.request_resolution.target_status == "resolved"
+    assert len(provider.requests) == 1
+    target_context = next(
+        str(message["content"])
+        for message in provider.requests[0][0]
+        if "TraceForge host-selected project target"
+        in str(message.get("content", ""))
+    )
+    assert f'"{expected_path}"' in target_context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "你好",
+        "Python 的 GIL 是什么?",
+        "pytest fixture scope 是什么?",
+        "项目管理是什么?",
+        "如何做项目估算?",
+        "介绍开源项目的许可证类型",
+        "解释 Kubernetes Deployment 的滚动更新",
+        "What is binary search?",
+        "What is project management?",
+        "How do open-source projects choose licenses?",
+        "How does TCP congestion control work?",
+    ],
+)
+async def test_general_questions_do_not_false_trigger_project_clarification(
+    settings: Settings,
+    storage: Storage,
+    prompt: str,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider([_direct_response("这是一个通用问题。")])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run(prompt)
+    completed = await manager.wait(run.id)
+    turn = completed.turns[-1]
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.clarification is None
+    assert turn.project_target is None
+    assert turn.request_resolution is not None
+    assert turn.request_resolution.target_status == "not_required"
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_project_selection_for_execute_work_allows_a_scoped_plan_without_authorizing_it(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="plan-login-fix",
+                        name="submit_plan",
+                        arguments=_plan_arguments(["go", "test", "./..."]),
+                    )
+                ]
+            )
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("修复登录问题", mode=InteractionMode.PLAN)
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+    alpha = next(
+        candidate
+        for candidate in waiting.turns[-1].project_candidates
+        if candidate.path == "alpha"
+    )
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="project_scope", option_id=alpha.id)],
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    planned = storage.get_run(run.id)
+    turn = planned.turns[-1]
+
+    assert turn.project_target is not None
+    assert turn.project_target.path == "alpha"
+    assert turn.project_scope is None
+    assert turn.request_resolution is not None
+    assert turn.request_resolution.work_kind == "execute"
+    assert turn.request_resolution.target_status == "resolved"
+    assert turn.request_resolution.ambiguity_dimensions == []
+    assert turn.request_resolution.reasons == [
+        "The user selected verified project target alpha from the host-provided options."
+    ]
+    assert planned.plan is not None
+    assert planned.plan.impacted_files == ["result.txt"]
+    assert planned.plan_approved is False
+    assert len(provider.requests) == 1
+    assert manager._clarification_round(run.id) == 0
+    first_system = str(provider.requests[0][0][0]["content"])
+    assert "TraceForge host-selected project target (trusted boundary):" in first_system
+    assert "TraceForge host request resolution (trusted classification):" in first_system
+    assert '"work_kind":\n"execute"' in first_system
+    assert '"workspace_dependent":\ntrue' in first_system
+    assert '"target_status":\n"resolved"' in first_system
+    assert '"ambiguity_dimensions":\n[]' in first_system
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_project_picker_semantic_key_cannot_be_reasked_as_a_requirement(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            _question_response(
+                "repeat-project-target",
+                question_id="project_target_again",
+                semantic_key="target.project_root",
+                prompt="Which project should I use?",
+            ),
+            _direct_response("已按首次选择的项目继续。", call_id="answer"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("检查项目依赖")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+    alpha = next(
+        candidate
+        for candidate in waiting.turns[-1].project_candidates
+        if candidate.path == "alpha"
+    )
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="project_scope", option_id=alpha.id)],
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert len(provider.requests) == 2
+    assert [
+        (item.purpose, item.semantic_key)
+        for item in completed.turns[-1].resolved_clarifications
+    ] == [("project_scope", "target.project_root")]
+    assert "project root is resolved only by the host" in json.dumps(
+        completed.messages
+    )
+    requirement_requests = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.CLARIFICATION_REQUESTED
+        and event.payload.get("purpose") == "requirements"
+    ]
+    assert requirement_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "prompt", "expected_target"),
+    [
+        ("explicit", "检查 alpha 项目的依赖", "alpha"),
+        ("automatic", "检查项目依赖", "alpha"),
+        ("conversation", "你好", None),
+    ],
+)
+async def test_model_cannot_ask_for_a_host_owned_project_root_on_any_route(
+    settings: Settings,
+    storage: Storage,
+    route: str,
+    prompt: str,
+    expected_target: str | None,
+) -> None:
+    if route == "explicit":
+        _create_multi_project_workspace(settings.workspace)
+    elif route == "automatic":
+        alpha = settings.workspace / "alpha"
+        alpha.mkdir()
+        (alpha / "go.mod").write_text(
+            "module example.com/alpha\n", encoding="utf-8"
+        )
+    provider = ScriptedProvider(
+        [
+            _question_response(
+                "host-owned-target",
+                question_id="project_root_again",
+                semantic_key="target.project_root",
+                prompt="Which project should I use?",
+                dimension="target",
+            ),
+            _direct_response("继续处理。", call_id="answer"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run(prompt)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert len(provider.requests) == 2
+    target = completed.turns[-1].project_target
+    assert (None if target is None else target.path) == expected_target
+    assert "project root is resolved only by the host" in json.dumps(
+        completed.messages
+    )
+    requirement_requests = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.CLARIFICATION_REQUESTED
+        and event.payload.get("purpose") == "requirements"
+    ]
+    assert requirement_requests == []
+
+
+@pytest.mark.asyncio
+async def test_literal_project_name_cannot_bypass_the_host_picker(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider([])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run(
+        "Inspect the repository and explain this snippet:\n"
+        "```text\nDeploy the beta project\n```"
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.clarification is not None
+    assert waiting.clarification.purpose == "project_scope"
+    assert waiting.turns[-1].project_target is None
+    assert waiting.turns[-1].request_resolution is not None
+    assert waiting.turns[-1].request_resolution.work_kind == "read"
+    assert waiting.turns[-1].request_resolution.target_status == "clarification_required"
+    assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
+        "alpha",
+        "beta",
+    ]
+    assert provider.requests == []
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_undetermined_workspace_task_requires_explicit_plan_review(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="uncertain-plan",
+                        name="submit_plan",
+                        arguments=_plan_arguments(["go", "test", "./..."]),
+                    )
+                ]
+            )
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Make the login work")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+    alpha = next(
+        candidate
+        for candidate in waiting.turns[-1].project_candidates
+        if candidate.path == "alpha"
+    )
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="project_scope", option_id=alpha.id)],
+    )
+    await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
+    planned = storage.get_run(run.id)
+
+    assert planned.turns[-1].request_resolution is not None
+    assert planned.turns[-1].request_resolution.work_kind == "undetermined"
+    assert planned.plan_gate is not None
+    assert planned.plan_gate.decision == "approval_required"
+    assert planned.plan_gate.risk in {"medium", "high"}
+    assert any(
+        "could not prove the requested effect" in reason
+        for reason in planned.plan_gate.reasons
+    )
+    assert planned.plan_approved is False
+    assert len(provider.requests) == 1
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_read_request_project_picker_does_not_authorize_provider_plan(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="blocked-read-plan",
+                        name="submit_plan",
+                        arguments=_plan_arguments(["go", "test", "./..."]),
+                    )
+                ]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="allowed-read",
+                        name="read_file",
+                        arguments={"path": "go.mod"},
+                    )
+                ]
+            ),
+            _direct_response("依赖信息已检查。", call_id="answer"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("检查项目依赖")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+    alpha = next(
+        candidate
+        for candidate in waiting.turns[-1].project_candidates
+        if candidate.path == "alpha"
+    )
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="project_scope", option_id=alpha.id)],
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.plan is None
+    assert completed.turns[-1].project_target is not None
+    assert completed.turns[-1].project_target.path == "alpha"
+    blocked_result = next(
+        ToolResult.model_validate_json(str(message["content"]))
+        for message in completed.messages
+        if message.get("tool_call_id") == "blocked-read-plan"
+    )
+    assert blocked_result.ok is False
+    assert "classified this turn as read-only" in (blocked_result.error or "")
+    tool_events = [
+        event
+        for event in storage.get_events(run.id)
+        if event.type is EventType.TOOL_COMPLETED
+    ]
+    assert [event.payload["call"]["name"] for event in tool_events] == ["read_file"]
+    event_types = [event.type for event in storage.get_events(run.id)]
+    assert EventType.PLAN_GATED not in event_types
+    assert storage.list_snapshots(run.id) == []
+
+
+@pytest.mark.asyncio
+async def test_requirement_questions_must_declare_material_ambiguity_contract(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            _unclassified_question_response("missing-contract"),
+            _question_response("classified-question"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("修复缓存问题")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.clarification is not None
+    question = waiting.clarification.questions[0]
+    assert question.dimension == "scope"
+    assert question.material_effect == "behavior"
+    assert question.rationale
+    assert len(provider.requests) == 2
+    assert "Requirement clarification must give every question a stable semantic key" in json.dumps(
+        waiting.messages,
+        ensure_ascii=False,
+    )
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_requirement_answers_are_durable_followup_context(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            _question_response(
+                "scope-question",
+                question_id="migration_scope",
+                prompt="是否迁移调用方?",
+            ),
+            _direct_response("已记录迁移范围。", call_id="first-answer"),
+            _direct_response("继续按已确认范围处理。", call_id="follow-answer"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("修复缓存问题")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="migration_scope", option_id="a")],
+    )
+    first = await manager.wait(run.id)
+
+    assert first.state is RunState.ANSWERED
+    assert len(first.turns[-1].resolved_clarifications) == 1
+    resolved = first.turns[-1].resolved_clarifications[0]
+    assert resolved.dimension == "scope"
+    assert resolved.answer == "A"
+
+    await manager.follow_up(run.id, "继续修复它")
+    followed = await manager.wait(run.id)
+
+    assert followed.state is RunState.ANSWERED, followed.error
+    request_content = "\n".join(
+        str(message.get("content", "")) for message in provider.requests[-1][0]
+    )
+    assert "Confirmed user choices" in request_content
+    assert "是否迁移调用方?" in request_content
+    assert '"dimension":\n"scope"' in request_content
+    assert '"answer":\n"A"' in request_content
+
+
+@pytest.mark.asyncio
+async def test_requirement_semantic_key_cannot_be_reasked_with_a_new_question_id(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            _question_response(
+                "first-question",
+                question_id="migration_scope_v1",
+                semantic_key="scope.migration",
+                prompt="是否迁移调用方?",
+            ),
+            _question_response(
+                "renamed-question",
+                question_id="migration_scope_v2",
+                semantic_key="scope.migration",
+                prompt="再确认一次迁移范围?",
+            ),
+            _direct_response("已按首次选择继续。", call_id="answer"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("修复缓存问题")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="migration_scope_v1", option_id="a")],
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert len(completed.turns[-1].resolved_clarifications) == 1
+    assert completed.turns[-1].resolved_clarifications[0].semantic_key == "scope.migration"
+    assert "repeated choices already resolved" in json.dumps(completed.messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "repeated_prompt",
     [
         "介绍一下项目",
@@ -647,8 +1315,91 @@ async def test_repeated_unqualified_overview_reopens_picker_in_same_task(
 
     assert repeated.clarification is not None
     assert repeated.clarification.purpose == "project_scope"
+    assert repeated.turns[-1].project_target is None
     assert repeated.turns[-1].project_scope is None
     assert [candidate.path for candidate in repeated.turns[-1].project_candidates] == [
+        "alpha",
+        "beta",
+    ]
+    assert len(provider.requests) == 3
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_adjacent_explicit_reference_inherits_target_across_read_and_execute(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall(id="list-alpha", name="list_files", arguments={})]
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="read-alpha",
+                        name="read_file",
+                        arguments={"path": "README.md"},
+                    )
+                ]
+            ),
+            _direct_response("Alpha overview", call_id="answer-alpha"),
+            _direct_response("将在所选项目中运行测试。", call_id="answer-run"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍 alpha 项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+
+    await manager.follow_up(run.id, "在这个项目运行测试")
+    completed = await manager.wait(run.id)
+    turn = completed.turns[-1]
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert turn.project_target is not None
+    assert turn.project_target.path == "alpha"
+    assert turn.project_target.selected_by == "inherited"
+    assert turn.project_scope is None
+    assert turn.request_resolution is not None
+    assert turn.request_resolution.work_kind == "execute"
+    assert turn.request_resolution.target_reference == "inherited"
+
+
+@pytest.mark.asyncio
+async def test_unqualified_execute_request_reopens_picker_after_a_selected_project(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    provider = ScriptedProvider(
+        [
+            ModelResponse(tool_calls=[ToolCall(id="list", name="list_files", arguments={})]),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(id="read", name="read_file", arguments={"path": "README.md"})
+                ]
+            ),
+            _direct_response("Alpha overview"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍 alpha 项目")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED
+
+    await manager.follow_up(run.id, "运行测试")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.clarification is not None
+    assert waiting.clarification.purpose == "project_scope"
+    assert waiting.turns[-1].project_target is None
+    assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
         "alpha",
         "beta",
     ]
@@ -684,6 +1435,35 @@ async def test_project_discovery_runs_off_the_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_root_manifest_does_not_override_multi_project_target_ambiguity(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    (settings.workspace / "pyproject.toml").write_text(
+        '[project]\nname = "workspace-root"\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
+    provider = ScriptedProvider([])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍一下项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+
+    assert waiting.clarification is not None
+    assert waiting.clarification.purpose == "project_scope"
+    assert waiting.turns[-1].project_target is None
+    assert [item.path for item in waiting.turns[-1].project_candidates] == [
+        ".",
+        "alpha",
+        "beta",
+    ]
+    assert provider.requests == []
+    await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "prompt",
     [
@@ -692,7 +1472,7 @@ async def test_project_discovery_runs_off_the_event_loop(
         "Compare alpha and beta projects",
     ],
 )
-async def test_multiple_explicit_projects_still_require_one_bounded_selection(
+async def test_multiple_explicit_projects_are_not_silently_reduced_to_one_target(
     settings: Settings,
     storage: Storage,
     prompt: str,
@@ -705,11 +1485,40 @@ async def test_multiple_explicit_projects_still_require_one_bounded_selection(
     manager = AgentManager(settings, storage, provider)
 
     run = await manager.start_run(prompt)
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED
+    assert completed.clarification is None
+    assert completed.turns[-1].request_resolution is not None
+    assert completed.turns[-1].request_resolution.target_status == "unsupported"
+    assert [candidate.path for candidate in completed.turns[-1].project_candidates] == [
+        "alpha",
+        "beta",
+    ]
+    assert provider.requests == []
+    assert "一次只能建立一个" in completed.turns[-1].summary
+
+
+@pytest.mark.asyncio
+async def test_explicit_project_alternatives_open_a_bounded_picker(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    _create_multi_project_workspace(settings.workspace)
+    gamma = settings.workspace / "gamma"
+    gamma.mkdir()
+    (gamma / "Cargo.toml").write_text("[package]\nname='gamma'\n", encoding="utf-8")
+    provider = ScriptedProvider([])
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Fix either alpha or beta")
     await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
     waiting = storage.get_run(run.id)
 
     assert waiting.clarification is not None
     assert waiting.clarification.purpose == "project_scope"
+    assert waiting.turns[-1].request_resolution is not None
+    assert waiting.turns[-1].request_resolution.target_reference == "unspecified"
     assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
         "alpha",
         "beta",
@@ -723,7 +1532,7 @@ async def test_multiple_explicit_projects_still_require_one_bounded_selection(
     "prompt",
     ["比较这些项目", "介绍这两个项目", "compare both repositories"],
 )
-async def test_implicit_multi_project_request_requires_bounded_selection(
+async def test_implicit_multi_project_request_is_not_changed_into_single_project_work(
     settings: Settings,
     storage: Storage,
     prompt: str,
@@ -733,17 +1542,18 @@ async def test_implicit_multi_project_request_requires_bounded_selection(
     manager = AgentManager(settings, storage, provider)
 
     run = await manager.start_run(prompt)
-    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
-    waiting = storage.get_run(run.id)
+    completed = await manager.wait(run.id)
 
-    assert waiting.clarification is not None
-    assert waiting.clarification.purpose == "project_scope"
-    assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
+    assert completed.state is RunState.ANSWERED
+    assert completed.clarification is None
+    assert completed.turns[-1].request_resolution is not None
+    assert completed.turns[-1].request_resolution.target_status == "unsupported"
+    assert [candidate.path for candidate in completed.turns[-1].project_candidates] == [
         "alpha",
         "beta",
     ]
     assert provider.requests == []
-    await manager.cancel(run.id)
+    assert "一次只能建立一个" in completed.turns[-1].summary
 
 
 @pytest.mark.asyncio
@@ -1009,7 +1819,7 @@ async def test_selected_project_scope_blocks_siblings_and_requires_root_evidence
     assert "Project overview rejected because required root evidence is missing" in (
         persisted_messages
     )
-    assert "read-only project overview" in persisted_messages
+    assert "effect ceiling classified this turn" in persisted_messages
     assert "escapes selected project scope 'alpha'" in persisted_messages
     assert "BETA SECRET" not in persisted_messages
     tool_payloads = [
@@ -1028,7 +1838,7 @@ async def test_selected_project_scope_blocks_siblings_and_requires_root_evidence
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "follow_prompt",
-    ["它用了什么数据库?", "主要功能是什么?", "用什么语言写的?"],
+    ["它用了什么数据库?", "这个项目的主要功能是什么?", "这个项目用什么语言写的?"],
 )
 async def test_explicit_project_overview_skips_picker_and_follow_up_inherits_scope(
     settings: Settings,
@@ -1171,13 +1981,18 @@ async def test_negated_candidate_does_not_hide_a_positive_project_selection(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "prompt",
-    ["分析整个工作区", "比较这些项目", "介绍多个项目"],
+    ("prompt", "whole_workspace"),
+    [
+        ("分析整个工作区", True),
+        ("比较这些项目", False),
+        ("介绍多个项目", False),
+    ],
 )
-async def test_workspace_or_multi_scope_reset_requires_a_fresh_bounded_selection(
+async def test_workspace_or_multi_scope_reset_never_reuses_the_prior_project(
     settings: Settings,
     storage: Storage,
     prompt: str,
+    whole_workspace: bool,
 ) -> None:
     _create_multi_project_workspace(settings.workspace)
     provider = ScriptedProvider(
@@ -1189,6 +2004,7 @@ async def test_workspace_or_multi_scope_reset_requires_a_fresh_bounded_selection
                 ]
             ),
             _direct_response("Alpha overview"),
+            _direct_response("Workspace analysis", call_id="workspace-answer"),
         ]
     )
     manager = AgentManager(settings, storage, provider)
@@ -1199,18 +2015,28 @@ async def test_workspace_or_multi_scope_reset_requires_a_fresh_bounded_selection
     assert first.turns[-1].project_scope.path == "alpha"
 
     await manager.follow_up(run.id, prompt)
-    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
-    waiting = storage.get_run(run.id)
+    completed = await manager.wait(run.id)
 
-    assert waiting.clarification is not None
-    assert waiting.clarification.purpose == "project_scope"
-    assert waiting.turns[-1].project_scope is None
-    assert [candidate.path for candidate in waiting.turns[-1].project_candidates] == [
-        "alpha",
-        "beta",
-    ]
-    assert len(provider.requests) == 3
-    await manager.cancel(run.id)
+    assert completed.state is RunState.ANSWERED, completed.error
+    turn = completed.turns[-1]
+    assert turn.project_scope is None
+    assert turn.request_resolution is not None
+    if whole_workspace:
+        assert turn.request_resolution.target_reference == "workspace"
+        assert turn.request_resolution.target_status == "resolved"
+        assert turn.project_target is not None
+        assert turn.project_target.path == "."
+        assert len(provider.requests) == 4
+    else:
+        assert turn.request_resolution.target_reference == "multiple"
+        assert turn.request_resolution.target_status == "unsupported"
+        assert turn.project_target is None
+        assert [candidate.path for candidate in turn.project_candidates] == [
+            "alpha",
+            "beta",
+        ]
+        assert "一次只能建立一个" in turn.summary
+        assert len(provider.requests) == 3
 
 
 @pytest.mark.asyncio
@@ -1366,6 +2192,17 @@ async def test_other_project_reset_does_not_reselect_a_manifest_bearing_workspac
     )
     manager = AgentManager(settings, storage, provider)
     run = await manager.start_run("介绍一下项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    initial = storage.get_run(run.id)
+    root = next(
+        candidate
+        for candidate in initial.turns[-1].project_candidates
+        if candidate.path == "."
+    )
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="project_scope", option_id=root.id)],
+    )
     first = await manager.wait(run.id)
 
     assert first.state is RunState.ANSWERED, first.error
@@ -1428,6 +2265,78 @@ async def test_project_scope_does_not_revive_across_an_unrelated_turn(
     ]
     assert len(provider.requests) == 4
     await manager.cancel(run.id)
+
+
+@pytest.mark.asyncio
+async def test_workspace_command_root_is_not_promoted_to_project_overview_target(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            _direct_response("命令请求已记录。", call_id="command-answer"),
+            _direct_response("must not reach provider", call_id="unexpected-answer"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Run a command in the workspace")
+    first = await manager.wait(run.id)
+
+    assert first.state is RunState.ANSWERED, first.error
+    assert first.turns[-1].project_target is not None
+    assert first.turns[-1].project_target.path == "."
+    assert first.turns[-1].project_target.markers == []
+
+    await manager.follow_up(run.id, "Describe this project")
+    completed = await manager.wait(run.id)
+    turn = completed.turns[-1]
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert len(provider.requests) == 1
+    assert turn.project_target is None
+    assert turn.project_scope is None
+    assert turn.request_resolution is not None
+    assert turn.request_resolution.work_kind == "read"
+    assert turn.request_resolution.overview_required is True
+    assert turn.request_resolution.target_status == "unsupported"
+    assert "target" in turn.request_resolution.ambiguity_dimensions
+    assert "没有把先前命令使用的工作区容器升级为项目概览目标" in turn.summary
+
+
+@pytest.mark.asyncio
+async def test_workspace_command_root_can_be_inherited_for_adjacent_execute_work(
+    settings: Settings,
+    storage: Storage,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            _direct_response("首次命令请求已记录。", call_id="first-answer"),
+            _direct_response("后续命令请求已记录。", call_id="second-answer"),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("Run a command in the workspace")
+    first = await manager.wait(run.id)
+    assert first.state is RunState.ANSWERED, first.error
+
+    await manager.follow_up(run.id, "Run another command in this project")
+    completed = await manager.wait(run.id)
+    turn = completed.turns[-1]
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert len(provider.requests) == 2
+    assert turn.project_target is not None
+    assert turn.project_target.path == "."
+    assert turn.project_target.markers == []
+    assert turn.project_target.selected_by == "inherited"
+    assert turn.project_scope is None
+    assert turn.request_resolution is not None
+    assert turn.request_resolution.work_kind == "execute"
+    assert turn.request_resolution.overview_required is False
+    assert turn.request_resolution.target_status == "resolved"
+    assert turn.request_resolution.ambiguity_dimensions == []
 
 
 @pytest.mark.asyncio
@@ -1528,7 +2437,7 @@ async def test_resume_rebinds_the_persisted_project_scope_before_provider_use(
 
 
 @pytest.mark.asyncio
-async def test_root_manifest_keeps_overview_at_workspace_root(
+async def test_root_manifest_is_a_candidate_alongside_child_projects(
     settings: Settings,
     storage: Storage,
 ) -> None:
@@ -1569,16 +2478,29 @@ async def test_root_manifest_keeps_overview_at_workspace_root(
     manager = AgentManager(settings, storage, provider)
 
     run = await manager.start_run("介绍一下项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    waiting = storage.get_run(run.id)
+    assert [item.path for item in waiting.turns[-1].project_candidates] == [
+        ".",
+        "packages",
+    ]
+    root = next(
+        item for item in waiting.turns[-1].project_candidates if item.path == "."
+    )
+    await manager.answer_clarification(
+        run.id,
+        [ClarificationAnswer(question_id="project_scope", option_id=root.id)],
+    )
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.ANSWERED, completed.error
     scope = completed.turns[-1].project_scope
     assert scope is not None
     assert scope.path == "."
-    assert scope.selected_by == "automatic"
+    assert scope.selected_by == "clarification"
     assert scope.root_listed is True
     assert scope.evidence_read == ["pyproject.toml"]
-    assert EventType.CLARIFICATION_REQUESTED not in {
+    assert EventType.CLARIFICATION_REQUESTED in {
         event.type for event in storage.get_events(run.id)
     }
 
@@ -1604,8 +2526,18 @@ async def test_project_picker_does_not_consume_requirements_clarification_rounds
                     ToolCall(id="read", name="read_file", arguments={"path": "go.mod"})
                 ]
             ),
-            _question_response("requirements-1", prompt="Which audience?"),
-            _question_response("requirements-2", prompt="Which depth?"),
+            _question_response(
+                "requirements-1",
+                question_id="audience",
+                semantic_key="scope.audience",
+                prompt="Which audience?",
+            ),
+            _question_response(
+                "requirements-2",
+                question_id="depth",
+                semantic_key="scope.depth",
+                prompt="Which depth?",
+            ),
             _direct_response("Final scoped overview"),
         ]
     )
@@ -1642,7 +2574,7 @@ async def test_project_picker_does_not_consume_requirements_clarification_rounds
             await asyncio.sleep(0.01)
     await manager.answer_clarification(
         run.id,
-        [ClarificationAnswer(question_id="choice", option_id="a")],
+        [ClarificationAnswer(question_id="audience", option_id="a")],
         request_id=first_request.request_id,
     )
 
@@ -1662,7 +2594,7 @@ async def test_project_picker_does_not_consume_requirements_clarification_rounds
             await asyncio.sleep(0.01)
     await manager.answer_clarification(
         run.id,
-        [ClarificationAnswer(question_id="choice", option_id="b")],
+        [ClarificationAnswer(question_id="depth", option_id="b")],
         request_id=second_request.request_id,
     )
     completed = await manager.wait(run.id)
@@ -1825,7 +2757,11 @@ async def test_full_clarify_build_verify_flow(
                             "questions": [
                                 {
                                     "id": "format",
+                                    "semantic_key": "constraint.output_format",
                                     "prompt": "Which output format?",
+                                    "dimension": "constraint",
+                                    "material_effect": "files",
+                                    "rationale": "The output contract changes the file format.",
                                     "options": [
                                         {
                                             "id": "text",
@@ -2040,7 +2976,9 @@ async def test_plan_mode_always_pauses_for_review_even_when_low_risk(
     )
     manager = AgentManager(settings, storage, provider)
     run = await manager.start_run(
-        "Review note.txt", verifier_enabled=False, mode=InteractionMode.PLAN
+        _execution_request("plan-mode review"),
+        verifier_enabled=False,
+        mode=InteractionMode.PLAN,
     )
 
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
@@ -2096,21 +3034,23 @@ async def test_follow_up_continues_the_same_task_with_prior_turn_context(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    first = await manager.start_run("Review the current behavior", verifier_enabled=False)
+    first_request = _execution_request("first-turn behavior")
+    follow_up_request = _execution_request("follow-up edge case")
+    first = await manager.start_run(first_request, verifier_enabled=False)
     first_completed = await manager.wait(first.id)
     assert first_completed.state is RunState.SUCCEEDED
 
     continued = await manager.follow_up(
-        first.id, "Now focus on the edge case", mode=InteractionMode.AGENT
+        first.id, follow_up_request, mode=InteractionMode.AGENT
     )
     assert continued.id == first.id
     second_completed = await manager.wait(first.id)
 
     assert second_completed.state is RunState.SUCCEEDED
-    assert second_completed.task == "Review the current behavior"
+    assert second_completed.task == first_request
     assert [turn.request for turn in second_completed.turns] == [
-        "Review the current behavior",
-        "Now focus on the edge case",
+        first_request,
+        follow_up_request,
     ]
     assert [turn.outcome for turn in second_completed.turns] == [
         "succeeded",
@@ -2496,7 +3436,9 @@ async def test_success_freezes_proof_after_the_completion_event(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Review the workspace", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("freeze success proof"), verifier_enabled=False
+    )
 
     completed = await manager.wait(run.id)
     events = storage.get_events(run.id)
@@ -2538,7 +3480,9 @@ async def test_atomic_success_failure_leaves_no_half_terminal_boundary(
 
     monkeypatch.setattr(storage, "_save_proof_pack_if_absent_locked", fail_proof_insert)
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Review the workspace", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("atomic terminal failure"), verifier_enabled=False
+    )
     completed = await manager.wait(run.id)
     events = storage.get_events(run.id)
 
@@ -2655,7 +3599,9 @@ async def test_gets_and_follow_up_wait_for_atomic_success_finalization(
         return ready
 
     monkeypatch.setattr(manager, "_prepare_terminal_cleanup", pause_before_commit)
-    run = await manager.start_run("Review atomically", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("atomic success finalization"), verifier_enabled=False
+    )
     await asyncio.wait_for(entered_finalization.wait(), timeout=3)
 
     persisted = storage.get_run(run.id)
@@ -2731,7 +3677,9 @@ async def test_get_and_rollback_wait_for_atomic_success_finalization(
         return ready
 
     monkeypatch.setattr(manager, "_prepare_terminal_cleanup", pause_before_commit)
-    run = await manager.start_run("Review before rollback", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("rollback after finalization"), verifier_enabled=False
+    )
     await asyncio.wait_for(entered_finalization.wait(), timeout=3)
 
     proof_request = asyncio.create_task(manager.get_proof_pack(run.id))
@@ -2993,7 +3941,10 @@ async def test_no_op_edit_keeps_passing_check_fresh_and_reports_no_changed_file(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Confirm result.txt", verifier_enabled=False)
+    run = await manager.start_run(
+        "Apply a no-op patch to result.txt",
+        verifier_enabled=False,
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
@@ -3188,7 +4139,7 @@ async def test_unknown_command_waits_for_explicit_approval(
     )
     manager = AgentManager(settings, storage, provider)
     run = await manager.start_run(
-        "Inspect the Python environment",
+        _execution_request("unknown command approval"),
         verifier_enabled=False,
         mode=InteractionMode.PLAN,
     )
@@ -3321,7 +4272,7 @@ async def test_terminal_builder_and_verifier_drafts_are_not_published(
     )
     manager = AgentManager(settings, storage, provider)
 
-    run = await manager.start_run("Review the workspace")
+    run = await manager.start_run(_execution_request("terminal draft isolation"))
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED
@@ -3371,7 +4322,8 @@ async def test_builder_rejects_malformed_finish_before_verification(
     manager = AgentManager(settings, storage, provider)
 
     run = await manager.start_run(
-        "Review the workspace", verifier_enabled=verifier_enabled
+        _execution_request("malformed finish rejection"),
+        verifier_enabled=verifier_enabled,
     )
     completed = await manager.wait(run.id)
 
@@ -3433,7 +4385,10 @@ async def test_builder_fails_after_three_consecutive_malformed_finish_batches(
     )
     manager = AgentManager(settings, storage, provider)
 
-    run = await manager.start_run("Reject repeated malformed finish", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("repeated malformed finish rejection"),
+        verifier_enabled=False,
+    )
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.FAILED
@@ -3493,7 +4448,9 @@ async def test_successful_builder_batch_resets_consecutive_rejection_budget(
     )
     manager = AgentManager(settings, storage, provider)
 
-    run = await manager.start_run("Reset rejection budget", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("rejection budget reset"), verifier_enabled=False
+    )
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED, completed.error
@@ -3664,7 +4621,8 @@ async def test_builder_action_budget_allows_finish_below_or_at_exact_limit(
     manager = AgentManager(limited, storage, provider)
 
     run = await manager.start_run(
-        "Exercise the action budget", verifier_enabled=verifier_enabled
+        _execution_request("action budget boundary"),
+        verifier_enabled=verifier_enabled,
     )
     if action_count > 1:
         await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
@@ -3727,7 +4685,7 @@ async def test_exact_action_budget_verifier_failure_stops_without_phantom_repair
     )
     manager = AgentManager(limited, storage, provider)
 
-    run = await manager.start_run("Produce a finished result")
+    run = await manager.start_run(_execution_request("exact action budget repair"))
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.FAILED
@@ -3804,7 +4762,9 @@ async def test_builder_rejects_over_budget_batch_before_executing_any_call(
     )
     manager = AgentManager(limited, storage, provider)
 
-    run = await manager.start_run("Stay within two actions", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("over-budget batch rejection"), verifier_enabled=False
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
@@ -3900,7 +4860,9 @@ async def test_builder_fails_after_three_consecutive_over_budget_batches(
     )
     manager = AgentManager(limited, storage, provider)
 
-    run = await manager.start_run("Reject repeated overflow", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("repeated overflow rejection"), verifier_enabled=False
+    )
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.FAILED
@@ -4042,7 +5004,9 @@ async def test_finish_fails_immediately_when_budget_cannot_run_missing_command_c
     )
     manager = AgentManager(limited, storage, provider)
 
-    run = await manager.start_run("Do not finish without the command", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("required command before finish"), verifier_enabled=False
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
@@ -4121,7 +5085,9 @@ async def test_builder_publishes_only_progress_backed_by_accepted_tools(
     )
     manager = AgentManager(settings, storage, provider)
 
-    run = await manager.start_run("Review the workspace", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("progress publication"), verifier_enabled=False
+    )
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED
@@ -4177,7 +5143,8 @@ async def test_reasoning_effort_is_frozen_across_planner_builder_and_verifier(
     )
 
     run = await manager.start_run(
-        "Review the workspace", reasoning_effort=ReasoningEffort.HIGH
+        _execution_request("reasoning effort propagation"),
+        reasoning_effort=ReasoningEffort.HIGH,
     )
     completed = await manager.wait(run.id)
 
@@ -4484,7 +5451,9 @@ async def test_structural_json_cannot_synthesize_a_credential_in_agent_history(
     )
     manager = AgentManager(replace(settings, api_key=configured), storage, provider)
 
-    run = await manager.start_run("Review foo", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("structural credential boundary"), verifier_enabled=False
+    )
     completed = await manager.wait(run.id)
     storage.secure_checkpoint()
 
@@ -4546,7 +5515,9 @@ async def test_tool_result_metadata_is_recursively_redacted_before_persistence(
         )
 
     monkeypatch.setattr(manager.tools, "execute", metadata_result)
-    run = await manager.start_run("Review safely", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("tool metadata redaction"), verifier_enabled=False
+    )
     completed = await manager.wait(run.id)
     events = storage.get_events(run.id)
 
@@ -4657,7 +5628,7 @@ async def test_secret_bearing_verifier_report_fails_before_publication(
     )
     manager = AgentManager(replace(settings, api_key=configured), storage, provider)
 
-    run = await manager.start_run("Review safely")
+    run = await manager.start_run(_execution_request("verifier credential rejection"))
     completed = await manager.wait(run.id)
     events = storage.get_events(run.id)
 
@@ -4713,7 +5684,9 @@ async def test_terminal_presentation_credentials_are_redacted_not_executed(
             ]
         ),
     )
-    finish_run = await finish.start_run("Review safely", verifier_enabled=False)
+    finish_run = await finish.start_run(
+        _execution_request("terminal credential redaction"), verifier_enabled=False
+    )
     completed = await finish.wait(finish_run.id)
 
     assert answered.state is RunState.ANSWERED
@@ -4841,7 +5814,10 @@ async def test_human_decision_credentials_are_rejected_before_durable_acceptance
             ]
         ),
     )
-    plan_run = await plan_manager.start_run("Plan safely", mode=InteractionMode.PLAN)
+    plan_run = await plan_manager.start_run(
+        _execution_request("plan-decision credential rejection"),
+        mode=InteractionMode.PLAN,
+    )
     await _wait_for_state(storage, plan_run.id, RunState.AWAITING_PLAN_APPROVAL)
     plan_receipt = storage.get_active_decision(plan_run.id)
     assert plan_receipt is not None
@@ -4909,7 +5885,9 @@ async def test_builder_reuses_successful_planning_inspection(
     )
     manager = AgentManager(settings, storage, provider)
     run = await manager.start_run(
-        "Review context.txt", verifier_enabled=False, mode=InteractionMode.PLAN
+        _execution_request("reuse planning inspection", path="context.txt"),
+        verifier_enabled=False,
+        mode=InteractionMode.PLAN,
     )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
@@ -4956,7 +5934,9 @@ async def test_plan_revision_then_completion(settings: Settings, storage: Storag
     )
     manager = AgentManager(settings, storage, provider)
     run = await manager.start_run(
-        "Review", verifier_enabled=False, mode=InteractionMode.PLAN
+        _execution_request("plan revision completion"),
+        verifier_enabled=False,
+        mode=InteractionMode.PLAN,
     )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
 
@@ -5014,7 +5994,9 @@ async def test_stale_plan_retry_is_idempotent_without_rebinding_to_revised_plan(
     )
     manager = AgentManager(settings, storage, provider)
     run = await manager.start_run(
-        "Review safely", verifier_enabled=False, mode=InteractionMode.PLAN
+        _execution_request("stale plan revision retry"),
+        verifier_enabled=False,
+        mode=InteractionMode.PLAN,
     )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     first = storage.get_active_decision(run.id)
@@ -5069,7 +6051,11 @@ async def test_stale_clarification_retry_does_not_answer_the_next_round(
                         "questions": [
                             {
                                 "id": "choice",
+                                "semantic_key": f"scope.{call_id}",
                                 "prompt": "Choose one",
+                                "dimension": "scope",
+                                "material_effect": "behavior",
+                                "rationale": "The alternatives change behavior.",
                                 "options": [
                                     {"id": "a", "label": "A"},
                                     {"id": "b", "label": "B"},
@@ -5191,7 +6177,9 @@ async def test_verifier_failure_triggers_one_repair_cycle(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Create a final value", mode=InteractionMode.PLAN)
+    run = await manager.start_run(
+        _execution_request("verifier repair cycle"), mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 
@@ -5288,7 +6276,7 @@ async def test_repair_cannot_reuse_a_passing_check_from_before_the_edit(
     )
     manager = AgentManager(settings, storage, provider)
     run = await manager.start_run(
-        "Create a final value with current evidence", mode=InteractionMode.PLAN
+        _execution_request("repair evidence freshness"), mode=InteractionMode.PLAN
     )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
@@ -5339,7 +6327,9 @@ async def test_verifier_failure_at_repair_limit_fails_run(
         ]
     )
     manager = AgentManager(limited, storage, provider)
-    run = await manager.start_run("Prove the result", mode=InteractionMode.PLAN)
+    run = await manager.start_run(
+        _execution_request("verifier repair limit"), mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 
@@ -5369,7 +6359,9 @@ async def test_three_identical_tool_failures_stop_builder(
     )
     manager = AgentManager(settings, storage, provider)
     run = await manager.start_run(
-        "Try a missing tool", verifier_enabled=False, mode=InteractionMode.PLAN
+        _execution_request("repeated missing tool failure"),
+        verifier_enabled=False,
+        mode=InteractionMode.PLAN,
     )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
@@ -5427,7 +6419,9 @@ async def test_recovery_guidance_follows_every_result_in_a_parallel_tool_batch(
     )
     manager = AgentManager(settings, storage, provider)
 
-    run = await manager.start_run("检查空工作区", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("parallel recovery guidance"), verifier_enabled=False
+    )
     completed = await manager.wait(run.id)
 
     assert completed.state is RunState.SUCCEEDED, completed.error
@@ -5500,7 +6494,7 @@ async def test_approved_unknown_command_runs_once(
         and event.payload["call"]["name"] == "run_command"
     ]
     assert [result["output"] for result in results] == ["approved\n"]
-    assert results[0]["metadata"]["sandbox"]["status"] == "bypassed"
+    assert results[0]["metadata"]["sandbox"]["status"] == "enforced"
 
 
 @pytest.mark.asyncio
@@ -6638,7 +7632,15 @@ async def test_restarted_clarification_rounds_ignore_reopen_events_and_reused_ca
     first = AgentManager(
         settings,
         storage,
-        ScriptedProvider([_question_response("reused-question", prompt="First choice?")]),
+        ScriptedProvider(
+            [
+                _question_response(
+                    "reused-question",
+                    semantic_key="scope.first_choice",
+                    prompt="First choice?",
+                )
+            ]
+        ),
     )
     run = await first.start_run("Clarify twice across restarts")
     await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
@@ -6649,7 +7651,15 @@ async def test_restarted_clarification_rounds_ignore_reopen_events_and_reused_ca
     second = AgentManager(
         settings,
         storage,
-        ScriptedProvider([_question_response("reused-question", prompt="Second choice?")]),
+        ScriptedProvider(
+            [
+                _question_response(
+                    "reused-question",
+                    semantic_key="scope.second_choice",
+                    prompt="Second choice?",
+                )
+            ]
+        ),
     )
     await second.resume(run.id)
     await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
@@ -6699,6 +7709,13 @@ async def test_restarted_clarification_rounds_ignore_reopen_events_and_reused_ca
     ]
     assert len(request_events) == 4
     assert len({event.payload["request_id"] for event in request_events}) == 2
+    assert [
+        (item.question_id, item.semantic_key, item.answer)
+        for item in completed.turns[-1].resolved_clarifications
+    ] == [
+        ("choice", "scope.first_choice", "A"),
+        ("choice", "scope.second_choice", "B"),
+    ]
     assert sum(
         message.get("role") == "tool"
         and message.get("tool_call_id") == "reused-question"
@@ -6728,7 +7745,7 @@ async def test_accepted_plan_revision_after_restart_pairs_submit_plan_call(
         ),
     )
     run = await first.start_run(
-        "Revise durably",
+        _execution_request("durable plan revision"),
         verifier_enabled=False,
         mode=InteractionMode.PLAN,
     )
@@ -6816,7 +7833,7 @@ async def test_rejected_action_result_survives_crash_after_decision_consumption(
         ),
     )
     run = await first.start_run(
-        "Reject durably",
+        _execution_request("durable action rejection"),
         verifier_enabled=False,
         approval_mode=ApprovalMode.MANUAL,
     )
@@ -6901,7 +7918,9 @@ async def test_accepted_plan_survives_crash_before_worker_notification(
         ),
     )
     run = await first.start_run(
-        "Resume an accepted plan", verifier_enabled=False, mode=InteractionMode.PLAN
+        _execution_request("resume accepted plan"),
+        verifier_enabled=False,
+        mode=InteractionMode.PLAN,
     )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     receipt = storage.get_active_decision(run.id)
@@ -6979,7 +7998,7 @@ async def test_accepted_action_before_crash_executes_once_after_explicit_resume(
         ),
     )
     run = await first.start_run(
-        "Create once",
+        _execution_request("execute accepted action once"),
         verifier_enabled=False,
         approval_mode=ApprovalMode.MANUAL,
     )
@@ -7087,7 +8106,7 @@ async def test_started_approved_action_is_uncertain_and_never_replayed_after_cra
 
     monkeypatch.setattr(first.tools, "execute", block_after_start)
     run = await first.start_run(
-        "Do not replay",
+        _execution_request("never replay started action"),
         verifier_enabled=False,
         approval_mode=ApprovalMode.MANUAL,
     )
@@ -7172,7 +8191,7 @@ async def test_user_cancel_marks_a_started_approved_action_uncertain(
 
     monkeypatch.setattr(manager.tools, "execute", block_after_start)
     run = await manager.start_run(
-        "Cancel after action start",
+        _execution_request("cancel after action start"),
         verifier_enabled=False,
         approval_mode=ApprovalMode.MANUAL,
     )
@@ -7201,7 +8220,9 @@ async def test_shutdown_resume_plan_then_rollback(
         )
     ]))
     run = await first.start_run(
-        "Resume me", verifier_enabled=False, mode=InteractionMode.PLAN
+        _execution_request("shutdown resume and rollback"),
+        verifier_enabled=False,
+        mode=InteractionMode.PLAN,
     )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await first.shutdown()
@@ -7282,7 +8303,9 @@ async def test_transient_model_outage_pauses_and_resumes_without_losing_run(
 
     resilient = replace(settings, model_retry_delay=0)
     manager = AgentManager(resilient, storage, RecoveringProvider())
-    run = await manager.start_run("Review note.txt", verifier_enabled=False)
+    run = await manager.start_run(
+        _execution_request("transient provider recovery"), verifier_enabled=False
+    )
 
     interrupted = await manager.wait(run.id)
 
@@ -7308,6 +8331,7 @@ async def test_transient_model_outage_pauses_and_resumes_without_losing_run(
     assert completed.error is None
     assert completed.plan_gate is not None
     assert completed.plan_gate.decision == "auto_approved"
+    assert run.id not in manager.tools._project_scopes
 
 
 @pytest.mark.asyncio
@@ -7546,7 +8570,9 @@ async def test_cancel_waiting_run(settings: Settings, storage: Storage) -> None:
             )
         ]),
     )
-    run = await manager.start_run("Cancel me", mode=InteractionMode.PLAN)
+    run = await manager.start_run(
+        _execution_request("cancel pending plan"), mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
 
     cancelled = await manager.cancel(run.id)
@@ -7630,7 +8656,9 @@ async def test_verifier_reads_evidence_before_structured_verdict(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Review evidence", mode=InteractionMode.PLAN)
+    run = await manager.start_run(
+        _execution_request("verifier evidence read"), mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 
@@ -7722,7 +8750,10 @@ async def test_verifier_recovers_from_invalid_structured_report(
         ]
     )
     manager = AgentManager(settings, storage, provider)
-    run = await manager.start_run("Recover verifier output", mode=InteractionMode.PLAN)
+    run = await manager.start_run(
+        _execution_request("invalid verifier output recovery"),
+        mode=InteractionMode.PLAN,
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
 

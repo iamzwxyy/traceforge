@@ -170,7 +170,7 @@ test("project selection stays verified, keyboard-visible, and durable across rec
 
   await page.goto("/");
 
-  await expect(page.getByRole("heading", { name: "选择要处理的项目" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "选择本轮的目标项目" })).toBeVisible();
   await expect(page.getByText("alpha · go.mod · README.md", { exact: true })).toBeVisible();
   await expect(page.getByText("beta · package.json · README.md", { exact: true })).toBeVisible();
   await expect(page.getByPlaceholder("其他答案…")).toHaveCount(0);
@@ -187,7 +187,7 @@ test("project selection stays verified, keyboard-visible, and durable across rec
   })).toBe(true);
 
   await alpha.check();
-  await page.getByRole("button", { name: "使用此项目" }).click();
+  await page.getByRole("button", { name: "确认目标项目" }).click();
   await expect.poll(() => answerPayload).toEqual({
     request_id: "project-scope-decision",
     answers: [{ question_id: "project_scope", option_id: alphaId }],
@@ -197,7 +197,7 @@ test("project selection stays verified, keyboard-visible, and durable across rec
   await expect(scopeBadge).toContainText("项目 alpha");
   await expect(scopeBadge).toHaveAttribute(
     "aria-label",
-    "当前轮读取范围限定为 alpha；已读取 README.md",
+    "当前轮目标为 alpha；已读取 README.md。选择目标不授予执行权限。",
   );
 
   current = projectScopeRun("answered", "2026-08-31T06:00:03Z");
@@ -206,6 +206,6 @@ test("project selection stays verified, keyboard-visible, and durable across rec
   await expect(scopeBadge).toContainText("项目 alpha");
   await expect(scopeBadge).toHaveAttribute(
     "title",
-    "当前轮读取范围限定为 alpha；已读取 README.md",
+    "当前轮目标为 alpha；已读取 README.md。选择目标不授予执行权限。",
   );
 });

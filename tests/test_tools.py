@@ -282,6 +282,49 @@ def test_permission_policy_enforces_visible_mutation_scope(
     assert "src/unplanned.py" in patch_assessment.reason
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        ToolCall(
+            id="create-with-empty-plan",
+            name="create_file",
+            arguments={"path": "src/unplanned.py", "content": "value = 1\n"},
+        ),
+        ToolCall(
+            id="patch-with-empty-plan",
+            name="apply_patch",
+            arguments={
+                "patch": (
+                    "*** Begin Patch\n"
+                    "*** Add File: src/unplanned.py\n"
+                    "+value = 1\n"
+                    "*** End Patch"
+                )
+            },
+        ),
+    ],
+    ids=["create-file", "apply-patch"],
+)
+def test_permission_policy_denies_mutation_when_plan_has_no_impacted_files(
+    settings: Settings,
+    workspace: Workspace,
+    call: ToolCall,
+) -> None:
+    registry = ToolRegistry(workspace, settings)
+    plan = _plan(["uv", "run", "pytest"])
+
+    assessment = registry.assess(call, plan)
+
+    assert assessment.decision is PermissionDecision.DENY
+    assert assessment.risk == "dangerous"
+    assert "declares no impacted files" in assessment.reason
+    for mode in ApprovalMode:
+        resolution = registry.resolve_permission(call, plan, mode)
+        assert resolution.decision is PermissionDecision.DENY
+        assert resolution.policy_decision is PermissionDecision.DENY
+        assert resolution.authorization == "policy"
+
+
 def test_permission_policy_denies_malformed_and_destructive_commands(
     settings: Settings, workspace: Workspace
 ) -> None:
@@ -1117,7 +1160,7 @@ async def test_project_scope_is_the_virtual_root_for_read_tools_and_can_be_clear
         settings,
         RunRecord(id="scoped-read", task="Inspect alpha", workspace=str(workspace.root)),
     )
-    registry.bind_project_scope("scoped-read", "alpha")
+    scope_identity = registry.bind_project_scope("scoped-read", "alpha")
 
     listed = await registry.execute(
         "scoped-read", ToolCall(id="list", name="list_files", arguments={})
@@ -1150,6 +1193,7 @@ async def test_project_scope_is_the_virtual_root_for_read_tools_and_can_be_clear
     assert "beta" not in listed.output
     assert listed.metadata == {
         "project_scope": "alpha",
+        "project_scope_identity": scope_identity,
         "requested_path": ".",
         "effective_path": "alpha",
     }
@@ -1171,6 +1215,305 @@ async def test_project_scope_is_the_virtual_root_for_read_tools_and_can_be_clear
     )
     assert unscoped.ok and "alpha/" in unscoped.output and "beta/" in unscoped.output
     assert unscoped.metadata == {}
+
+
+@pytest.mark.asyncio
+async def test_bound_project_scope_is_a_virtual_root_for_native_mutations(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    beta = workspace.root / "beta"
+    (alpha / "src").mkdir(parents=True)
+    beta.mkdir()
+    (alpha / "src" / "existing.py").write_text("value = 'alpha'\n")
+    beta_target = beta / "secret.py"
+    beta_target.write_text("value = 'beta'\n")
+    run_id = "scoped-mutations"
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id=run_id, task="Edit alpha", workspace=str(workspace.root)),
+    )
+    original_identity = registry.bind_project_scope(run_id, "alpha")
+
+    created = await registry.execute(
+        run_id,
+        ToolCall(
+            id="create",
+            name="create_file",
+            arguments={"path": "src/generated.py", "content": "generated = True\n"},
+        ),
+    )
+    patched = await registry.execute(
+        run_id,
+        ToolCall(
+            id="patch",
+            name="apply_patch",
+            arguments={
+                "patch": (
+                    "--- a/src/existing.py\n"
+                    "+++ b/src/existing.py\n"
+                    "@@ -1 +1 @@\n"
+                    "-value = 'alpha'\n"
+                    "+value = 'updated'\n"
+                )
+            },
+        ),
+    )
+    create_escape = await registry.execute(
+        run_id,
+        ToolCall(
+            id="create-escape",
+            name="create_file",
+            arguments={"path": "../beta/new.py", "content": "escaped = True\n"},
+        ),
+    )
+    patch_escape = await registry.execute(
+        run_id,
+        ToolCall(
+            id="patch-escape",
+            name="apply_patch",
+            arguments={
+                "patch": (
+                    "--- a/../beta/secret.py\n"
+                    "+++ b/../beta/secret.py\n"
+                    "@@ -1 +1 @@\n"
+                    "-value = 'beta'\n"
+                    "+value = 'escaped'\n"
+                )
+            },
+        ),
+    )
+
+    assert created.ok and patched.ok
+    assert created.metadata["changed_files"] == ["alpha/src/generated.py"]
+    assert patched.metadata["changed_files"] == ["alpha/src/existing.py"]
+    assert created.metadata["project_scope"] == "alpha"
+    assert created.metadata["project_scope_identity"] == original_identity
+    assert (alpha / "src" / "generated.py").read_text() == "generated = True\n"
+    assert (alpha / "src" / "existing.py").read_text() == "value = 'updated'\n"
+    assert not create_escape.ok and not patch_escape.ok
+    assert "selected project scope" in (create_escape.error or "")
+    assert "selected project scope" in (patch_escape.error or "")
+    assert not (beta / "new.py").exists()
+    assert beta_target.read_text() == "value = 'beta'\n"
+
+
+@pytest.mark.asyncio
+async def test_scoped_root_create_refreshes_identity_and_keeps_scope_usable(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    run_id = "scoped-generation-refresh"
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id=run_id, task="Edit alpha", workspace=str(workspace.root)),
+    )
+    original_identity = registry.bind_project_scope(run_id, "alpha")
+
+    created = await registry.execute(
+        run_id,
+        ToolCall(
+            id="root-create",
+            name="create_file",
+            arguments={"path": "root.txt", "content": "root-level\n"},
+        ),
+    )
+    read_back = await registry.execute(
+        run_id,
+        ToolCall(id="read-back", name="read_file", arguments={"path": "root.txt"}),
+    )
+    registry.sandbox.status = SandboxStatus("seatbelt", True, "test backend")
+    registry.sandbox._program = "/usr/bin/true"
+    command = await registry.execute(
+        run_id,
+        ToolCall(
+            id="command-after-create",
+            name="run_command",
+            arguments={"argv": ["python3", "-V"]},
+        ),
+    )
+
+    refreshed_identity = registry.current_project_scope_identity(run_id)
+    assert created.ok and read_back.ok and command.ok
+    assert "root-level" in read_back.output
+    assert refreshed_identity is not None and refreshed_identity != original_identity
+    assert created.metadata["project_scope_identity"] == refreshed_identity
+    assert read_back.metadata["project_scope_identity"] == refreshed_identity
+    assert command.metadata["project_scope_identity"] == refreshed_identity
+
+
+@pytest.mark.asyncio
+async def test_bound_project_scope_rejects_command_cwd_and_retains_sandbox_on_approval(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    beta = workspace.root / "beta"
+    alpha.mkdir()
+    beta.mkdir()
+    sibling_executable = beta / "tool"
+    sibling_executable.write_text("#!/bin/sh\nexit 0\n")
+    sibling_executable.chmod(0o755)
+    linked_sibling_executable = alpha / "linked-tool"
+    linked_sibling_executable.symlink_to(sibling_executable)
+    run_id = "scoped-command-boundary"
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id=run_id, task="Run alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope(run_id, "alpha")
+    registry.sandbox.status = SandboxStatus("seatbelt", True, "test backend")
+    registry.sandbox._program = "/usr/bin/true"
+
+    cwd_escape = await registry.execute(
+        run_id,
+        ToolCall(
+            id="cwd-escape",
+            name="run_command",
+            arguments={"argv": ["python3", "-V"], "cwd": "../beta"},
+        ),
+    )
+    approved = await registry.execute(
+        run_id,
+        ToolCall(
+            id="approved-command",
+            name="run_command",
+            arguments={"argv": ["python3", "-c", "print('not launched')"]},
+        ),
+        sandbox_bypass=True,
+    )
+    executable_escapes = [
+        ToolCall(
+            id="sibling-executable",
+            name="run_command",
+            arguments={"argv": [str(sibling_executable)]},
+        ),
+        ToolCall(
+            id="linked-sibling-executable",
+            name="run_command",
+            arguments={"argv": [str(linked_sibling_executable)]},
+        ),
+    ]
+
+    assert not cwd_escape.ok
+    assert "selected project scope" in (cwd_escape.error or "")
+    assert approved.ok
+    assert approved.metadata["sandbox"]["status"] == "enforced"
+    assert approved.metadata["sandbox"]["scope_enforced"] is True
+    assert approved.metadata["sandbox"]["bypass_requested"] is True
+    for call in executable_escapes:
+        assessment = registry.assess(call, None, run_id=run_id)
+        assert assessment.decision is PermissionDecision.DENY
+        assert "outside the selected project root" in assessment.reason
+        result = await registry.execute(run_id, call, sandbox_bypass=True)
+        assert not result.ok
+        assert "outside the selected project root" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_bound_mutation_fails_closed_after_project_identity_replacement(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    alpha = workspace.root / "alpha"
+    alpha.mkdir()
+    run_id = "scoped-mutation-replacement"
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id=run_id, task="Edit alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope(run_id, "alpha")
+    alpha.rename(workspace.root / "alpha-original")
+    alpha.mkdir()
+
+    result = await registry.execute(
+        run_id,
+        ToolCall(
+            id="replaced-create",
+            name="create_file",
+            arguments={"path": "blocked.txt", "content": "must not write\n"},
+        ),
+    )
+
+    assert not result.ok
+    assert "replaced after selection" in (result.error or "")
+    assert not (alpha / "blocked.txt").exists()
+
+
+def test_scoped_permission_assessment_uses_effective_project_paths(
+    settings: Settings,
+    workspace: Workspace,
+) -> None:
+    alpha = workspace.root / "alpha"
+    beta = workspace.root / "beta"
+    (alpha / "src").mkdir(parents=True)
+    beta.mkdir()
+    registry = ToolRegistry(workspace, settings)
+    run_id = "scoped-assessment"
+    registry.bind_project_scope(run_id, "alpha")
+    registry.sandbox.status = SandboxStatus("seatbelt", True, "test backend")
+    plan = _plan(["uv", "run", "pytest"]).model_copy(
+        update={"impacted_files": ["src/allowed.py"]}
+    )
+
+    allowed = registry.assess(
+        ToolCall(
+            id="allowed",
+            name="create_file",
+            arguments={"path": "src/allowed.py", "content": "value = 1\n"},
+        ),
+        plan,
+        run_id=run_id,
+    )
+    denied_write = registry.assess(
+        ToolCall(
+            id="denied-write",
+            name="create_file",
+            arguments={"path": "../beta/escape.py", "content": "value = 2\n"},
+        ),
+        plan,
+        run_id=run_id,
+    )
+    denied_command = registry.assess(
+        ToolCall(
+            id="denied-command",
+            name="run_command",
+            arguments={"argv": ["cat", "../beta/secret.txt"]},
+        ),
+        None,
+        run_id=run_id,
+    )
+    approved_but_scoped = registry.resolve_permission(
+        ToolCall(
+            id="unknown-command",
+            name="run_command",
+            arguments={"argv": ["python3", "app.py"]},
+        ),
+        None,
+        ApprovalMode.AUTOMATIC,
+        run_id=run_id,
+    )
+
+    assert allowed.decision is PermissionDecision.ALLOW
+    assert denied_write.decision is PermissionDecision.DENY
+    assert denied_command.decision is PermissionDecision.DENY
+    assert approved_but_scoped.decision is PermissionDecision.ASK
+    assert approved_but_scoped.sandbox_bypass_on_allow is False
 
 
 @pytest.mark.asyncio

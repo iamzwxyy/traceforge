@@ -111,47 +111,109 @@ continuation creates a separate linked run with a fresh snapshot namespace.
 
 ### Planning
 
-Before the first provider request, the host recognizes bounded project-overview intents and scans
-only filesystem names for stable project manifests. If the workspace root is itself a project it is
-kept as the canonical scope; one child project is selected automatically; multiple child projects
-produce a host-authored `project_scope` decision whose options come from the filesystem rather than
-the model. This decision is persisted on the active `ConversationTurn`, does not consume either of
-the two model clarification rounds, and is inherited by referential read-only follow-ups in the
-same run. Each displayed candidate already carries a device/inode/ctime identity; selection and
-decision consumption persist atomically. If a candidate or inherited root is moved, deleted, or replaced,
-the host stops instead of silently selecting a surviving sibling. Explicitly naming multiple roots
-or asking to compare them still produces a one-project picker because v1 intentionally exposes one
-bounded root per turn. Read-only references inherit that root, while whole-workspace/other-project
-or explicit switch wording resets it. Inheritance is adjacent-turn only, so an unrelated middle
-turn cannot revive stale scope; a request that also commands test/start/install/update/run/build/
-deploy work stays on the executable path, while implementation history and testing-result
-explanations remain read-only. An adjacent referential/detail question inherits, but another
-unqualified “introduce the project” remains ambiguous and opens the host picker again.
+Before the first provider request, the host creates a structured `RequestResolution` for the active
+`ConversationTurn`. It records whether the work is conversation, read-only, executable, or
+fail-safe `undetermined`; whether
+it depends on workspace contents; whether its target reference is absent, unspecified, explicit,
+inherited, workspace-wide, multiple, or another project; whether the target is unnecessary,
+resolved, requires clarification, or is unsupported; target-routing ambiguity; whether
+project-overview evidence is required; and bounded reasons. Requirements questions are separate:
+each model-authored question declares its target, scope, constraint, or acceptance dimension,
+material effect, rationale, and stable semantic key, while accepted answers are stored in
+`ConversationTurn.resolved_clarifications`.
+This projection is product state, not hidden model reasoning, and is returned as
+`ConversationTurn.request_resolution`; the resolved target is returned separately as
+`ConversationTurn.project_target`. Both fields remain nullable for legacy records and a turn that
+has not reached resolution yet.
 
-The selected scope is bound into `ToolRegistry` as a virtual root for list/read/search. Each scoped
-operation opens the recorded root as a temporary `dirfd`, validates its device/inode/ctime, and
-walks path components with `openat`-style `dir_fd` calls plus `O_NOFOLLOW`. Scoped search uses the same
-descriptor walker instead of passing a re-resolvable path to `rg`. This pins actual bytes to the
-opened directory while reading; a post-operation identity check discards buffered output when the
-recorded path or directory generation changed. All scoped reads run away from the event loop.
-Listing streams a bounded number of entries without retaining child descriptors; file reads bound line count, line
-size, file bytes, and persisted output; search additionally bounds query length, regex execution
-time, files, tree entries, and total scan bytes. Incomplete walks are explicitly marked.
-Project-overview completion additionally requires a root listing plus a successful root README or
-readable manifest (including an Xcode `project.pbxproj`) read; `submit_plan` is rejected for this
-host-classified read-only turn.
+Classification is compositional rather than prompt-specific. The resolver combines speech act,
+requested effect, local object evidence, verified project-name roles, clause polarity, and target
+cardinality. It applies those dimensions to one canonical semantic text: fenced/inline code and
+quoted literals governed as content are masked before either action or target extraction. Thus a
+snippet that says “deploy beta” cannot authorize deployment or select `beta`, and a social prefix
+such as “Hello,” cannot consume the real task that follows it. A bare project-like token plus a
+generic semantic-subject question remains conservative; action-governed property/object shorthand,
+possessive, locative, project-noun, action-target, comparison, and source/destination roles provide
+stronger evidence. Candidate names that collide with action/object or common ecosystem vocabulary
+need one of those stronger roles rather than being silently bound.
 
-The planning role can list, read, and search, then must choose one structured terminal action.
+Every request the host classifies as workspace-dependent uses the same target resolver:
+introductions, fixes, tests, searches, builds, deployments, and other reads or executions no longer
+have separate target rules.
+The host scans only filesystem names for stable project manifests. A verified explicit name or a
+reliable adjacent reference resolves automatically to a `ProjectTarget`; a sole candidate may also
+resolve automatically, while an explicit whole-workspace request binds the workspace root. A root
+manifest makes that root a candidate beside direct-child projects, not an override. An unspecified
+single-target request with multiple verified roots
+produces a host-authored `project_scope` decision whose options come from the filesystem rather than
+the model. Verified alternatives such as `alpha or beta` produce a picker bounded to those choices;
+joint targets such as `alpha and beta`, parallel per-project properties, comparisons, and
+source-to-destination transfers remain an unsupported one-root scope instead of being
+misrepresented as a choice or narrowed to the last name. Negative polarity removes only the
+non-selected branch (`beta instead of alpha`). Conversation, general-knowledge questions, and
+ungoverned artifact names such as “What is package.json?” remain unscoped.
+
+`ProjectTarget` persists the selected path, label, root markers, selection source, and
+device/inode/ctime identity. Selection and decision consumption are atomic. A moved, deleted, or
+replaced target stops the turn rather than silently selecting a sibling. Inheritance is
+adjacent-turn and referential: an unrelated middle turn cannot revive a stale target, while a
+reliable “this project” reference can carry the exact identity into a later read or execution.
+Repeating an unqualified workspace-dependent request in a multi-project container reopens the
+picker. Project selection does not consume either of the two requirements-clarification rounds.
+The filesystem project-root semantic namespace is host-owned: model-authored requirements cannot
+ask the user to select or reselect it on explicit, automatic, or conversation routes.
+
+The target is bound into `ToolRegistry` as the virtual root for reads, writes, and commands. Native
+list/read/search operations open the recorded root as a temporary `dirfd`, validate its identity,
+and walk path components with `openat`-style `dir_fd` calls plus `O_NOFOLLOW`; scoped search uses the
+same descriptor walker instead of passing a re-resolvable path to `rg`. Native writes resolve
+against the same target boundary, and commands run with that project as their bounded working root.
+For a child-project target, commands require OS enforcement: Seatbelt denies sibling-project data,
+and Bubblewrap masks the containing workspace before exposing only the target. Path validation for
+native writes and command launch is not yet fully descriptor-bound, so a hostile concurrent rename
+after validation remains a documented TOCTOU boundary; the stronger rename-race claim applies only
+to descriptor-relative reads and their post-read identity check.
+The target never grants execution authority: plan scope, action-permission profiles, the real-path
+guard, command policy, and OS sandbox are evaluated independently and remain mandatory.
+
+Scoped reads still run away from the event loop. Listing streams a bounded number of entries
+without retaining child descriptors; file reads bound line count, line size, file bytes, and
+persisted output; search additionally bounds query length, regex execution time, files, tree
+entries, and total scan bytes. A post-operation identity check discards buffered output when the
+recorded path or directory generation changed, and incomplete walks are explicitly marked. Only
+for a manifest-backed whole-project overview does `overview_required` require completion to include
+a root listing and a successful root README or readable manifest read, including an Xcode
+`project.pbxproj`.
+
+After target resolution, the planning role can list, read, and search, then must choose one
+structured terminal action.
 `respond_to_user` ends greetings, general questions, explicit read-only analysis, or a remaining
-blocker as `answered`, without a plan, verifier verdict, or Proof Pack. `ask_questions` is reserved
-for a known implementation request whose material choice cannot be discovered, or for a request
-that asks only for an answer, explanation, or read-only analysis but remains materially ambiguous
-after inspection because multiple plausible targets would produce misleadingly different answers:
-at most three questions per round, two to four options per question, and at most two rounds. A
-non-executable clarification must return to focused inspection or end with `respond_to_user`; it
-cannot enter executable work unless the user separately requests mutation or command execution.
-`submit_plan` begins executable work only when enough context exists. Terminal actions cannot be
-mixed with reads or with each other in one model response.
+blocker as `answered`, without a plan, verifier verdict, or Proof Pack. The Planner contract reserves
+`ask_questions` for a material target, scope, constraint, or acceptance ambiguity that inspection
+and trusted context cannot remove; it instructs the model not to ask about discoverable facts,
+cosmetic preferences, greetings, or general knowledge. The host validates each question's declared
+dimension, material effect, rationale, and semantic key, rejects a semantic key reissued under a
+different question ID in the same turn, persists accepted answers, limits each round to three
+questions with two to four options, and caps requirements clarification at two rounds. The Planner
+is instructed to return non-executable clarification to focused inspection or `respond_to_user`.
+The host applies an effect ceiling independently of model behavior: conversation routes cannot use
+workspace reads or `submit_plan`; every read route can inspect but cannot submit a plan; executable
+routes use the normal plan and action gates. An `undetermined` workspace task may inspect, clarify,
+and propose a plan, but the host forces that plan to an explicit approval gate with at least medium
+risk, even in Agent mode. The fallback is grammatical rather than one exact prompt: it covers
+causative imperatives, obligation modals, desired-result frames, and Chinese 把 constructions, while
+epistemic questions, explanations, learning, and advice remain conversation. Terminal actions
+cannot be mixed with reads or with each other in one model response.
+
+The regression corpus is a bounded deterministic Chinese/English prompt matrix. Cases cover
+unspecified targets across overview, fix, test, search, and deploy intents; exact and adjacent
+references; workspace, alternative, and joint targets; local versus general artifact names;
+literal/snippet masking; explanatory, negated, and result-state actions; greetings; and general
+knowledge. Each case asserts its expected route and target. Agent-level tests separately exercise
+provider-call suppression, durable selection, host-owned target questions, semantic-key
+deduplication, the `undetermined` approval ceiling, and multi-turn sequences.
+These tests protect the enumerated semantic families rather than claiming a global natural-language
+precision or recall score.
 
 Model prose is public only after the runtime accepts a non-terminal inspection/tool round. Prose-only
 contract violations, mixed terminal responses, and prose attached to `respond_to_user`, `finish`, or
@@ -420,12 +482,13 @@ ordinary readable/editable workspace files; reading later disk content does not 
 current-turn guidance snapshot.
 
 A run is also a durable conversation. `ConversationTurn` records the request, selected Agent/Plan
-mode, selected action-permission mode, selected reasoning effort, outcome, completion summary,
-native-edit files, and timestamps. A terminal answered, successful, failed, or
-cancelled run can transition back to `created` for a follow-up. The next planner receives the last six completed
-turn requests and summaries while keeping the same run id, project, workspace snapshots, event
-ledger, and rollback boundary. Model protocol messages reset per turn so stale tool-call state is
-not mixed into a new request.
+mode, selected action-permission mode, selected reasoning effort, request resolution, project
+target, resolved clarification answers, outcome, completion summary, native-edit files, and
+timestamps. A terminal answered, successful, failed, or cancelled run can transition back to
+`created` for a follow-up. The next planner receives the last six completed turn requests,
+summaries, and structured resolved choices while keeping the same run id, project, workspace
+snapshots, event ledger, and rollback boundary. Model protocol messages reset per turn so stale
+tool-call state is not mixed into a new request.
 
 Answer, failure, and cancellation close the active turn and publish `state.changed`,
 `turn.completed`, and `run.completed` with the RunRecord in one guarded SQLite transaction. Success

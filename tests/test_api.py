@@ -124,7 +124,7 @@ def test_api_exposes_only_workspace_rule_provenance(
         created = client.post(
             "/api/runs",
             json={
-                "task": "Review",
+                "task": "Update note.txt in the workspace",
                 "workspace": str(settings.workspace),
                 "verifier_enabled": False,
             },
@@ -197,7 +197,11 @@ def test_api_rejects_duplicate_answers_for_one_clarification_question(
                     "questions": [
                         {
                             "id": "scope",
+                            "semantic_key": "scope.change_size",
                             "prompt": "Which scope?",
+                            "dimension": "scope",
+                            "material_effect": "files",
+                            "rationale": "The alternatives change the affected files.",
                             "options": [
                                 {"id": "small", "label": "Small"},
                                 {"id": "large", "label": "Large"},
@@ -369,7 +373,7 @@ def test_api_run_lifecycle_and_public_shape(settings: Settings) -> None:
         response = client.post(
             "/api/runs",
             json={
-                "task": "Observe this workspace",
+                "task": "Update note.txt in the workspace",
                 "verifier_enabled": False,
                 "mode": "plan",
             },
@@ -467,7 +471,7 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
     with TestClient(app) as client:
         created = client.post(
             "/api/runs",
-            json={"task": "Observe this workspace", "verifier_enabled": False},
+            json={"task": "Update note.txt in the workspace", "verifier_enabled": False},
         )
         assert created.status_code == 201
         run_id = created.json()["id"]
@@ -481,7 +485,7 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
         follow_up = client.post(
             f"/api/runs/{run_id}/turns",
             json={
-                "prompt": "Check the edge case too",
+                "prompt": "Update note.txt for the edge case too",
                 "approval_mode": "manual",
             },
         )
@@ -490,7 +494,7 @@ def test_api_defaults_to_agent_mode_and_supports_same_task_follow_up(
         assert follow_up.json()["approval_mode"] == "manual"
         second = _wait_for_state(client, run_id, "succeeded")
         assert len(second["turns"]) == 2
-        assert second["turns"][1]["request"] == "Check the edge case too"
+        assert second["turns"][1]["request"] == "Update note.txt for the edge case too"
         assert second["turns"][0]["approval_mode"] == "automatic"
         assert second["turns"][1]["approval_mode"] == "manual"
         assert all(turn["reasoning_effort"] == "auto" for turn in second["turns"])
@@ -614,7 +618,7 @@ def test_api_keeps_each_success_proof_immutable_across_later_turns(
     with TestClient(app) as client:
         created = client.post(
             "/api/runs",
-            json={"task": "First request", "verifier_enabled": False},
+            json={"task": "Update note.txt for the first request", "verifier_enabled": False},
         )
         run_id = created.json()["id"]
         first_view = _wait_for_state(client, run_id, "succeeded")
@@ -635,7 +639,7 @@ def test_api_keeps_each_success_proof_immutable_across_later_turns(
 
         followed = client.post(
             f"/api/runs/{run_id}/turns",
-            json={"prompt": "Second request"},
+            json={"prompt": "Update note.txt for the second request"},
         )
         assert followed.status_code == 200
         second_view = _wait_for_state(client, run_id, "succeeded")
@@ -827,7 +831,11 @@ def test_api_rejects_second_active_run(settings: Settings) -> None:
     with TestClient(app) as client:
         first = client.post(
             "/api/runs",
-            json={"task": "First", "workspace": str(settings.workspace), "mode": "plan"},
+            json={
+                "task": "Update note.txt in the workspace",
+                "workspace": str(settings.workspace),
+                "mode": "plan",
+            },
         )
         assert first.status_code == 201
         run_id = first.json()["id"]
@@ -843,7 +851,10 @@ def test_api_rejects_second_active_run(settings: Settings) -> None:
 def test_websocket_replays_persisted_events(settings: Settings) -> None:
     app = create_app(settings, provider=ScriptedProvider([_plan_response()]))
     with TestClient(app) as client:
-        response = client.post("/api/runs", json={"task": "Observe", "mode": "plan"})
+        response = client.post(
+            "/api/runs",
+            json={"task": "Update note.txt in the workspace", "mode": "plan"},
+        )
         run_id = response.json()["id"]
         _wait_for_state(client, run_id, "awaiting_plan_approval")
 
@@ -1010,7 +1021,11 @@ def test_projects_direct_tasks_and_directory_browser(settings: Settings, tmp_pat
 
         direct = client.post(
             "/api/runs",
-            json={"task": "Direct", "workspace": str(direct_root), "mode": "plan"},
+            json={
+                "task": "Update note.txt in the workspace",
+                "workspace": str(direct_root),
+                "mode": "plan",
+            },
         )
         assert direct.status_code == 201
         direct_run = _wait_for_state(client, direct.json()["id"], "awaiting_plan_approval")
@@ -1020,7 +1035,7 @@ def test_projects_direct_tasks_and_directory_browser(settings: Settings, tmp_pat
         project = client.post(
             "/api/runs",
             json={
-                "task": "Project",
+                "task": "Update note.txt in the workspace",
                 "project_id": opened.json()["id"],
                 "mode": "plan",
             },
@@ -1038,7 +1053,7 @@ def test_direct_task_allocates_an_isolated_workspace(settings: Settings) -> None
     with TestClient(app) as client:
         created = client.post(
             "/api/runs",
-            json={"task": "Direct", "mode": "plan"},
+            json={"task": "Update note.txt in the workspace", "mode": "plan"},
         )
 
         assert created.status_code == 201
@@ -1051,7 +1066,11 @@ def test_direct_task_allocates_an_isolated_workspace(settings: Settings) -> None
 
         explicit = client.post(
             "/api/runs",
-            json={"task": "Explicit direct", "create_direct_workspace": True, "mode": "plan"},
+            json={
+                "task": "Update note.txt in the workspace",
+                "create_direct_workspace": True,
+                "mode": "plan",
+            },
         )
         assert explicit.status_code == 201
         explicit_run = _wait_for_state(
@@ -1372,7 +1391,7 @@ def test_open_workspace_endpoint_is_run_scoped_and_rejects_cross_site_or_retarge
         created = client.post(
             "/api/runs",
             json={
-                "task": "Observe",
+                "task": "Update note.txt in the workspace",
                 "mode": "plan",
                 "workspace": str(settings.workspace),
             },
@@ -1867,7 +1886,7 @@ def test_api_allows_provider_repair_then_resume_after_transient_outage(
         created = client.post(
             "/api/runs",
             json={
-                "task": "Recover this run",
+                "task": "Update note.txt after provider recovery",
                 "verifier_enabled": False,
                 "mode": "plan",
             },

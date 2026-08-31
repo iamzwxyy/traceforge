@@ -389,7 +389,9 @@ async def test_all_model_phases_receive_private_guidance_after_system_before_req
     )
     manager = AgentManager(settings, storage, provider)
 
-    run = await manager.start_run("Review the project", mode=InteractionMode.PLAN)
+    run = await manager.start_run(
+        "Update note.txt in the project", mode=InteractionMode.PLAN
+    )
     await _wait_for_state(storage, run.id, RunState.AWAITING_PLAN_APPROVAL)
     await manager.decide_plan(run.id, PlanDecision(decision="approve"))
     completed = await manager.wait(run.id)
@@ -401,6 +403,11 @@ async def test_all_model_phases_receive_private_guidance_after_system_before_req
         assert messages[1]["role"] == "user"
         assert canary in messages[1]["content"]
         assert messages[2]["role"] == "user"
+    planner_system = str(provider.requests[0][0][0]["content"])
+    assert "TraceForge host request resolution (trusted classification):" in planner_system
+    assert '"work_kind":\n"execute"' in planner_system
+    assert provider.requests[0][0][1]["role"] == "user"
+    assert canary in provider.requests[0][0][1]["content"]
     persisted = storage.get_run(run.id)
     assert canary not in str(persisted.model_dump(mode="json"))
     resolved = [

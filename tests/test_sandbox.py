@@ -97,6 +97,141 @@ def test_bubblewrap_launch_is_namespaced_and_keeps_git_read_only(tmp_path: Path)
     assert launch.metadata["network"] == "isolated_namespace"
 
 
+def test_seatbelt_scoped_launch_narrows_command_root_and_rejects_bypass(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    project = workspace / "alpha"
+    sibling = workspace / "beta"
+    project.mkdir(parents=True)
+    sibling.mkdir()
+    command_temp = tmp_path / "command-temp"
+    command_temp.mkdir()
+    sandbox = CommandSandbox(workspace)
+    sandbox.status = SandboxStatus("seatbelt", True, "test backend")
+    sandbox._program = "/usr/bin/sandbox-exec"
+
+    launch = sandbox.prepare(
+        "/usr/bin/python3",
+        ["python3", "-V"],
+        cwd=project,
+        command_temp=command_temp,
+        environment={"PATH": "/usr/bin:/bin"},
+        bypass=False,
+        execution_root=project,
+    )
+
+    profile = launch.arguments[1]
+    assert f"-DCOMMAND_ROOT={project}" in launch.arguments
+    assert '(require-not (subpath (param "COMMAND_ROOT")))' in profile
+    assert (
+        "(deny file-read-data (require-all "
+        '(subpath (param "WORKSPACE")) '
+        '(require-not (subpath (param "COMMAND_ROOT")))))'
+    ) in profile
+    assert launch.metadata["command_root"] == str(project)
+    with pytest.raises(ValueError, match="cwd must stay inside"):
+        sandbox.prepare(
+            "/usr/bin/python3",
+            ["python3", "-V"],
+            cwd=sibling,
+            command_temp=command_temp,
+            environment={"PATH": "/usr/bin:/bin"},
+            bypass=False,
+            execution_root=project,
+        )
+    approved = sandbox.prepare(
+        "/usr/bin/python3",
+        ["python3", "-V"],
+        cwd=project,
+        command_temp=command_temp,
+        environment={"PATH": "/usr/bin:/bin"},
+        bypass=True,
+        execution_root=project,
+    )
+    assert approved.program == "/usr/bin/sandbox-exec"
+    assert approved.metadata["status"] == "enforced"
+    assert approved.metadata["scope_enforced"] is True
+    assert approved.metadata["bypass_requested"] is True
+
+
+def test_bubblewrap_scoped_launch_binds_only_project_writable(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    project = workspace / "alpha"
+    workspace_git = workspace / ".git"
+    project_git = project / ".git"
+    workspace_git.mkdir(parents=True)
+    project_git.mkdir(parents=True)
+    (workspace / "beta").mkdir()
+    command_temp = tmp_path / "command-temp"
+    command_temp.mkdir()
+    sandbox = CommandSandbox(workspace)
+    sandbox.status = SandboxStatus("bubblewrap", True, "test backend")
+    sandbox._program = "/usr/bin/bwrap"
+
+    launch = sandbox.prepare(
+        "/usr/bin/python3",
+        ["python3", "-V"],
+        cwd=project,
+        command_temp=command_temp,
+        environment={"PATH": "/usr/bin:/bin"},
+        bypass=False,
+        execution_root=project,
+    )
+
+    arguments = launch.arguments
+    project_bind = ["--bind", str(project), str(project)]
+    assert any(
+        arguments[index : index + 3] == project_bind
+        for index in range(len(arguments) - 2)
+    )
+    workspace_mask = arguments.index(str(workspace))
+    project_mount = next(
+        index
+        for index in range(len(arguments) - 2)
+        if arguments[index : index + 3] == project_bind
+    )
+    assert arguments[workspace_mask - 1 : workspace_mask + 1] == [
+        "--tmpfs",
+        str(workspace),
+    ]
+    assert workspace_mask < project_mount
+    assert not any(
+        arguments[index : index + 3]
+        == ["--bind", str(workspace), str(workspace)]
+        for index in range(len(arguments) - 2)
+    )
+    git_index = arguments.index(str(project_git))
+    assert arguments[git_index - 1 : git_index + 2] == [
+        "--ro-bind",
+        str(project_git),
+        str(project_git),
+    ]
+    assert str(workspace_git) not in arguments
+
+
+def test_policy_only_sandbox_fails_closed_for_scoped_commands(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    project = workspace / "alpha"
+    project.mkdir(parents=True)
+    command_temp = tmp_path / "command-temp"
+    command_temp.mkdir()
+    sandbox = CommandSandbox(workspace)
+    sandbox.status = SandboxStatus("none", False, "test backend unavailable")
+    sandbox._program = None
+
+    with pytest.raises(ValueError, match="require an enforced OS sandbox"):
+        sandbox.prepare(
+            "/usr/bin/python3",
+            ["python3", "-V"],
+            cwd=project,
+            command_temp=command_temp,
+            environment={"PATH": "/usr/bin:/bin"},
+            bypass=False,
+            execution_root=project,
+        )
+
+
 @pytest.mark.asyncio
 async def test_enforced_sandbox_allows_workspace_write_and_blocks_escape(
     settings: Settings, storage: Storage, workspace: Workspace
@@ -147,6 +282,108 @@ async def test_enforced_sandbox_allows_workspace_write_and_blocks_escape(
     assert not escape_result.ok
     assert escape_result.metadata["sandbox"]["status"] == "enforced"
     assert not outside.exists()
+
+
+@pytest.mark.asyncio
+async def test_enforced_scoped_command_writes_project_but_not_sibling_even_when_approved(
+    settings: Settings,
+    storage: Storage,
+    workspace: Workspace,
+) -> None:
+    alpha = workspace.root / "alpha"
+    beta = workspace.root / "beta"
+    alpha.mkdir()
+    beta.mkdir()
+    secret = "sibling project contents must stay private"
+    (beta / "secret.txt").write_text(secret)
+    (alpha / "sibling-link").symlink_to(beta, target_is_directory=True)
+    run_id = "sandbox-project-scope"
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id=run_id, task="Probe alpha", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope(run_id, "alpha")
+    if not registry.sandbox_status.enforced:
+        pytest.skip(registry.sandbox_status.detail)
+
+    inside = await registry.execute(
+        run_id,
+        ToolCall(
+            id="inside-project",
+            name="run_command",
+            arguments={
+                "argv": [
+                    "python3",
+                    "-c",
+                    "from pathlib import Path; Path('inside.txt').write_text('allowed')",
+                ]
+            },
+        ),
+    )
+    sibling = await registry.execute(
+        run_id,
+        ToolCall(
+            id="sibling-escape",
+            name="run_command",
+            arguments={
+                "argv": [
+                    "python3",
+                    "-c",
+                    (
+                        "from pathlib import Path; "
+                        "Path('../beta/escape.txt').write_text('escaped')"
+                    ),
+                ]
+            },
+        ),
+        sandbox_bypass=True,
+    )
+    sibling_read = await registry.execute(
+        run_id,
+        ToolCall(
+            id="sibling-read",
+            name="run_command",
+            arguments={
+                "argv": [
+                    "python3",
+                    "-c",
+                    "from pathlib import Path; print(Path('../beta/secret.txt').read_text())",
+                ]
+            },
+        ),
+        sandbox_bypass=True,
+    )
+    symlink_read = await registry.execute(
+        run_id,
+        ToolCall(
+            id="sibling-symlink-read",
+            name="run_command",
+            arguments={
+                "argv": [
+                    "python3",
+                    "-c",
+                    "from pathlib import Path; print(Path('sibling-link/secret.txt').read_text())",
+                ]
+            },
+        ),
+        sandbox_bypass=True,
+    )
+
+    assert inside.ok, inside.output
+    assert (alpha / "inside.txt").read_text() == "allowed"
+    assert inside.metadata["cwd"] == "alpha"
+    assert not sibling.ok
+    assert sibling.metadata["sandbox"]["status"] == "enforced"
+    assert sibling.metadata["sandbox"]["bypass_requested"] is True
+    assert not (beta / "escape.txt").exists()
+    assert not sibling_read.ok
+    assert sibling_read.metadata["sandbox"]["scope_enforced"] is True
+    assert secret not in sibling_read.output
+    assert not symlink_read.ok
+    assert symlink_read.metadata["sandbox"]["scope_enforced"] is True
+    assert secret not in symlink_read.output
 
 
 @pytest.mark.asyncio

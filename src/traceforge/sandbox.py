@@ -48,8 +48,17 @@ class CommandSandbox:
         command_temp: Path,
         environment: dict[str, str],
         bypass: bool,
+        execution_root: Path | None = None,
     ) -> SandboxLaunch:
-        if bypass:
+        command_root = self._validated_execution_root(execution_root)
+        self._validate_executable_scope(executable, command_root)
+        resolved_cwd = cwd.resolve(strict=True)
+        if not resolved_cwd.is_dir() or not resolved_cwd.is_relative_to(command_root):
+            raise ValueError(
+                f"Command cwd must stay inside the command root: {command_root}"
+            )
+        scoped = command_root != self.workspace
+        if bypass and not scoped:
             return SandboxLaunch(
                 executable,
                 argv[1:],
@@ -61,6 +70,10 @@ class CommandSandbox:
                 },
             )
         if not self.status.enforced or self._program is None:
+            if scoped:
+                raise ValueError(
+                    "Commands in a selected project require an enforced OS sandbox"
+                )
             return SandboxLaunch(
                 executable,
                 argv[1:],
@@ -73,11 +86,19 @@ class CommandSandbox:
             )
         if self.status.backend == "seatbelt":
             arguments = self._seatbelt_arguments(
-                executable, argv, command_temp=command_temp, environment=environment
+                executable,
+                argv,
+                command_temp=command_temp,
+                environment=environment,
+                execution_root=command_root,
             )
         else:
             arguments = self._bubblewrap_arguments(
-                executable, argv, cwd=cwd, command_temp=command_temp
+                executable,
+                argv,
+                cwd=resolved_cwd,
+                command_temp=command_temp,
+                execution_root=command_root,
             )
         return SandboxLaunch(
             self._program,
@@ -91,9 +112,51 @@ class CommandSandbox:
                     if self.status.backend == "seatbelt"
                     else "isolated_namespace"
                 ),
+                "command_root": str(command_root),
+                "scope_enforced": scoped,
+                "bypass_requested": bypass,
                 "detail": self.status.detail,
             },
         )
+
+    def _validated_execution_root(self, requested: Path | None) -> Path:
+        if requested is None:
+            return self.workspace
+        resolved = requested.resolve(strict=True)
+        if not resolved.is_dir() or not resolved.is_relative_to(self.workspace):
+            raise ValueError(
+                "Command root must be a directory inside the configured workspace"
+            )
+        return resolved
+
+    def validate_executable_scope(
+        self,
+        executable: str,
+        *,
+        execution_root: Path | None = None,
+    ) -> None:
+        """Reject absolute workspace executables that escape a selected project."""
+
+        command_root = self._validated_execution_root(execution_root)
+        self._validate_executable_scope(executable, command_root)
+
+    def _validate_executable_scope(self, executable: str, command_root: Path) -> None:
+        candidate = Path(executable)
+        if command_root == self.workspace or not candidate.is_absolute():
+            return
+        lexical_path = Path(os.path.abspath(executable))
+        try:
+            resolved_path = lexical_path.resolve()
+        except (OSError, RuntimeError):
+            resolved_path = lexical_path
+        for path in (lexical_path, resolved_path):
+            if path.is_relative_to(self.workspace) and not path.is_relative_to(
+                command_root
+            ):
+                raise ValueError(
+                    "Absolute executable is outside the selected project root: "
+                    f"{executable}"
+                )
 
     def _seatbelt_arguments(
         self,
@@ -102,11 +165,12 @@ class CommandSandbox:
         *,
         command_temp: Path,
         environment: dict[str, str],
+        execution_root: Path,
     ) -> list[str]:
         home = Path.home().resolve()
         executable_path = Path(executable)
         resolved_parent = executable_path.resolve().parent
-        read_roots = {self.workspace, resolved_parent}
+        read_roots = {execution_root, resolved_parent}
         if resolved_parent.name == "bin":
             read_roots.add(resolved_parent.parent)
         # A virtual-environment interpreter is commonly a symlink into the base
@@ -125,10 +189,11 @@ class CommandSandbox:
         read_roots = {path for path in read_roots if path.is_relative_to(home)}
         definitions: list[tuple[str, Path]] = [
             ("WORKSPACE", self.workspace),
+            ("COMMAND_ROOT", execution_root),
             ("COMMAND_TEMP", command_temp),
             ("HOME_ROOT", home),
         ]
-        read_exclusions = ["(require-not (subpath (param \"WORKSPACE\")))"]
+        read_exclusions = ["(require-not (subpath (param \"COMMAND_ROOT\")))"]
         for index, path in enumerate(sorted(read_roots)):
             key = f"READ_ROOT_{index}"
             definitions.append((key, path))
@@ -144,11 +209,16 @@ class CommandSandbox:
                     f'(deny file-write* (literal (param "{key}")) (subpath (param "{key}")))',
                 ]
             )
-        git_dir = self.workspace / ".git"
-        if git_dir.exists():
-            definitions.append(("GIT_DIR", git_dir))
+        for index, git_dir in enumerate(
+            sorted({self.workspace / ".git", execution_root / ".git"})
+        ):
+            if not git_dir.exists():
+                continue
+            key = f"GIT_DIR_{index}"
+            definitions.append((key, git_dir))
             protected_rules.append(
-                '(deny file-write* (literal (param "GIT_DIR")) (subpath (param "GIT_DIR")))'
+                f'(deny file-write* (literal (param "{key}")) '
+                f'(subpath (param "{key}")))'
             )
 
         profile = "\n".join(
@@ -169,13 +239,19 @@ class CommandSandbox:
                 *[f"  {item}" for item in read_exclusions],
                 "))",
                 (
+                    "(deny file-read-data (require-all "
+                    '(subpath (param "WORKSPACE")) '
+                    '(require-not (subpath (param "COMMAND_ROOT")))))'
+                ),
+                (
                     "(deny file-write* (require-all "
-                    '(require-not (subpath (param "WORKSPACE"))) '
+                    '(require-not (subpath (param "COMMAND_ROOT"))) '
                     '(require-not (subpath (param "COMMAND_TEMP"))) '
                     '(require-not (literal "/dev/null"))))'
                 ),
                 (
-                    '(deny file-write-unlink (require-all (literal (param "WORKSPACE")) '
+                    '(deny file-write-unlink (require-all '
+                    '(literal (param "COMMAND_ROOT")) '
                     "(vnode-type DIRECTORY)))"
                 ),
                 *protected_rules,
@@ -191,6 +267,7 @@ class CommandSandbox:
         *,
         cwd: Path,
         command_temp: Path,
+        execution_root: Path,
     ) -> list[str]:
         arguments = [
             "--die-with-parent",
@@ -207,16 +284,25 @@ class CommandSandbox:
             "/dev",
             "--proc",
             "/proc",
-            "--bind",
-            str(self.workspace),
-            str(self.workspace),
-            "--bind",
-            str(command_temp),
-            str(command_temp),
         ]
-        git_dir = self.workspace / ".git"
-        if git_dir.exists():
-            arguments.extend(["--ro-bind", str(git_dir), str(git_dir)])
+        if execution_root != self.workspace:
+            # The initial read-only root still exposes the host workspace. Mask it before
+            # mounting the selected project back at its original absolute path so sibling
+            # project contents are absent from the command's namespace.
+            arguments.extend(["--tmpfs", str(self.workspace)])
+        arguments.extend(
+            [
+                "--bind",
+                str(execution_root),
+                str(execution_root),
+                "--bind",
+                str(command_temp),
+                str(command_temp),
+            ]
+        )
+        for git_dir in [execution_root / ".git"]:
+            if git_dir.exists():
+                arguments.extend(["--ro-bind", str(git_dir), str(git_dir)])
         for path in self._sensitive_paths():
             if path.is_dir():
                 arguments.extend(["--tmpfs", str(path)])

@@ -18,7 +18,8 @@ or deliberately bypassed.
 ## File boundary
 
 Every path must be a non-empty relative path. Before a read or write, TraceForge resolves the real
-ancestor and checks it remains below the fixed workspace root. Absolute paths, traversal, `.git`
+ancestor and checks it remains below the fixed workspace root and, when selected, the active
+project virtual root. Absolute paths, traversal, `.git`
 components, non-regular file targets, existing targets for `create_file`, and writes through any
 symlink component are rejected.
 
@@ -121,29 +122,81 @@ Completion review is a third, separate concept. After fresh checks, the verifier
 through a read-only tool surface and cannot mutate files or execute commands. Its pass/fail decision
 does not grant runtime permissions; a rejection only returns bounded findings to the builder.
 
-Ambiguous project overviews in a container workspace use an additional host-owned read boundary.
+Every request the host classifies as workspace-dependent crosses a host-owned project-target
+boundary before the model can inspect or act. `RequestResolution` makes target routing auditable: it
+records the work kind, workspace dependency, target reference and status, target-routing ambiguity,
+the overview-evidence requirement, and bounded reasons. Model-authored requirements questions carry
+their target/scope/constraint/acceptance dimension separately, and accepted answers are stored as
+resolved clarifications. Neither structure is an authorization token.
+
+The resolver operates on a canonical semantic view that masks fenced/inline snippets and quoted
+content literals before action and project-target extraction. It composes requested effect, local
+object evidence, verified target roles, polarity, and cardinality instead of accepting an isolated
+keyword as authority. General explanations of artifact names remain conversation unless a local
+read/write relation governs the artifact. Unknown software result-state wording is classified as
+`undetermined`: inspection and clarification remain available, but a resulting plan always requires
+explicit review and cannot be auto-approved. Its result-state grammar includes causative imperatives,
+obligation modals, desired-result frames, and Chinese disposal constructions; question and
+epistemic-complement guards keep explanations, learning, and advice outside executable routing.
+
 Candidate project roots come from bounded manifest-name discovery, not model prose; hidden/temp/
 cache/build directories and symlinks are excluded. Candidate device/inode/ctime identities are
-captured before the picker is shown, and the chosen root is persisted atomically with decision consumption.
-It becomes the virtual root for `list_files`, `read_file`, and `search_text`. Every scoped operation
-opens a temporary root descriptor, checks it against the persisted identity, and traverses each
+captured before a picker is shown. An explicit or reliable adjacent reference resolves directly;
+an unspecified single-target request with multiple possible roots requires a host-authored choice;
+explicit alternatives produce a picker limited to those verified candidates; an unsupported joint
+multiple-target request fails closed instead of silently narrowing the user's stated scope. The resulting `ProjectTarget`
+is persisted atomically with decision consumption. Moving, replacing, or deleting it invalidates
+the target rather than authorizing a surviving sibling.
+
+The chosen target becomes the virtual root for reads, writes, and commands. Each scoped read opens
+a temporary root descriptor, checks it against the persisted identity, and traverses every
 component relative to that descriptor with symlink following disabled; scoped search uses the same
-descriptor walker rather than an external pathname-based process. This rejects parent traversal,
-sibling projects, file or directory symlink aliases, deletion, directory replacement, and
-rename-away/restore races without returning buffered content after the identity changes. This
-scope picker is a target-resolution decision, not a grant to mutate files or execute commands.
+descriptor walker rather than an external pathname-based process. Native writes resolve from the
+same target, and project commands use that root as their bounded working directory. Scoped commands
+require an enforced OS sandbox: Seatbelt denies sibling-project file reads and writes, while
+Bubblewrap hides the containing workspace and mounts only the selected target back. These controls
+reject ordinary parent traversal, sibling-project access, and symlink aliases. Descriptor-relative
+reads additionally discard buffered content after a target identity change. Native writes and the
+command launcher still perform some final operations through validated pathnames rather than one
+held directory descriptor; a hostile concurrent rename between validation and that operation is a
+known residual TOCTOU boundary, not a claimed guarantee.
+
+Project selection is deliberately not an action approval. It cannot promote Manual to Automatic,
+disable a plan gate, turn a denied command into an allowed command, bypass the real-path guard, or
+weaken the OS sandbox. Requirements clarification is also separate: project choice does not consume
+its two-round budget. The Planner contract allows only unresolved material target, scope,
+constraint, or acceptance choices to use that budget. The host enforces declared dimension,
+material effect, rationale, stable semantic keys, option/round limits, and durable answers; it does
+not claim to prove the natural-language necessity of every model-authored question. The project-root
+target namespace itself is host-owned, so a provider cannot use requirements clarification to ask
+for or override that target on explicit, automatic, or conversation routes.
+
+Effect ceilings are also host-owned. Conversation routes cannot access workspace tools or submit a
+plan. Read routes may inspect but every `submit_plan` is rejected. Executable routes retain the
+normal plan, permission, path, and sandbox gates. `undetermined` routes may inspect and propose a
+plan only through forced explicit plan review with a minimum medium-risk classification.
 
 `.git` path components and `.env`-family basenames are compared case-insensitively before any
 descriptor traversal, so aliases such as `.GIT` and `.ENV.prod` cannot bypass the boundary on the
 default case-insensitive macOS filesystem (and are rejected consistently on Linux).
 
-Scoped list/read/search form a bounded resource boundary. They run outside the API event loop and
-use streaming directory iteration or unbuffered descriptor reads. Listing caps entries and rows;
+Scoped list/read/search form a bounded resource boundary inside that project target. They run
+outside the API event loop and use streaming directory iteration or unbuffered descriptor reads.
+Listing caps entries and rows;
 file reads cap requested lines, individual line size, scanned file bytes, and UTF-8 persisted
 output. Search additionally caps regular-expression length, per-match time, one total wall-clock
 deadline, files visited, total scanned bytes, and returned text. Invalid or timed-out expressions
 become ordinary failed tool results; oversized/incomplete walks are marked without persisting
 over-budget content.
+
+The clarification regression boundary is a fixed Chinese/English matrix. Each case asserts the
+expected host route and target for unspecified, explicit, inherited, workspace, multiple-target,
+alternative, local-artifact, literal/snippet, explanatory, negated, result-state, executable,
+greeting, and general-knowledge requests. Agent tests separately check that a required picker
+suppresses provider calls, that the host owns project-root questions, that uncertain effects force
+review, and that requirement semantic keys and answers remain bound across decision and follow-up
+paths. This is a bounded regression contract,
+not a global natural-language precision/recall or four-dimension accuracy measurement.
 
 ## Per-turn action-permission profiles
 
@@ -182,6 +235,8 @@ but those controls are usability defenses—the database compare-and-set remains
 Clarification schemas reject duplicate question IDs, duplicate answers, and responses that mix or
 omit option/custom values. Restart repair pairs an accepted reply with the exact latest unanswered
 source call rather than trusting a provider call ID to be globally unique.
+Host-authored project selection remains `purpose=project_scope` and does not increment the persisted
+requirements round; only `purpose=requirements` decisions count toward the two-round limit.
 
 Approved actions use an at-most-once crash boundary. The transaction that consumes approval also
 clears the pending card, enters execution, and persists `tool.started`; only then may the external
@@ -226,15 +281,21 @@ then probes and selects one backend:
 
 | Platform | Enforced backend | Main boundary |
 | --- | --- | --- |
-| macOS | built-in Seatbelt (`sandbox-exec`) | writes limited to workspace and command temp; external network denied; loopback retained |
-| Linux | working non-setuid Bubblewrap | read-only host root, writable workspace/command temp, read-only `.git`, separate user/PID/network namespaces |
-| Unsupported or failed probe | none (`policy_only`) | application path/argv policy and approval only |
+| macOS | built-in Seatbelt (`sandbox-exec`) | writes limited to the command root and temp; a selected project also hides sibling file contents; external network denied; loopback retained |
+| Linux | working non-setuid Bubblewrap | read-only host root, writable command root/temp, read-only `.git`, separate user/PID/network namespaces; a selected project masks its containing workspace before remounting only that project |
+| Unsupported or failed probe | none (`policy_only`) | application path/argv policy and approval only for workspace-root commands; selected-project commands fail closed |
 
 Both enforced profiles block configured credential files, common credential locations, and real
 `.env*` files other than `.env.example`. Seatbelt additionally denies ordinary file-content reads
 under the user's home except the selected workspace and runtime paths. Bubblewrap keeps the host
 root readable for tool compatibility but masks the enumerated sensitive paths. These are accurate,
 different claims; the UI does not collapse them into a generic “secure” label.
+
+When a project below the workspace root is selected, its command boundary cannot be bypassed by an
+approval: an unavailable backend rejects the command, Seatbelt denies reads from the rest of the
+workspace, and Bubblewrap removes the rest of that workspace from the command namespace. Absolute
+executables inside the workspace but outside the selected project, including target-local symlinks
+to such executables, are rejected before launch.
 
 The sandbox is constructed by TraceForge, not inferred from an approval. Backend, enforcement
 status, network mode, and any bypass are stored with each command result. The Proof Pack aggregates

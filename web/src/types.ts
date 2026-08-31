@@ -36,7 +36,11 @@ export interface QuestionOption {
 
 export interface ClarificationQuestion {
   id: string;
+  semantic_key?: string | null;
   prompt: string;
+  dimension?: AmbiguityDimension | null;
+  material_effect?: "answer" | "files" | "behavior" | "architecture" | "acceptance" | null;
+  rationale?: string | null;
   options: QuestionOption[];
 }
 
@@ -55,12 +59,52 @@ export interface ProjectCandidate {
   identity: string;
 }
 
-export interface ProjectScope {
+export interface ProjectTarget {
   path: string;
   label: string;
   markers: string[];
   selected_by: "automatic" | "explicit" | "clarification" | "inherited";
   identity: string;
+}
+
+export type RequestWorkKind = "conversation" | "read" | "execute" | "undetermined";
+export type TargetReference =
+  | "none"
+  | "unspecified"
+  | "explicit"
+  | "inherited"
+  | "workspace"
+  | "multiple"
+  | "other";
+export type TargetStatus =
+  | "not_required"
+  | "resolved"
+  | "clarification_required"
+  | "unsupported";
+export type AmbiguityDimension = "target" | "scope" | "constraint" | "acceptance";
+
+export interface RequestResolution {
+  work_kind: RequestWorkKind;
+  workspace_dependent: boolean;
+  target_reference: TargetReference;
+  target_status: TargetStatus;
+  ambiguity_dimensions: AmbiguityDimension[];
+  overview_required: boolean;
+  reasons: string[];
+}
+
+export interface ResolvedClarification {
+  purpose: "requirements" | "project_scope";
+  question_id: string;
+  semantic_key: string;
+  prompt: string;
+  dimension: AmbiguityDimension;
+  material_effect: "answer" | "files" | "behavior" | "architecture" | "acceptance";
+  answer: string;
+  option_id: string | null;
+}
+
+export interface ProjectScope extends ProjectTarget {
   root_listed: boolean;
   evidence_read: string[];
 }
@@ -170,6 +214,9 @@ export interface ConversationTurn {
   summary_stream_id: string | null;
   changed_files: string[];
   project_candidates: ProjectCandidate[];
+  resolved_clarifications: ResolvedClarification[];
+  project_target: ProjectTarget | null;
+  request_resolution: RequestResolution | null;
   project_scope: ProjectScope | null;
   started_at: string;
   completed_at: string | null;

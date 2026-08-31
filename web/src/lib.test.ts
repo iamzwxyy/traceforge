@@ -4,6 +4,8 @@ import {
   backgroundRunRefreshDelay,
   buildActivityChapters,
   clarificationPresentation,
+  currentProjectTarget,
+  currentRequestResolution,
   currentProjectScope,
   effectiveAssistantOutputStatus,
   inferProviderPreset,
@@ -18,13 +20,14 @@ import {
   projectConversationEvents,
   projectProgressEvents,
   reasoningErrorLabel,
+  requestResolutionPresentation,
   shouldSubmitPrompt,
   supportedReasoningEffort,
   taskTitle,
   workspaceInstructionManifest,
   workspaceInstructionErrorLabel,
 } from "./lib";
-import type { Run, RunEvent } from "./types";
+import type { RequestResolution, Run, RunEvent } from "./types";
 
 function event(seq: number): RunEvent {
   return { run_id: "run", seq, type: "message", payload: {}, created_at: "now" };
@@ -178,16 +181,17 @@ describe("mission control helpers", () => {
     expect(presentState("answered")).toEqual({ label: "已答复", tone: "success" });
   });
 
-  it("presents project selection as a bounded read scope and keeps the selected scope visible", () => {
+  it("presents project selection as a bounded target without granting execution authority", () => {
     expect(clarificationPresentation("project_scope")).toEqual({
       eyebrow: "选择项目",
-      title: "选择要处理的项目",
-      detail: "选择后，本轮读取范围会限定在该项目目录内，不会把兄弟目录或项目内部子目录误作项目主体。",
-      submitLabel: "使用此项目",
+      title: "选择本轮的目标项目",
+      detail: "选择只确定本轮目标，不授予执行权限。读取、写入和命令都受该项目边界约束；执行仍按当前审批与沙箱策略处理。",
+      submitLabel: "确认目标项目",
       allowsCustomAnswer: false,
     });
     expect(clarificationPresentation("requirements")).toMatchObject({
-      title: "这些选择会影响后续回答或执行范围",
+      title: "确认会实质影响结果的选择",
+      detail: expect.stringContaining("项目目标选择不占用该额度"),
       allowsCustomAnswer: true,
     });
 
@@ -209,7 +213,40 @@ describe("mission control helpers", () => {
     } as unknown as Run;
 
     expect(currentProjectScope(run)).toEqual({ ...scope, selected_by: "inherited" });
+    expect(currentProjectTarget(run)).toEqual({ ...scope, selected_by: "inherited" });
     expect(currentProjectScope({ turns: [] } as unknown as Run)).toBeNull();
+  });
+
+  it("projects structured project targets and request-resolution reasons for lightweight UI use", () => {
+    const target = {
+      path: "alpha",
+      label: "alpha",
+      markers: ["go.mod"],
+      selected_by: "explicit" as const,
+      identity: "1:2:3",
+    };
+    const resolution: RequestResolution = {
+      work_kind: "execute",
+      workspace_dependent: true,
+      target_reference: "explicit",
+      target_status: "resolved",
+      ambiguity_dimensions: ["constraint", "acceptance"],
+      overview_required: false,
+      reasons: ["The request names alpha."],
+    };
+    const run = {
+      turns: [{ project_target: target, request_resolution: resolution }],
+    } as unknown as Run;
+
+    expect(currentProjectTarget(run)).toEqual(target);
+    expect(currentRequestResolution(run)).toEqual(resolution);
+    expect(requestResolutionPresentation(resolution)).toEqual({
+      workKind: "执行",
+      targetStatus: "目标已确定",
+      ambiguityDimensions: ["约束", "验收"],
+    });
+    expect(currentProjectTarget({ turns: [] } as unknown as Run)).toBeNull();
+    expect(currentRequestResolution({ turns: [] } as unknown as Run)).toBeNull();
   });
 
   it("settles provisional output labels when the run terminates", () => {

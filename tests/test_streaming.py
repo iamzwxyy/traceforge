@@ -2310,7 +2310,9 @@ async def test_verified_finish_summary_stream_is_committed_by_the_success_event(
     )
     manager = AgentManager(settings, storage, provider)
 
-    run = await manager.start_run("inspect without changing files", verifier_enabled=False)
+    run = await manager.start_run(
+        "Update note.txt in the workspace", verifier_enabled=False
+    )
     completed = await manager.wait(run.id)
     events = storage.get_events(run.id)
     output_completed = next(
@@ -2383,7 +2385,7 @@ async def test_verifier_outage_aborts_the_provider_completed_finish_owner(
         _VerifierOutageAfterFinishProvider(summary),
     )
 
-    run = await manager.start_run("interrupt during independent verification")
+    run = await manager.start_run("Update note.txt before independent verification")
     interrupted = await manager.wait(run.id)
     events = storage.get_events(run.id)
     completed = next(
@@ -2437,7 +2439,7 @@ async def test_shutdown_aborts_the_provider_completed_finish_owner(
     provider = _BlockingVerifierAfterFinishProvider(summary)
     manager = AgentManager(settings, storage, provider)
 
-    run = await manager.start_run("shut down during independent verification")
+    run = await manager.start_run("Update note.txt before shutdown verification")
     await asyncio.wait_for(provider.verifier_started.wait(), timeout=2)
     await manager.shutdown()
 

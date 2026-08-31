@@ -10,6 +10,17 @@ import traceforge.project_scope as project_scope_module
 from traceforge.models import ProjectCandidate
 from traceforge.project_scope import (
     discover_project_candidates,
+    has_advisory_action_intent,
+    has_diagnostic_action_intent,
+    has_execution_intent,
+    has_governed_multiple_project_targets,
+    has_governed_workspace_root_target,
+    has_inspection_read_action_intent,
+    has_mixed_adjacent_explicit_project_targets,
+    has_mixed_current_other_project_targets,
+    has_other_project_target_intent,
+    has_overview_read_action_intent,
+    has_read_action_intent,
     is_explicit_project_switch_request,
     is_negated_project_switch_request,
     is_other_project_scope_request,
@@ -18,9 +29,11 @@ from traceforge.project_scope import (
     is_project_scope_reset_request,
     lookup_explicit_project_candidates,
     lookup_project_candidate_by_name,
+    mask_execution_action_words,
     matching_candidates,
     negated_project_switch_candidates,
     positive_project_switch_candidates,
+    target_role_candidates,
 )
 
 
@@ -663,7 +676,7 @@ def test_new_operation_vocabulary_keeps_how_to_requests_read_only(
     candidates = [_candidate("app")]
 
     assert is_project_overview_request(prompt, candidates) is True
-    assert is_project_scope_followup_request(prompt) is True
+    assert is_project_scope_followup_request(prompt) is False
 
 
 @pytest.mark.parametrize(
@@ -683,7 +696,7 @@ def test_operation_nouns_without_command_structure_remain_read_only(
     candidates = [_candidate("app")]
 
     assert is_project_overview_request(prompt, candidates) is True
-    assert is_project_scope_followup_request(prompt) is True
+    assert is_project_scope_followup_request(prompt) is False
 
 
 @pytest.mark.parametrize(
@@ -820,17 +833,20 @@ def test_unlisted_but_structural_mutation_commands_fall_open(prompt: str) -> Non
 
 
 @pytest.mark.parametrize(
-    "prompt",
+    ("prompt", "inherits"),
     [
-        "介绍项目并分析架构",
-        "Describe the project and explain its architecture",
+        ("介绍项目并分析架构", False),
+        ("Describe the project and explain its architecture", True),
     ],
 )
-def test_known_read_only_mixed_clauses_remain_in_project_scope(prompt: str) -> None:
+def test_known_read_only_mixed_clauses_remain_in_project_scope(
+    prompt: str,
+    inherits: bool,
+) -> None:
     candidates = [_candidate("app")]
 
     assert is_project_overview_request(prompt, candidates) is True
-    assert is_project_scope_followup_request(prompt) is True
+    assert is_project_scope_followup_request(prompt) is inherits
 
 
 @pytest.mark.parametrize(
@@ -854,7 +870,7 @@ def test_common_read_only_mixed_phrasings_remain_scoped(suffix: str) -> None:
     candidates = [_candidate("alpha"), _candidate("beta")]
 
     assert is_project_overview_request(prompt, candidates) is True
-    assert is_project_scope_followup_request(prompt) is True
+    assert is_project_scope_followup_request(prompt) is False
 
 
 @pytest.mark.parametrize(
@@ -890,7 +906,7 @@ def test_discourse_markers_with_read_only_clauses_remain_scoped(
     candidates = [_candidate("alpha"), _candidate("beta")]
 
     assert is_project_overview_request(prompt, candidates) is True
-    assert is_project_scope_followup_request(prompt) is True
+    assert is_project_scope_followup_request(prompt) is False
 
 
 @pytest.mark.parametrize(
@@ -941,17 +957,20 @@ def test_unrelated_overview_words_do_not_inherit_project_scope(prompt: str) -> N
 
 
 @pytest.mark.parametrize(
-    "prompt",
+    ("prompt", "expected"),
     [
-        "再详细介绍一下",
-        "它用了什么数据库?",
-        "分析项目架构",
-        "解释 README",
-        "Explain the README",
+        ("再详细介绍一下", True),
+        ("它用了什么数据库?", True),
+        ("分析项目架构", False),
+        ("解释 README", False),
+        ("Explain the README", False),
     ],
 )
-def test_bounded_project_references_still_inherit_project_scope(prompt: str) -> None:
-    assert is_project_scope_followup_request(prompt) is True
+def test_only_referential_project_details_inherit_project_scope(
+    prompt: str,
+    expected: bool,
+) -> None:
+    assert is_project_scope_followup_request(prompt) is expected
 
 
 def test_bare_it_requires_a_project_detail_to_inherit_scope() -> None:
@@ -960,22 +979,25 @@ def test_bare_it_requires_a_project_detail_to_inherit_scope() -> None:
 
 
 @pytest.mark.parametrize(
-    "prompt",
+    ("prompt", "expected"),
     [
-        "继续",
-        "再详细一点",
-        "continue",
-        "有哪些依赖?",
-        "技术栈是什么?",
-        "架构怎么样?",
-        "数据库呢?",
-        "主要功能是什么?",
-        "用什么语言写的?",
-        "入口在哪?",
+        ("继续", True),
+        ("再详细一点", True),
+        ("continue", True),
+        ("有哪些依赖?", False),
+        ("技术栈是什么?", False),
+        ("架构怎么样?", False),
+        ("数据库呢?", False),
+        ("主要功能是什么?", False),
+        ("用什么语言写的?", False),
+        ("入口在哪?", False),
     ],
 )
-def test_adjacent_project_continuations_and_details_inherit_scope(prompt: str) -> None:
-    assert is_project_scope_followup_request(prompt) is True
+def test_only_pure_continuations_inherit_without_an_explicit_project_reference(
+    prompt: str,
+    expected: bool,
+) -> None:
+    assert is_project_scope_followup_request(prompt) is expected
 
 
 @pytest.mark.parametrize(
@@ -1033,7 +1055,7 @@ def test_mutation_words_in_explanatory_noun_contexts_remain_read_only(
     candidates = [_candidate("app")]
 
     assert is_project_overview_request(prompt, candidates) is True
-    assert is_project_scope_followup_request(prompt) is True
+    assert is_project_scope_followup_request(prompt) is False
 
 
 @pytest.mark.parametrize(
@@ -1055,7 +1077,7 @@ def test_extended_mutation_words_keep_explanatory_context_read_only(
     candidates = [_candidate("app")]
 
     assert is_project_overview_request(prompt, candidates) is True
-    assert is_project_scope_followup_request(prompt) is True
+    assert is_project_scope_followup_request(prompt) is False
 
 
 @pytest.mark.parametrize(
@@ -1075,7 +1097,7 @@ def test_contextual_mutation_words_in_project_names_remain_read_only(
     candidates = [_candidate("app")]
 
     assert is_project_overview_request(prompt, candidates) is True
-    assert is_project_scope_followup_request(prompt) is True
+    assert is_project_scope_followup_request(prompt) is False
 
 
 @pytest.mark.parametrize(
@@ -1095,7 +1117,7 @@ def test_more_contextual_mutation_roots_in_names_remain_read_only(
     candidates = [_candidate("app")]
 
     assert is_project_overview_request(prompt, candidates) is True
-    assert is_project_scope_followup_request(prompt) is True
+    assert is_project_scope_followup_request(prompt) is False
 
 
 @pytest.mark.parametrize(
@@ -1185,7 +1207,7 @@ def test_common_domain_names_are_not_silent_explicit_project_selections(
 ) -> None:
     candidate = _candidate(name)
 
-    assert matching_candidates(prompt, [candidate]) == []
+    assert target_role_candidates(prompt, [candidate]) == []
     assert is_project_overview_request(prompt, [candidate]) is False
 
 
@@ -1208,7 +1230,7 @@ def test_test_result_is_a_read_only_project_explanation() -> None:
     prompt = "介绍项目的测试结果"
 
     assert is_project_overview_request(prompt, [_candidate("app")]) is True
-    assert is_project_scope_followup_request(prompt) is True
+    assert is_project_scope_followup_request(prompt) is False
 
 
 @pytest.mark.parametrize(
@@ -1391,3 +1413,666 @@ def test_xcode_bundle_uses_its_readable_project_file_as_evidence(tmp_path: Path)
     assert inventory.candidates[0].markers == [
         "TraceForge.xcodeproj/project.pbxproj"
     ]
+
+
+_ENGLISH_OPERATIONS = (
+    "build",
+    "run",
+    "execute",
+    "deploy",
+    "publish",
+    "test",
+    "start",
+    "install",
+    "update",
+    "upgrade",
+    "compile",
+    "restart",
+    "stop",
+)
+_CHINESE_OPERATIONS = (
+    "构建",
+    "运行",
+    "执行",
+    "部署",
+    "发布",
+    "测试",
+    "启动",
+    "安装",
+    "更新",
+    "升级",
+    "编译",
+    "重启",
+    "停止",
+)
+
+
+@pytest.mark.parametrize("operation", _ENGLISH_OPERATIONS)
+def test_shared_english_operation_vocabulary_preserves_modality(operation: str) -> None:
+    assert has_advisory_action_intent(f"Should we {operation} the project?") is True
+    assert has_execution_intent(f"Should we {operation} the project?") is False
+    assert has_execution_intent(f"Please {operation} the project") is True
+
+
+@pytest.mark.parametrize("operation", _CHINESE_OPERATIONS)
+def test_shared_chinese_operation_vocabulary_preserves_modality(operation: str) -> None:
+    assert has_advisory_action_intent(f"是否应该{operation}项目?") is True
+    assert has_execution_intent(f"是否应该{operation}项目?") is False
+    assert has_execution_intent(f"请{operation}项目") is True
+
+
+@pytest.mark.parametrize("operation", _ENGLISH_OPERATIONS)
+def test_every_english_operation_uses_the_same_verified_target_slot(
+    operation: str,
+) -> None:
+    alpha = _candidate("alpha")
+
+    assert target_role_candidates(f"{operation.title()} alpha", [alpha]) == [alpha]
+
+
+@pytest.mark.parametrize("operation", _CHINESE_OPERATIONS)
+def test_every_chinese_operation_uses_the_same_verified_target_slot(
+    operation: str,
+) -> None:
+    alpha = _candidate("alpha")
+
+    assert target_role_candidates(f"{operation}alpha", [alpha]) == [alpha]
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Run alpha and beta tests",
+        "Build alpha and beta apps",
+        "Run tests in alpha and beta",
+        "Fix login in alpha and beta",
+        "Check dependencies for alpha and beta",
+        "Inspect alpha and beta",
+        "Inspect either alpha or beta",
+        "运行alpha和beta的测试",
+        "在alpha和beta中运行测试",
+        "修复alpha和beta的登录",
+        "检查alpha和beta的依赖",
+    ],
+)
+def test_coordinated_verified_names_share_one_target_slot(prompt: str) -> None:
+    candidates = [_candidate("alpha"), _candidate("beta")]
+
+    assert target_role_candidates(prompt, candidates) == candidates
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("Inspect alpha, then inspect beta", ["alpha", "beta"]),
+        ("Inspect alpha then run beta tests", ["alpha", "beta"]),
+        ("检查alpha\uff0c然后检查beta", ["alpha", "beta"]),
+        ("Do not inspect beta; inspect alpha", ["alpha"]),
+        ("Please do not inspect beta; inspect alpha", ["alpha"]),
+        ("Don't run beta tests; run alpha tests", ["alpha"]),
+        ("请不要检查beta\uff0c检查alpha", ["alpha"]),
+        ("Instead of inspecting beta, inspect alpha", ["alpha"]),
+        ("Run alpha tests rather than beta tests", ["alpha"]),
+        ("Fix beta instead of alpha", ["beta"]),
+        ("修复beta而不是alpha", ["beta"]),
+        ("Switch from alpha to beta", ["beta"]),
+        ("不要切换到beta\uff0c检查alpha", ["alpha"]),
+    ],
+)
+def test_target_collection_unions_positive_clauses_and_respects_polarity(
+    prompt: str,
+    expected: list[str],
+) -> None:
+    candidates = [_candidate("alpha"), _candidate("beta")]
+
+    assert [item.path for item in target_role_candidates(prompt, candidates)] == expected
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Compare alpha or beta",
+        "Compare either alpha or beta",
+        "比较alpha或beta",
+    ],
+)
+def test_alternative_comparison_targets_never_silently_narrow(prompt: str) -> None:
+    candidates = [_candidate("alpha"), _candidate("beta")]
+
+    assert target_role_candidates(prompt, candidates) == candidates
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("Search entire workspace for alpha", []),
+        ("Search for alpha", []),
+        ("Search for alpha in beta", ["beta"]),
+        ("Look for alpha in beta", ["beta"]),
+        ("Check beta for alpha bugs", ["beta"]),
+        ("Run tests for alpha", ["alpha"]),
+        ("Architecture for alpha", ["alpha"]),
+    ],
+)
+def test_preposition_target_roles_follow_the_governing_predicate(
+    prompt: str,
+    expected: list[str],
+) -> None:
+    candidates = [_candidate("alpha"), _candidate("beta")]
+
+    assert [item.path for item in target_role_candidates(prompt, candidates)] == expected
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Compare alpha with beta",
+        "Compare alpha to beta",
+        "Copy a file from alpha to beta",
+        "Copy alpha config into beta",
+        "Read alpha then update beta",
+        "Inspect alpha before fixing beta",
+        "从alpha复制文件到beta",
+        "参考alpha修改beta",
+        "先检查alpha再修复beta",
+    ],
+)
+def test_source_and_destination_projects_are_both_required_scope(prompt: str) -> None:
+    candidates = [_candidate("alpha"), _candidate("beta")]
+
+    assert target_role_candidates(prompt, candidates) == candidates
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ('Search for "alpha" in beta', ["beta"]),
+        ("Find references to `alpha` in beta", ["beta"]),
+        ('Explain string "alpha"', []),
+        ('Compare terms "alpha" and "beta"', []),
+        ("Run `pytest`", []),
+    ],
+)
+def test_quotes_supply_boundaries_but_not_project_target_roles(
+    prompt: str,
+    expected: list[str],
+) -> None:
+    candidates = [_candidate("alpha"), _candidate("beta"), _candidate("pytest")]
+
+    assert [item.path for item in target_role_candidates(prompt, candidates)] == expected
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "What does alpha do?",
+        "How does alpha work?",
+        "alpha如何工作",
+        "alpha能做什么",
+    ],
+)
+def test_bare_semantic_subject_does_not_silently_bind_a_candidate(prompt: str) -> None:
+    alpha = _candidate("alpha")
+
+    assert target_role_candidates(prompt, [alpha]) == []
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "What does the alpha project do?",
+        "How does the alpha project work?",
+        "alpha项目如何工作",
+        "alpha项目能做什么",
+    ],
+)
+def test_project_cue_makes_a_semantic_subject_explicit(prompt: str) -> None:
+    alpha = _candidate("alpha")
+
+    assert target_role_candidates(prompt, [alpha]) == [alpha]
+
+
+@pytest.mark.parametrize(
+    ("name", "prompt"),
+    [
+        ("python", "Show Python code examples"),
+        ("react", "Explain hooks in React"),
+        ("app", "Read app config"),
+        ("build", "Run build tests"),
+        ("test", "Build test app"),
+        ("deploy", "Check deploy configuration"),
+    ],
+)
+def test_domain_and_action_candidate_collisions_do_not_change_semantics(
+    name: str,
+    prompt: str,
+) -> None:
+    assert target_role_candidates(prompt, [_candidate(name)]) == []
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Should we fix the bug? Then run tests.",
+        "讨论是否修复问题\uff0c然后运行测试",
+        "Where is authentication implemented? Then fix the bug.",
+    ],
+)
+def test_discussed_action_clause_does_not_weaken_a_later_imperative(
+    prompt: str,
+) -> None:
+    assert has_execution_intent(prompt) is True
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Should we fix and run tests?",
+        "No need to run tests",
+        "You don't need to run tests",
+        "I don't want to modify files",
+        "I'm not asking you to fix it",
+        "我不想修改文件",
+    ],
+)
+def test_advisory_and_negated_action_clauses_do_not_authorize_execution(
+    prompt: str,
+) -> None:
+    assert has_execution_intent(prompt) is False
+
+
+def test_shared_read_predicates_and_action_mask_are_public_composition_atoms() -> None:
+    assert has_read_action_intent("Explore the project") is True
+    assert has_overview_read_action_intent("Break down the project") is True
+    assert has_inspection_read_action_intent("Examine the files") is True
+    assert has_diagnostic_action_intent("Troubleshoot failing tests") is True
+    masked = mask_execution_action_words("Should we test the dependencies?")
+    assert "test" not in masked.casefold()
+    assert "dependencies" in masked
+    assert "idea" in mask_execution_action_words("Should we test this idea?")
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Inspect this workspace",
+        "Analyze the workspace root",
+        "Show files in the current directory",
+        "Run tests across the entire workspace",
+        "分析这个目录",
+        "查看当前工作区",
+    ],
+)
+def test_workspace_root_phrases_require_a_governing_local_predicate(prompt: str) -> None:
+    assert has_governed_workspace_root_target(prompt) is True
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "What is a workspace root?",
+        "Explain the concept of entire workspace",
+        'Explain the term "workspace root"',
+    ],
+)
+def test_workspace_root_concepts_are_not_local_targets(prompt: str) -> None:
+    assert has_governed_workspace_root_target(prompt) is False
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Check alpha and all projects",
+        "Run alpha tests and tests in every project",
+        "Compare these repositories",
+        "Inspect both other projects",
+        "比较这些项目",
+        "介绍这两个项目",
+        "检查所有其他项目",
+    ],
+)
+def test_quantified_project_sets_require_a_governed_target_slot(prompt: str) -> None:
+    assert has_governed_multiple_project_targets(prompt) is True
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Fix alpha to support all projects",
+        'Add "all projects" option',
+        "Write docs for all projects",
+        "Check all dependencies in alpha",
+    ],
+)
+def test_project_set_words_in_feature_or_constraint_objects_are_not_targets(
+    prompt: str,
+) -> None:
+    assert has_governed_multiple_project_targets(prompt) is False
+
+
+def test_other_and_mixed_current_other_helpers_are_governed() -> None:
+    assert has_other_project_target_intent("Inspect another project") is True
+    assert has_other_project_target_intent("another one") is True
+    assert has_other_project_target_intent("What is another project?") is False
+    assert has_other_project_target_intent('Explain "another project"') is False
+    assert (
+        has_mixed_current_other_project_targets(
+            "Compare this project with another project"
+        )
+        is True
+    )
+    assert has_mixed_current_other_project_targets("Copy from it to another project") is True
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Compare this project with beta",
+        "Compare it to beta",
+        "Compare its architecture with beta",
+        "Inspect this project and beta",
+        "Copy a file from this project to beta",
+        "比较这个项目和beta",
+        "先检查这个项目再修复beta",
+    ],
+)
+def test_adjacent_and_explicit_targets_are_reported_as_mixed(prompt: str) -> None:
+    assert has_mixed_adjacent_explicit_project_targets(
+        prompt, [_candidate("alpha"), _candidate("beta")]
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "What does it do?",
+        "How is it organized?",
+        "How does it work?",
+        "Does it have tests?",
+        "它是做什么的?",
+        "它是如何工作的?",
+        "它有哪些模块?",
+        "它的目录结构?",
+    ],
+)
+def test_strong_project_pronoun_questions_are_adjacent_references(prompt: str) -> None:
+    assert is_project_scope_followup_request(prompt) is True
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "What database is typical?",
+        "What architecture is common?",
+        "How do I run unit tests in Python?",
+        "How do I build a Docker image?",
+        "部署流程一般是什么?",
+        "如何构建镜像?",
+        "运行脚本",
+        "测试工具有哪些?",
+        "有哪些依赖?",
+        "架构怎么样?",
+    ],
+)
+def test_generic_details_and_operation_topics_are_not_adjacent_references(
+    prompt: str,
+) -> None:
+    assert is_project_scope_followup_request(prompt) is False
+
+
+@pytest.mark.parametrize(
+    ("name", "prompt"),
+    [
+        ("python", "Explain Python architecture"),
+        ("react", "Show React code"),
+        ("app", "Check app dependencies"),
+        ("server", "Explain server architecture"),
+        ("database", "Explain database configuration"),
+        ("服务", "解释服务架构"),
+        ("数据库", "解释数据库配置"),
+    ],
+)
+def test_collision_candidate_property_is_not_a_silent_project_binding(
+    name: str,
+    prompt: str,
+) -> None:
+    assert target_role_candidates(prompt, [_candidate(name)]) == []
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Explain alpha architecture",
+        "解释alpha架构",
+        "Show alpha code",
+        "Check alpha dependencies",
+        "What database does alpha use?",
+    ],
+)
+def test_low_collision_candidate_read_shorthand_is_explicit(prompt: str) -> None:
+    alpha = _candidate("alpha")
+
+    assert target_role_candidates(prompt, [alpha]) == [alpha]
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Add feature X to alpha",
+        "Add login support to alpha",
+        "Apply patch to alpha",
+        "Deploy to alpha",
+        "Write code to alpha",
+    ],
+)
+def test_destination_preposition_is_a_strong_execution_target(prompt: str) -> None:
+    alpha = _candidate("alpha")
+
+    assert target_role_candidates(prompt, [alpha]) == [alpha]
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Fix alpha and update beta",
+        "Fix alpha then update beta",
+        "Fix alpha before update beta",
+        "Fix alpha after update beta",
+        "Fix alpha plus update beta",
+        "Fix alpha and also update beta",
+        "Fix alpha as well as update beta",
+        "修复alpha并更新beta",
+        "修复alpha然后更新beta",
+        "修复alpha再更新beta",
+        "修复alpha同时更新beta",
+        "修复alpha\uff0c然后更新beta",
+        "检查alpha后再修复beta",
+        "Inspect alpha and review beta",
+        "Inspect alpha before review beta",
+        "Inspect alpha while review beta",
+        "Inspect alpha before reviewing beta",
+        "Inspect alpha while reviewing beta",
+        "Fix alpha before updating beta",
+        "Inspect alpha or review beta",
+        "检查alpha或查看beta",
+    ],
+)
+def test_independently_governed_predicates_union_all_targets(prompt: str) -> None:
+    candidates = [_candidate("alpha"), _candidate("beta")]
+
+    assert target_role_candidates(prompt, candidates) == candidates
+
+
+def test_replaced_target_is_not_added_to_positive_target_union() -> None:
+    candidates = [_candidate("alpha"), _candidate("beta")]
+
+    assert target_role_candidates("Inspect alpha rather than beta", candidates) == [
+        candidates[0]
+    ]
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "介绍同一个项目",
+        "介绍同一项目",
+        "介绍同个项目",
+        "介绍同样的项目",
+        "介绍相同的项目",
+        "介绍刚才那个项目",
+        "继续介绍同一个项目",
+    ],
+)
+def test_explicit_same_project_phrases_are_adjacent_references(prompt: str) -> None:
+    assert is_project_scope_followup_request(prompt) is True
+
+
+def test_either_or_cross_predicate_exposes_both_target_candidates() -> None:
+    candidates = [_candidate("alpha"), _candidate("beta")]
+
+    assert target_role_candidates("要么修复alpha\uFF0C要么更新beta", candidates) == candidates
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Explain alpha's architecture",
+        "Explain the alpha project architecture",
+        "Inspect architecture in alpha",
+        "检查alpha的依赖",
+        "在alpha中检查依赖",
+    ],
+)
+def test_possessive_locative_and_project_cues_are_strong_target_roles(
+    prompt: str,
+) -> None:
+    alpha = _candidate("alpha")
+
+    assert target_role_candidates(prompt, [alpha]) == [alpha]
+
+
+@pytest.mark.parametrize(
+    ("name", "prompt"),
+    [
+        ("python", "Inspect files in python"),
+        ("go", "Explain go's dependencies"),
+        ("react", "Inspect the react project"),
+        ("run", "Inspect files in the run project"),
+        ("build", "Explain the build project's architecture"),
+    ],
+)
+def test_strong_target_grammar_is_independent_of_candidate_word_meaning(
+    name: str,
+    prompt: str,
+) -> None:
+    candidate = _candidate(name)
+
+    assert target_role_candidates(prompt, [candidate]) == [candidate]
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Explain the fix",
+        "Show me the proposed fix",
+        "Summarize the fix",
+        "Outline the fix",
+        "Walk me through the fix",
+        "Break down the fix",
+        "What does fix mean?",
+        "The fix failed",
+        "I don't want you to fix alpha",
+        "We are not asking you to change alpha",
+        "I recommend we fix alpha",
+        "Do you recommend we fix alpha?",
+        "我不想让你修改alpha",
+        "不用你修复alpha",
+        "不要直接修改alpha\uff0c只解释问题",
+    ],
+)
+def test_action_words_without_a_positive_imperative_frame_are_not_execution(
+    prompt: str,
+) -> None:
+    assert has_execution_intent(prompt) is False
+
+
+def test_direct_action_still_authorizes_execution_after_modality_filtering() -> None:
+    assert has_execution_intent("Fix alpha") is True
+    assert has_execution_intent("Apply the first edit") is True
+    assert has_execution_intent("修复alpha") is True
+
+
+def test_targeted_lookup_uses_the_same_target_slot_grammar_beyond_scan_cap(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    for name in ("alpha", "前端", "Describe", "in"):
+        _create_project(root, name, "package.json")
+
+    prompts = {
+        "Inspect alpha": ["alpha"],
+        "Run alpha": ["alpha"],
+        "Fix alpha": ["alpha"],
+        "In alpha run tests": ["alpha"],
+        "在前端中搜索代码": ["前端"],
+        "检查前端的依赖": ["前端"],
+        'Describe project named "alpha"': ["alpha"],
+        'Run tests in project "alpha"': ["alpha"],
+    }
+    for prompt, expected in prompts.items():
+        assert [
+            item.path for item in lookup_explicit_project_candidates(root, prompt)
+        ] == expected
+
+    assert lookup_explicit_project_candidates(root, "Describe the project") == ()
+    assert lookup_explicit_project_candidates(root, "Search for alpha") == ()
+
+
+def test_cjk_targeted_lookup_strips_governed_object_suffixes(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    for index in range(55):
+        _create_project(root, f"project-{index:03d}", "package.json")
+    for name in ("前端", "后端", "前端依赖", "订单服务", "alpha", "代码"):
+        _create_project(root, name, "package.json")
+
+    prompts = {
+        "检查前端依赖": ["前端"],
+        "解释订单服务架构": ["订单服务"],
+        "修复订单服务登录": ["订单服务"],
+        "在alpha中搜索代码": ["alpha"],
+        "介绍订单服务": ["订单服务"],
+        "修复订单服务": ["订单服务"],
+        "部署订单服务": ["订单服务"],
+        "检查订单服务 架构": ["订单服务"],
+        "检查前端和后端依赖": ["前端", "后端"],
+        "比较前端和后端架构": ["前端", "后端"],
+    }
+    for prompt, expected in prompts.items():
+        assert [
+            candidate.path
+            for candidate in lookup_explicit_project_candidates(root, prompt)
+        ] == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "prompt"),
+    [
+        ("app", "Deploy the service to app"),
+        ("python", "Write docs into python"),
+        ("python", "Inspect files in python"),
+    ],
+)
+def test_strong_lookup_slots_bypass_weak_name_collision_filter(
+    tmp_path: Path,
+    name: str,
+    prompt: str,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _create_project(root, name, "package.json")
+
+    assert [
+        candidate.path for candidate in lookup_explicit_project_candidates(root, prompt)
+    ] == [name]

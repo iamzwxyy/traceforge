@@ -53,6 +53,7 @@ import {
   availableProofTurnIndexes,
   clarificationPresentation,
   currentProjectScope,
+  currentProjectTarget,
   effectiveAssistantOutputStatus,
   inferProviderPreset,
   isActiveState,
@@ -81,6 +82,7 @@ import type {
   Project,
   ProjectCandidate,
   ProjectScope,
+  ProjectTarget,
   ProofPack,
   ProviderConfig,
   ProviderProbe,
@@ -1776,6 +1778,7 @@ function RunStage({
   const latestProofTurnIndex = proofTurnIndexes.at(-1) ?? null;
   const currentTurnIndex = run.turns.at(-1)?.index ?? 1;
   const projectScope = currentProjectScope(run);
+  const projectTarget = currentProjectTarget(run);
   const workspaceRules = latestWorkspaceInstructionManifest(events, currentTurnIndex);
   const currentProofTurnIndex = run.state === "succeeded"
     && proofTurnIndexes.includes(currentTurnIndex)
@@ -1818,7 +1821,7 @@ function RunStage({
             {run.mode === "plan" && run.plan_gate && <PlanGateBadge gate={run.plan_gate} />}
             <ApprovalModeBadge mode={run.approval_mode} />
             <ReasoningEffortBadge effort={run.reasoning_effort} />
-            {projectScope && <ProjectScopeBadge scope={projectScope} />}
+            {projectTarget && <ProjectTargetBadge target={projectTarget} scope={projectScope} />}
             {workspaceRules && <WorkspaceRulesBadge manifest={workspaceRules} />}
             <span>第 {currentTurnIndex} 轮</span>
             {run.parent_run_id && (
@@ -3004,16 +3007,22 @@ function WorkspaceRulesBadge({ manifest }: { manifest: WorkspaceInstructionManif
   );
 }
 
-function ProjectScopeBadge({ scope }: { scope: ProjectScope }) {
-  const evidence = scope.evidence_read.length > 0
+function ProjectTargetBadge({
+  target,
+  scope,
+}: {
+  target: ProjectTarget;
+  scope: ProjectScope | null;
+}) {
+  const evidence = scope && scope.evidence_read.length > 0
     ? `已读取 ${scope.evidence_read.join("、")}`
-    : scope.root_listed
+    : scope?.root_listed
       ? "已核对项目根目录"
-      : `项目标记：${scope.markers.join("、")}`;
-  const description = `当前轮读取范围限定为 ${scope.path}；${evidence}`;
+      : "读写与命令均限定在该项目边界";
+  const description = `当前轮目标为 ${target.path}；${evidence}。选择目标不授予执行权限。`;
   return (
     <span className="project-scope-badge" title={description} aria-label={description}>
-      <FolderOpen size={10} />项目 {scope.label}
+      <FolderOpen size={10} />项目 {target.label}
     </span>
   );
 }

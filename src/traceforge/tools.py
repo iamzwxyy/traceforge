@@ -87,6 +87,12 @@ def _binding_matches_identity(
     )
 
 
+def _binding_identity_token(binding: ProjectScopeBinding) -> str:
+    if binding.ctime_ns is None:
+        raise ValueError("Persisted project scope identity requires a ctime generation")
+    return f"{binding.device}:{binding.inode}:{binding.ctime_ns}"
+
+
 @dataclass(frozen=True, slots=True)
 class SearchGlob:
     components: tuple[re.Pattern[str], ...]
@@ -198,6 +204,13 @@ class ToolRegistry:
     def clear_project_scope(self, run_id: str) -> None:
         self._project_scopes.pop(run_id, None)
 
+    def current_project_scope_identity(self, run_id: str) -> str | None:
+        binding = self._project_scopes.get(run_id)
+        if binding is None:
+            return None
+        self._validated_project_scope(binding)
+        return _binding_identity_token(binding)
+
     @property
     def sandbox_status(self) -> SandboxStatus:
         return self.sandbox.status
@@ -281,13 +294,47 @@ class ToolRegistry:
             },
         ]
 
-    def assess(self, call: ToolCall, plan: TaskPlan | None) -> PermissionAssessment:
+    def assess(
+        self,
+        call: ToolCall,
+        plan: TaskPlan | None,
+        *,
+        run_id: str | None = None,
+    ) -> PermissionAssessment:
+        binding = self._project_scopes.get(run_id) if run_id is not None else None
+        if binding is not None:
+            try:
+                self._validated_project_scope(binding)
+            except WorkspaceViolation as exc:
+                return PermissionAssessment(
+                    PermissionDecision.DENY,
+                    str(exc),
+                    "dangerous",
+                )
+        if (
+            call.name in {"apply_patch", "create_file"}
+            and plan is not None
+            and not plan.impacted_files
+        ):
+            return PermissionAssessment(
+                PermissionDecision.DENY,
+                "Mutation denied because the visible plan declares no impacted files",
+                "dangerous",
+            )
         if call.name in {"apply_patch", "create_file"} and plan and plan.impacted_files:
             try:
-                mutation_paths = self._mutation_paths(call)
+                mutation_paths = self._mutation_paths(call, binding=binding)
+                planned_paths = {
+                    self._effective_scoped_path(binding, path)
+                    if binding is not None
+                    else self.workspace.relative(
+                        self.workspace.resolve_write(path)
+                    )
+                    for path in plan.impacted_files
+                }
             except (PatchError, WorkspaceViolation) as exc:
                 return PermissionAssessment(PermissionDecision.DENY, str(exc), "dangerous")
-            unexpected = sorted(set(mutation_paths) - set(plan.impacted_files))
+            unexpected = sorted(set(mutation_paths) - planned_paths)
             if unexpected:
                 return PermissionAssessment(
                     PermissionDecision.ASK,
@@ -310,11 +357,31 @@ class ToolRegistry:
                 "argv must be a non-empty string list",
                 "unknown",
             )
-        hard_denial = _hard_command_denial(argv, self.workspace.root)
+        command_root = (
+            binding.resolved_path if binding is not None else self.workspace.root
+        )
+        hard_denial = _hard_command_denial(argv, command_root)
         if hard_denial is not None:
             return PermissionAssessment(
                 PermissionDecision.DENY,
                 hard_denial,
+                "dangerous",
+            )
+        try:
+            self.sandbox.validate_executable_scope(
+                argv[0],
+                execution_root=command_root,
+            )
+        except ValueError as exc:
+            return PermissionAssessment(
+                PermissionDecision.DENY,
+                str(exc),
+                "dangerous",
+            )
+        if binding is not None and not self.sandbox.status.enforced:
+            return PermissionAssessment(
+                PermissionDecision.DENY,
+                "Commands in a selected project require an enforced OS sandbox",
                 "dangerous",
             )
         check_relation = _accepted_check_relation(argv, plan)
@@ -341,10 +408,13 @@ class ToolRegistry:
         call: ToolCall,
         plan: TaskPlan | None,
         mode: ApprovalMode,
+        *,
+        run_id: str | None = None,
     ) -> PermissionResolution:
         """Apply the user-selected approval mode without weakening invariant denials."""
 
-        assessment = self.assess(call, plan)
+        assessment = self.assess(call, plan, run_id=run_id)
+        scoped = run_id is not None and run_id in self._project_scopes
         if assessment.decision is PermissionDecision.DENY:
             return PermissionResolution(
                 mode=mode,
@@ -417,6 +487,7 @@ class ToolRegistry:
             sandbox_bypass_on_allow=(
                 call.name == "run_command"
                 and assessment.decision is PermissionDecision.ASK
+                and not scoped
             ),
         )
 
@@ -431,15 +502,18 @@ class ToolRegistry:
         mutation_baseline: dict[str, tuple[bool, str | None]] = {}
         scope_metadata: dict[str, str] = {}
         try:
+            binding = self._project_scopes.get(run_id)
+            if binding is not None:
+                self._validated_project_scope(binding)
+                scope_metadata = self._project_scope_metadata(binding)
             if call.name in {"apply_patch", "create_file", "run_command"}:
                 self._require_workspace_instruction_grant(run_id)
             if call.name in {"apply_patch", "create_file"}:
-                mutation_baseline = self._mutation_baseline(call)
+                mutation_baseline = self._mutation_baseline(call, binding=binding)
             if call.name in {"list_files", "read_file", "search_text"}:
                 # Every read uses the same bounded descriptor walker. A selected project narrows
                 # the virtual root; otherwise the immutable workspace root binding is used without
                 # reporting a synthetic project scope to the UI.
-                binding = self._project_scopes.get(run_id)
                 if binding is not None:
                     output, scope_metadata = await asyncio.to_thread(
                         self._execute_scoped_read,
@@ -452,13 +526,24 @@ class ToolRegistry:
                         call,
                     )
             elif call.name == "apply_patch":
-                output = self._apply_patch(run_id, **call.arguments)
+                try:
+                    output = self._apply_patch(run_id, binding=binding, **call.arguments)
+                finally:
+                    if binding is not None:
+                        binding = self._refresh_project_scope_binding(run_id, binding)
+                        scope_metadata = self._project_scope_metadata(binding)
             elif call.name == "create_file":
-                output = self._create_file(run_id, **call.arguments)
+                try:
+                    output = self._create_file(run_id, binding=binding, **call.arguments)
+                finally:
+                    if binding is not None:
+                        binding = self._refresh_project_scope_binding(run_id, binding)
+                        scope_metadata = self._project_scope_metadata(binding)
             elif call.name == "run_command":
                 return await self._run_command(
                     run_id,
                     call,
+                    binding=binding,
                     output_callback=output_callback,
                     sandbox_bypass=sandbox_bypass,
                     **call.arguments,
@@ -476,7 +561,10 @@ class ToolRegistry:
                 ok=True,
                 output=output,
                 metadata=(
-                    {"changed_files": self._changed_mutation_paths(mutation_baseline)}
+                    {
+                        "changed_files": self._changed_mutation_paths(mutation_baseline),
+                        **scope_metadata,
+                    }
                     if call.name in {"apply_patch", "create_file"}
                     else scope_metadata
                 ),
@@ -488,7 +576,10 @@ class ToolRegistry:
                 ok=False,
                 error=str(exc),
                 metadata=(
-                    {"changed_files": self._changed_mutation_paths(mutation_baseline)}
+                    {
+                        "changed_files": self._changed_mutation_paths(mutation_baseline),
+                        **scope_metadata,
+                    }
                     if call.name in {"apply_patch", "create_file"}
                     else scope_metadata
                 ),
@@ -530,6 +621,7 @@ class ToolRegistry:
         metadata = (
             {
                 "project_scope": binding.relative_path,
+                "project_scope_identity": _binding_identity_token(binding),
                 "requested_path": raw_path,
                 "effective_path": effective_path,
             }
@@ -620,6 +712,25 @@ class ToolRegistry:
         binding: ProjectScopeBinding,
         raw_path: str,
     ) -> tuple[tuple[str, ...], str]:
+        relative_parts, effective_path = ToolRegistry._scoped_relative_path(
+            binding,
+            raw_path,
+        )
+        parts = list(PurePosixPath(raw_path).parts)
+        if any(_is_git_path_component(part) for part in parts):
+            raise WorkspaceViolation("Reading .git path components is not allowed")
+        if _contains_secret_path_component(raw_path):
+            raise WorkspaceViolation(
+                "Secret-bearing environment paths (.env-family path components) "
+                "cannot be read by the agent"
+            )
+        return relative_parts, effective_path
+
+    @staticmethod
+    def _scoped_relative_path(
+        binding: ProjectScopeBinding,
+        raw_path: str,
+    ) -> tuple[tuple[str, ...], str]:
         if "\x00" in raw_path:
             raise WorkspaceViolation("Path must not contain a null byte")
         supplied = PurePosixPath(raw_path)
@@ -630,13 +741,6 @@ class ToolRegistry:
             raise WorkspaceViolation(
                 f"Path escapes selected project scope '{binding.relative_path}': {raw_path}"
             )
-        if any(_is_git_path_component(part) for part in parts):
-            raise WorkspaceViolation("Reading .git path components is not allowed")
-        if _contains_secret_path_component(raw_path):
-            raise WorkspaceViolation(
-                "Secret-bearing environment paths (.env-family path components) "
-                "cannot be read by the agent"
-            )
         relative_parts = tuple(part for part in parts if part not in {"", "."})
         effective_parts = (
             relative_parts
@@ -645,6 +749,16 @@ class ToolRegistry:
         )
         effective_path = "/".join(effective_parts) or "."
         return relative_parts, effective_path
+
+    @staticmethod
+    def _effective_scoped_path(
+        binding: ProjectScopeBinding,
+        raw_path: str,
+    ) -> str:
+        if not raw_path:
+            raise WorkspaceViolation("Path must be a non-empty relative path")
+        _parts, effective_path = ToolRegistry._scoped_relative_path(binding, raw_path)
+        return effective_path
 
     @contextmanager
     def _open_project_scope_fd(
@@ -781,6 +895,91 @@ class ToolRegistry:
             )
         return resolved
 
+    def _refresh_project_scope_binding(
+        self,
+        run_id: str,
+        binding: ProjectScopeBinding,
+    ) -> ProjectScopeBinding:
+        """Refresh a scope generation after a controlled mutation without accepting a swap."""
+
+        if self._project_scopes.get(run_id) is not binding:
+            raise WorkspaceViolation("Selected project scope changed while a tool was running")
+        lexical = self.workspace.root / binding.relative_path
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(lexical, flags)
+        except OSError as exc:
+            raise WorkspaceViolation(
+                f"Selected project scope '{binding.relative_path}' is no longer available"
+            ) from exc
+        try:
+            opened_identity = os.fstat(descriptor)
+            if not stat.S_ISDIR(opened_identity.st_mode) or (
+                opened_identity.st_dev,
+                opened_identity.st_ino,
+            ) != (binding.device, binding.inode):
+                raise WorkspaceViolation(
+                    f"Selected project scope '{binding.relative_path}' was replaced "
+                    "while a tool was running"
+                )
+            try:
+                path_identity = lexical.stat(follow_symlinks=False)
+                resolved = lexical.resolve(strict=True)
+                final_identity = lexical.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise WorkspaceViolation(
+                    f"Selected project scope '{binding.relative_path}' changed while a "
+                    "tool was running"
+                ) from exc
+            if (
+                path_identity.st_dev,
+                path_identity.st_ino,
+                path_identity.st_ctime_ns,
+            ) != (
+                opened_identity.st_dev,
+                opened_identity.st_ino,
+                opened_identity.st_ctime_ns,
+            ) or (
+                final_identity.st_dev,
+                final_identity.st_ino,
+                final_identity.st_ctime_ns,
+            ) != (
+                opened_identity.st_dev,
+                opened_identity.st_ino,
+                opened_identity.st_ctime_ns,
+            ) or resolved != binding.resolved_path:
+                raise WorkspaceViolation(
+                    f"Selected project scope '{binding.relative_path}' changed while a "
+                    "tool was running"
+                )
+            refreshed = ProjectScopeBinding(
+                relative_path=binding.relative_path,
+                resolved_path=binding.resolved_path,
+                device=binding.device,
+                inode=binding.inode,
+                ctime_ns=opened_identity.st_ctime_ns,
+            )
+            if self._project_scopes.get(run_id) is not binding:
+                raise WorkspaceViolation(
+                    "Selected project scope changed while a tool was running"
+                )
+            self._project_scopes[run_id] = refreshed
+            return refreshed
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _project_scope_metadata(binding: ProjectScopeBinding) -> dict[str, str]:
+        return {
+            "project_scope": binding.relative_path,
+            "project_scope_identity": _binding_identity_token(binding),
+        }
+
     def _require_workspace_instruction_grant(self, run_id: str) -> None:
         try:
             run = self.workspace.storage.get_run(run_id)
@@ -804,18 +1003,31 @@ class ToolRegistry:
                 "snapshot is missing or not bound"
             )
 
-    def _mutation_paths(self, call: ToolCall) -> list[str]:
+    def _mutation_paths(
+        self,
+        call: ToolCall,
+        *,
+        binding: ProjectScopeBinding | None = None,
+    ) -> list[str]:
         if call.name == "create_file":
             raw = call.arguments.get("path")
             if not isinstance(raw, str) or not raw.strip():
                 raise PatchError("create_file path must be a non-empty string")
-            return [self.workspace.relative(self.workspace.resolve_write(raw, must_exist=False))]
+            return [
+                self.workspace.relative(
+                    self._resolve_mutation_path(
+                        binding,
+                        raw,
+                        must_exist=False,
+                    )
+                )
+            ]
         raw_patch = call.arguments.get("patch")
         if not isinstance(raw_patch, str):
             raise PatchError("apply_patch patch must be a string")
         paths: list[str] = []
         for file_patch in parse_unified_diff(raw_patch):
-            path = self.workspace.resolve_write(file_patch.path)
+            path = self._resolve_mutation_path(binding, file_patch.path)
             if (
                 file_patch.new_path is not None
                 and file_patch.old_path is not None
@@ -825,9 +1037,28 @@ class ToolRegistry:
             paths.append(self.workspace.relative(path))
         return sorted(set(paths))
 
-    def _mutation_baseline(self, call: ToolCall) -> dict[str, tuple[bool, str | None]]:
+    def _resolve_mutation_path(
+        self,
+        binding: ProjectScopeBinding | None,
+        raw_path: str,
+        *,
+        must_exist: bool | None = None,
+    ) -> Path:
+        effective_path = (
+            self._effective_scoped_path(binding, raw_path)
+            if binding is not None
+            else raw_path
+        )
+        return self.workspace.resolve_write(effective_path, must_exist=must_exist)
+
+    def _mutation_baseline(
+        self,
+        call: ToolCall,
+        *,
+        binding: ProjectScopeBinding | None = None,
+    ) -> dict[str, tuple[bool, str | None]]:
         baseline: dict[str, tuple[bool, str | None]] = {}
-        for relative_path in self._mutation_paths(call):
+        for relative_path in self._mutation_paths(call, binding=binding):
             path = self.workspace.resolve_write(relative_path)
             baseline[relative_path] = _file_fingerprint(path)
         return baseline
@@ -1319,15 +1550,29 @@ class ToolRegistry:
             output = output[: output_limit - reserved] + separator + marker
         return output[:output_limit] or "No matches"[:output_limit]
 
-    def _apply_patch(self, run_id: str, patch: str) -> str:
+    def _apply_patch(
+        self,
+        run_id: str,
+        patch: str,
+        *,
+        binding: ProjectScopeBinding | None = None,
+    ) -> str:
         patches = parse_unified_diff(patch)
         planned: list[tuple[FilePatch, Path, str | None]] = []
         for file_patch in patches:
             if file_patch.old_path is None:
-                path = self.workspace.resolve_write(file_patch.path, must_exist=False)
+                path = self._resolve_mutation_path(
+                    binding,
+                    file_patch.path,
+                    must_exist=False,
+                )
                 original = ""
             else:
-                path = self.workspace.resolve_write(file_patch.old_path, must_exist=True)
+                path = self._resolve_mutation_path(
+                    binding,
+                    file_patch.old_path,
+                    must_exist=True,
+                )
                 original = path.read_text(encoding="utf-8")
                 self._reject_credential_text(original)
             if file_patch.new_path is None:
@@ -1348,9 +1593,16 @@ class ToolRegistry:
             self.workspace.record_agent_version(run_id, path)
         return self.workspace.diff(run_id)
 
-    def _create_file(self, run_id: str, path: str, content: str) -> str:
+    def _create_file(
+        self,
+        run_id: str,
+        path: str,
+        content: str,
+        *,
+        binding: ProjectScopeBinding | None = None,
+    ) -> str:
         self._reject_credential_text(content)
-        target = self.workspace.resolve_write(path, must_exist=False)
+        target = self._resolve_mutation_path(binding, path, must_exist=False)
         self.workspace.snapshot(run_id, target)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
@@ -1373,10 +1625,16 @@ class ToolRegistry:
         timeout_seconds: int | None = None,
         output_callback: OutputCallback | None = None,
         sandbox_bypass: bool = False,
+        binding: ProjectScopeBinding | None = None,
     ) -> ToolResult:
         if not argv or not all(isinstance(item, str) and item for item in argv):
             raise ValueError("argv must contain non-empty strings")
-        hard_denial = _hard_command_denial(argv, self.workspace.root)
+        command_root = (
+            self._validated_project_scope(binding)
+            if binding is not None
+            else self.workspace.root
+        )
+        hard_denial = _hard_command_denial(argv, command_root)
         if hard_denial is not None:
             raise ValueError(hard_denial)
         command_temp = tempfile.TemporaryDirectory(prefix="traceforge-command-")
@@ -1390,7 +1648,7 @@ class ToolRegistry:
             for directory in (sandbox_home, sandbox_tmp, sandbox_cache):
                 directory.mkdir()
             environment = _command_environment(
-                self.workspace.root,
+                command_root,
                 home=sandbox_home,
                 temp=sandbox_tmp,
                 cache=sandbox_cache,
@@ -1403,6 +1661,10 @@ class ToolRegistry:
             )
             if executable is None:
                 raise ValueError(f"Executable not found: {argv[0]}")
+            self.sandbox.validate_executable_scope(
+                executable,
+                execution_root=command_root,
+            )
             if not self.settings.demo_mode and _is_agent_private_executable(
                 Path(executable)
             ):
@@ -1410,9 +1672,19 @@ class ToolRegistry:
                     "Commands cannot use TraceForge's private runtime. Create a separate "
                     "workspace-local environment and run the project through it."
                 )
-            command_cwd = self.workspace.resolve_read(cwd)
+            effective_cwd = (
+                self._effective_scoped_path(binding, cwd)
+                if binding is not None
+                else cwd
+            )
+            command_cwd = self.workspace.resolve_read(effective_cwd)
             if not command_cwd.is_dir():
                 raise ValueError(f"Command cwd is not a directory: {cwd}")
+            if binding is not None and not command_cwd.is_relative_to(command_root):
+                raise WorkspaceViolation(
+                    f"Command cwd escapes selected project scope '{binding.relative_path}': "
+                    f"{cwd}"
+                )
             timeout = timeout_seconds or self.settings.command_timeout
             if timeout > self.settings.max_command_timeout:
                 raise ValueError(f"timeout_seconds exceeds {self.settings.max_command_timeout}")
@@ -1423,6 +1695,7 @@ class ToolRegistry:
                 command_temp=command_temp_path,
                 environment=environment,
                 bypass=sandbox_bypass,
+                execution_root=command_root,
             )
             process = await asyncio.create_subprocess_exec(
                 launch.program,
@@ -1442,6 +1715,7 @@ class ToolRegistry:
         truncated = False
         stdout = process.stdout
         assert stdout is not None
+        timed_out = False
         try:
 
             async def consume() -> None:
@@ -1459,11 +1733,18 @@ class ToolRegistry:
             await asyncio.wait_for(asyncio.gather(consume(), process.wait()), timeout=timeout)
         except TimeoutError:
             await self.cancel(run_id)
-            output = b"".join(chunks).decode(errors="replace")
-            if truncated:
-                output += (
-                    f"\n... output truncated at {self.settings.stored_output_limit} bytes ...\n"
-                )
+            timed_out = True
+        finally:
+            self._processes.pop(run_id, None)
+            command_temp.cleanup()
+        scope_metadata: dict[str, str] = {}
+        if binding is not None:
+            binding = self._refresh_project_scope_binding(run_id, binding)
+            scope_metadata = self._project_scope_metadata(binding)
+        output = b"".join(chunks).decode(errors="replace")
+        if truncated:
+            output += f"\n... output truncated at {self.settings.stored_output_limit} bytes ...\n"
+        if timed_out:
             return ToolResult(
                 tool_call_id=call.id,
                 name=call.name,
@@ -1474,15 +1755,11 @@ class ToolRegistry:
                     "timeout": True,
                     "truncated": truncated,
                     "argv": argv,
+                    "cwd": self.workspace.relative(command_cwd),
                     "sandbox": launch.metadata,
+                    **scope_metadata,
                 },
             )
-        finally:
-            self._processes.pop(run_id, None)
-            command_temp.cleanup()
-        output = b"".join(chunks).decode(errors="replace")
-        if truncated:
-            output += f"\n... output truncated at {self.settings.stored_output_limit} bytes ...\n"
         return ToolResult(
             tool_call_id=call.id,
             name=call.name,
@@ -1495,6 +1772,7 @@ class ToolRegistry:
                 "argv": argv,
                 "cwd": self.workspace.relative(command_cwd),
                 "sandbox": launch.metadata,
+                **scope_metadata,
             },
         )
 

@@ -75,7 +75,13 @@ def scripted_demo_provider() -> ScriptedProvider:
                             "questions": [
                                 {
                                     "id": "compatibility",
+                                    "semantic_key": "constraint.api_compatibility",
                                     "prompt": "这次修复需要保留到什么程度的 API 兼容性？",
+                                    "dimension": "scope",
+                                    "material_effect": "architecture",
+                                    "rationale": (
+                                        "兼容边界是用户选择，并会改变迁移范围和公共 API。"
+                                    ),
                                     "options": [
                                         {
                                             "id": "preserve",
