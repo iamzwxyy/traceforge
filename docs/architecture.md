@@ -114,10 +114,14 @@ continuation creates a separate linked run with a fresh snapshot namespace.
 The planning role can list, read, and search, then must choose one structured terminal action.
 `respond_to_user` ends greetings, general questions, explicit read-only analysis, or a remaining
 blocker as `answered`, without a plan, verifier verdict, or Proof Pack. `ask_questions` is reserved
-for a known implementation request whose material choice cannot be discovered: at most three
-questions per round, two to four options per question, and at most two rounds. `submit_plan` begins
-executable work only when enough context exists. Terminal actions cannot be mixed with reads or
-with each other in one model response.
+for a known implementation request whose material choice cannot be discovered, or for a request
+that asks only for an answer, explanation, or read-only analysis but remains materially ambiguous
+after inspection because multiple plausible targets would produce misleadingly different answers:
+at most three questions per round, two to four options per question, and at most two rounds. A
+non-executable clarification must return to focused inspection or end with `respond_to_user`; it
+cannot enter executable work unless the user separately requests mutation or command execution.
+`submit_plan` begins executable work only when enough context exists. Terminal actions cannot be
+mixed with reads or with each other in one model response.
 
 Model prose is public only after the runtime accepts a non-terminal inspection/tool round. Prose-only
 contract violations, mixed terminal responses, and prose attached to `respond_to_user`, `finish`, or

@@ -442,6 +442,71 @@ async def test_planner_read_progress_remains_visible_before_the_answer(
 
 
 @pytest.mark.asyncio
+async def test_planner_prose_correction_resets_after_clarification_and_research(
+    settings: Settings, storage: Storage
+) -> None:
+    project = settings.workspace / "eval_center_middleware"
+    project.mkdir()
+    (project / "README.md").write_text("# Evaluation service\n")
+    broad_overview = "工作区包含多个项目, 请先选择要介绍的子项目。"
+    researched_overview = "eval_center_middleware 是一个评测服务。"
+    canonical_answer = "eval_center_middleware 是一个本地 Go 评测中间件。"
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                tool_calls=[ToolCall(id="list", name="list_files", arguments={})]
+            ),
+            ModelResponse(content=broad_overview),
+            _question_response(
+                "choose-project",
+                question_id="project",
+                prompt="要介绍哪个子项目?",
+            ),
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="read-project",
+                        name="read_file",
+                        arguments={"path": "eval_center_middleware/README.md"},
+                    )
+                ]
+            ),
+            ModelResponse(content=researched_overview),
+            _direct_response(canonical_answer),
+        ]
+    )
+    manager = AgentManager(settings, storage, provider)
+
+    run = await manager.start_run("介绍一下项目")
+    await _wait_for_state(storage, run.id, RunState.AWAITING_CLARIFICATION)
+    await manager.answer_clarification(
+        run.id, [ClarificationAnswer(question_id="project", option_id="a")]
+    )
+    completed = await manager.wait(run.id)
+
+    assert completed.state is RunState.ANSWERED, completed.error
+    assert completed.plan is None
+    assert completed.step_count == 0
+    assert len(provider.requests) == 6
+    assert "not accepted as the final answer" in str(
+        provider.requests[2][0][-1]["content"]
+    )
+    assert "not accepted as the final answer" in str(
+        provider.requests[5][0][-1]["content"]
+    )
+    assert completed.turns[-1].summary == canonical_answer
+    messages = [
+        event.payload["content"]
+        for event in storage.get_events(run.id)
+        if event.type is EventType.MESSAGE
+    ]
+    assert messages == []
+    persisted = json.dumps(completed.messages, ensure_ascii=False)
+    assert broad_overview in persisted
+    assert researched_overview in persisted
+
+
+@pytest.mark.asyncio
 async def test_read_only_inspection_can_end_in_a_direct_answer(
     settings: Settings, storage: Storage
 ) -> None:
@@ -550,6 +615,8 @@ async def test_answered_turn_supports_follow_up_and_redacts_credentials(
 def test_all_model_roles_require_simplified_chinese_user_facing_text() -> None:
     for prompt in (PLANNER_SYSTEM_PROMPT, BUILDER_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT):
         assert "Simplified Chinese" in prompt
+    assert "asks only for an answer, explanation, or read-only" in PLANNER_SYSTEM_PROMPT
+    assert "After inspection or a read-only clarification" in PLANNER_SYSTEM_PROMPT
 
 
 def test_greenfield_prompts_do_not_recommend_unavailable_network_dependencies() -> None:

@@ -1308,7 +1308,7 @@ class AgentManager:
         if run.state is not RunState.PLANNING:
             await self._transition(run, RunState.PLANNING)
         planning_tools = self._planning_tools()
-        non_tool_responses = 0
+        consecutive_non_tool_responses = 0
         for _ in range(12):
             response = await self._complete_model(run, planning_tools)
             terminal_calls = [
@@ -1319,8 +1319,8 @@ class AgentManager:
             run.messages.append(self._assistant_message_for_storage(response))
             self.storage.save_run(run)
             if not response.tool_calls:
-                non_tool_responses += 1
-                if non_tool_responses >= 2:
+                consecutive_non_tool_responses += 1
+                if consecutive_non_tool_responses >= 2:
                     raise RuntimeError(
                         "Planner did not submit a plan, clarification request, or direct response"
                     )
@@ -1328,12 +1328,16 @@ class AgentManager:
                     {
                         "role": "user",
                         "content": (
-                            "Use respond_to_user, ask_questions, or submit_plan now; do not "
-                            "answer in prose only."
+                            "Your prose-only content was not accepted as the final answer. If "
+                            "that prose was the intended final answer, call respond_to_user alone "
+                            "now and copy the complete answer into content. Otherwise call "
+                            "ask_questions or submit_plan alone. Do not emit prose-only content "
+                            "again."
                         ),
                     }
                 )
                 continue
+            consecutive_non_tool_responses = 0
             if terminal_calls and (len(terminal_calls) != 1 or len(response.tool_calls) != 1):
                 error = (
                     "A terminal planning action must be called exactly once and alone. "
