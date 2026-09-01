@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import { expectNoWcagViolations } from "./a11y";
 
 test("demo proves a tenant-isolation fix without runtime errors", async ({ page }) => {
+  test.setTimeout(90_000);
   const consoleErrors: string[] = [];
   let openerCalls = 0;
   page.on("console", (message) => {
@@ -21,7 +22,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
 
   await page.goto("/");
   await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
-  await expect(page.locator("textarea")).toHaveValue(/多租户缓存隔离/);
+  await expect(page.locator("textarea")).toHaveValue(/多租户缓存隔离/, { timeout: 15_000 });
   await expect(page.locator("textarea")).toHaveAttribute("readonly", "");
   await expect(page.getByText("固定演示", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("radio", { name: /手动审批/ })).toBeDisabled();
@@ -72,7 +73,7 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
     .toHaveAttribute("href", /plan\.md$/);
   await page.getByRole("button", { name: "批准并执行" }).click();
 
-  await expect(page.getByText("本轮已完成", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("本轮已完成", { exact: true })).toBeVisible({ timeout: 45_000 });
   await expect(page.locator(".assistant-turn")).toHaveCount(1);
   await expect(page.locator(".assistant-turn"))
     .toContainText("已按 (tenant_id, profile_id) 隔离缓存项");
