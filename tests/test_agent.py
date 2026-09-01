@@ -6494,7 +6494,7 @@ async def test_approved_unknown_command_runs_once(
         and event.payload["call"]["name"] == "run_command"
     ]
     assert [result["output"] for result in results] == ["approved\n"]
-    assert results[0]["metadata"]["sandbox"]["status"] == "enforced"
+    assert results[0]["metadata"]["sandbox"]["status"] == "bypassed"
 
 
 @pytest.mark.asyncio

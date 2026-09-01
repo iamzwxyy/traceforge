@@ -1455,6 +1455,72 @@ async def test_bound_mutation_fails_closed_after_project_identity_replacement(
     assert not (alpha / "blocked.txt").exists()
 
 
+@pytest.mark.asyncio
+async def test_workspace_root_project_scope_can_degrade_to_policy_only(
+    settings: Settings,
+    workspace: Workspace,
+    storage: Storage,
+) -> None:
+    run_id = "root-policy-only"
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        settings,
+        RunRecord(id=run_id, task="Check root", workspace=str(workspace.root)),
+    )
+    registry.bind_project_scope(run_id, ".")
+    registry.sandbox.status = SandboxStatus("none", False, "test backend unavailable")
+    registry.sandbox._program = None
+    argv = ["python3", "-c", "print('root-policy-only')"]
+    call = ToolCall(id="root-check", name="run_command", arguments={"argv": argv})
+
+    assessment = registry.assess(call, _plan(argv), run_id=run_id)
+    unknown = registry.resolve_permission(
+        ToolCall(
+            id="root-unknown",
+            name="run_command",
+            arguments={"argv": ["python3", "app.py"]},
+        ),
+        None,
+        ApprovalMode.AUTOMATIC,
+        run_id=run_id,
+    )
+    result = await registry.execute(run_id, call)
+
+    assert assessment.decision is PermissionDecision.ALLOW
+    assert unknown.decision is PermissionDecision.ASK
+    assert unknown.sandbox_bypass_on_allow is True
+    assert result.ok and "root-policy-only" in result.output
+    assert result.metadata["sandbox"]["status"] == "policy_only"
+    assert result.metadata["project_scope"] == "."
+
+
+def test_child_project_scope_still_requires_an_enforced_sandbox(
+    settings: Settings,
+    workspace: Workspace,
+) -> None:
+    project = workspace.root / "alpha"
+    project.mkdir()
+    run_id = "child-policy-only"
+    registry = ToolRegistry(workspace, settings)
+    registry.bind_project_scope(run_id, "alpha")
+    registry.sandbox.status = SandboxStatus("none", False, "test backend unavailable")
+    registry.sandbox._program = None
+
+    assessment = registry.assess(
+        ToolCall(
+            id="child-check",
+            name="run_command",
+            arguments={"argv": ["python3", "-V"]},
+        ),
+        None,
+        run_id=run_id,
+    )
+
+    assert assessment.decision is PermissionDecision.DENY
+    assert "require an enforced OS sandbox" in assessment.reason
+
+
 def test_scoped_permission_assessment_uses_effective_project_paths(
     settings: Settings,
     workspace: Workspace,

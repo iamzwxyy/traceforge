@@ -378,7 +378,11 @@ class ToolRegistry:
                 str(exc),
                 "dangerous",
             )
-        if binding is not None and not self.sandbox.status.enforced:
+        if (
+            binding is not None
+            and binding.resolved_path != self.workspace.root
+            and not self.sandbox.status.enforced
+        ):
             return PermissionAssessment(
                 PermissionDecision.DENY,
                 "Commands in a selected project require an enforced OS sandbox",
@@ -414,7 +418,8 @@ class ToolRegistry:
         """Apply the user-selected approval mode without weakening invariant denials."""
 
         assessment = self.assess(call, plan, run_id=run_id)
-        scoped = run_id is not None and run_id in self._project_scopes
+        binding = self._project_scopes.get(run_id) if run_id is not None else None
+        scoped = binding is not None and binding.resolved_path != self.workspace.root
         if assessment.decision is PermissionDecision.DENY:
             return PermissionResolution(
                 mode=mode,
