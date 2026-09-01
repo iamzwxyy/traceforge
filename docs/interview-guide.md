@@ -4,11 +4,11 @@
 
 TraceForge is a local coding agent built without an agent framework. The model can propose tool
 calls, but the application owns every consequential decision: a state machine, structured
-clarification, Agent/Plan interaction mode, path and command policy, subprocess lifecycle, evidence
+clarification, an automatic plan-review gate, path and command policy, subprocess lifecycle, evidence
 freshness, persistence, recovery, rollback, and independent completion review. A separate per-turn
 action-permission profile provides Manual, deterministic Automatic, and workspace-scoped Full
-access without conflating approval with the OS sandbox. Agent mode is the
-low-friction default; optional Plan mode pauses whenever implementation is needed. Greetings and
+access without conflating approval with the OS sandbox. Explicit low-risk work continues after its
+plan is recorded; complex, high-impact, clarified, or uncertain work pauses for review. Greetings and
 read-only questions end as a distinct answer instead of fabricating a plan or proof. Per-turn
 reasoning effort appears only when the exact endpoint/model supports it, without turning
 provider-private reasoning into UI or evidence. The visual workbench keeps multi-turn conversation
@@ -48,14 +48,14 @@ configured model may be the same.
 check lacks fresh passing evidence. Mutations reset those checks. After `finish`, the verifier can
 still reject the result and trigger a bounded repair cycle.
 
-### Does Agent mode let the model bypass the user?
+### Does automatic plan continuation let the model bypass the user?
 
-No. Agent mode skips only the plan-review click. The model still submits a structured scope and
-acceptance contract before any mutation, and the application still enforces workspace paths, undeclared-file approval,
-command classification, sandboxing, and destructive-operation denial. Plan mode is available when
-the user wants to inspect the full Markdown plan first; each action-permission profile has the same
-meaning in both interaction modes. A direct answer executes nothing and is labeled separately; completion review is also
-separate and read-only.
+No. The automatic path skips only the plan-review click for host-classified low-risk work. The model
+still submits a structured scope and acceptance contract before any mutation, and the application
+still enforces workspace paths, undeclared-file approval, command classification, sandboxing, and
+destructive-operation denial. Each action-permission profile keeps the same meaning under either
+plan-gate outcome. A direct answer executes nothing and is labeled separately; completion review is
+also separate and read-only.
 
 ### What does the Proof Pack hash prove?
 
@@ -118,7 +118,7 @@ database are one transaction.
 
 ### How does reasoning effort work, and do you expose chain of thought?
 
-It is a fourth, orthogonal per-turn control: Agent/Plan decides whether the plan pauses, action
+It is an orthogonal per-turn control: the automatic gate decides whether the plan pauses, action
 permission decides which tools ask, the sandbox limits commands, and reasoning effort only selects
 the model protocol level. TraceForge advertises levels from an exact official endpoint/model
 catalog; `auto` omits the field and unknown routes stay default-only. One selection is frozen across

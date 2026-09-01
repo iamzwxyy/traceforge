@@ -54,11 +54,11 @@ SCENARIOS = (
     ),
     Scenario(
         id="human-control",
-        title="Mode-aware intent and human control",
+        title="Gate-aware intent and human control",
         claim=(
-            "Conversation answers without a false workflow; executable Agent work proceeds "
-            "without a plan pause, Plan mode waits for review, and scope drift or unknown "
-            "execution still requires a decision."
+            "Conversation answers without a false workflow; the automatic gate continues "
+            "low-risk work and pauses work that requires review, while scope drift or unknown "
+            "execution still requires a separate decision."
         ),
         tests=(
             (

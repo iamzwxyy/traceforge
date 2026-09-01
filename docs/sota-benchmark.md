@@ -6,7 +6,7 @@ TraceForge 不应复刻 Codex 或 DeepSeek Harness 的完整产品面。课程�
 
 TraceForge 自己的主线应保持鲜明：**每次改动都能给出“计划 → 差异 → 新鲜检查 → 独立验证 → 可冲突回滚”的证据闭环**。这个能力比宠物、庞大插件市场或多智能体动画更能体现工程质量，也更适合作为答辩时可现场验证的亮点。产品上可将它命名为 **Proof Pack（交付证据包）**。
 
-截至 2026-08-28，Phase A、默认 Agent / 可选计划模式、三种逐轮动作权限、同任务多轮、Proof Pack、对话 +
+截至 2026-08-28，Phase A、按复杂度自动确认计划、三种逐轮动作权限、同任务多轮、Proof Pack、对话 +
 折叠 Trace、故障恢复、OS 沙箱、按模型逐轮思考强度与固定质量语料均已落地；两条真实 DeepSeek 代表任务也已
 脚本化并通过。当前工作重点转为可用性细节、完整回归和现场演示稳定性，而不是继续扩张功能面。
 
@@ -32,7 +32,7 @@ TraceForge 自己的主线应保持鲜明：**每次改动都能给出“计划 
 | 工具调度 | DeepSeek 以“可并发调用 + 独占屏障”调度，执行可重叠但结果按模型顺序提交；Codex 用读写锁让并发工具共享读锁、独占工具占写锁 | 同一模型响应中的工具逐个执行，稳定但浪费只读检查时间 | 仅并发 `list_files`、`read_file`、`search_text`；写文件、命令、计划更新和完成动作都是屏障；结果仍按原 tool-call 顺序进入历史 |
 | 上下文管理 | Codex 规范化 call/output 配对、截断工具输出并做可恢复 compaction；DeepSeek 把 runtime context 和 compaction 作为可持久替换事件 | 固定保留头部/尾部并生成确定性中段摘要，简单但长期任务会丢失关键因果 | 先做两级压缩：裁剪旧工具大输出，再生成结构化摘要；计划、文件改动、检查证据和未解决风险进入不可丢的 evidence ledger |
 | 模型推理协议 | OpenAI 按精确模型声明不同 `reasoning_effort` 集合与默认值；DeepSeek 用 thinking 开关和 effort，并要求工具调用续轮回传 `reasoning_content` | UI 按官方 endpoint + 精确 model 广告档位；选择逐轮冻结并安全记录；DeepSeek 私有推理只内部回放 | `auto` 完全省略字段；未知兼容路由不猜测；不静默降级；隐藏推理不进入 UI、事件、Verifier 或 Proof Pack |
-| 审批与隔离 | Codex 分开 sandbox、approval policy 和 reviewer；当前 Ask/auto-review 保持 workspace sandbox，真正 Full Access 才组合 danger-full-access + never；DeepSeek 对审批失败关闭并清理子进程凭据 | Agent/Plan 与逐轮 Manual/Automatic/workspace Full access 正交；基础硬策略先执行，Full 只在强制沙箱中免未知命令弹窗；Seatbelt/Bubblewrap、降级和只读复核另成层 | 保持各层边界和准确文案；不伪装独立 auto-review，不把工作区 Full 冒充宿主机 danger-full-access |
+| 审批与隔离 | Codex 分开 sandbox、approval policy 和 reviewer；当前 Ask/auto-review 保持 workspace sandbox，真正 Full Access 才组合 danger-full-access + never；DeepSeek 对审批失败关闭并清理子进程凭据 | 自动计划门禁与逐轮 Manual/Automatic/workspace Full access 正交；基础硬策略先执行，Full 只在强制沙箱中免未知命令弹窗；Seatbelt/Bubblewrap、降级和只读复核另成层 | 保持各层边界和准确文案；不伪装独立 auto-review，不把工作区 Full 冒充宿主机 danger-full-access |
 | 项目与任务 | Codex 的 Project 是独立实体，Thread 可选 `project_id`；DeepSeek Workspace 使用规范路径对应稳定 ID，同时允许未分组 session | 已支持可空 `project_id`、直接任务、最近目录和可复用项目根目录，多工作区运行时按规范路径隔离 | 保持 Project 只是分组与稳定根目录，不引入远程 host、工作树 handoff 等平台复杂度 |
 | 观测与测试 | DeepSeek 要求用户/模型可见变更同时有可无 key 回放快照，并用真实 API E2E 验证 provider；Codex 对 turn/item/tool/compaction 都有事件和历史投影 | 已有持久事件、断线续传、fake provider 全闭环、故障注入、固定质量语料、真实 DeepSeek 双场景、独立 verifier 与可下载 Proof Pack | 保留确定性 CI 与低频真实模型双层证据；真实 API 不进入日常 CI，避免密钥、成本和模型漂移造成不稳定 |
 
@@ -114,7 +114,7 @@ Provider 私有推理仅为 DeepSeek 协议续轮回放，公共事件只记录�
 1. 三个只读工具有界并发，写/命令/控制工具作为屏障，保证结果顺序。
 2. Evidence ledger 与两级上下文压缩。
 3. assembled transcript golden tests；真实模型代表场景脚本标准化。
-4. Agent / Plan 双模式（已完成）：普通 Agent 默认继续；需要实施时计划模式始终等待确认；问候和只读请求可直接答复；两种模式的越界写入和未知命令仍单独审批。
+4. 自动计划门禁（已完成）：低风险单文件工作自动继续，复杂、高影响、已澄清或不确定工作等待确认；问候和只读请求可直接答复；两种门禁结果下的越界写入和未知命令仍单独审批。
 5. 三种动作权限（已完成）：Manual 逐项确认，Automatic 使用本地确定性策略，workspace Full 在强制 OS 沙箱中自动处理软 `ask`；硬拒绝、真实路径和凭证边界不可升级。
 6. 按模型逐轮思考强度（已完成）：精确 endpoint/model 能力、默认省略、OpenAI/DeepSeek 协议映射、恢复兼容检查与隐藏推理隔离。
 
@@ -128,9 +128,9 @@ Provider 私有推理仅为 DeepSeek 协议续轮回放，公共事件只记录�
 
 ## 已确定的产品决策
 
-1. 计划审批不再按风险隐式切换：普通 Agent 默认不暂停，计划模式由用户显式开启并始终暂停。
-2. OS 沙箱、动作审批、计划模式、完成后只读复核分别表达，不共用一个含糊的“安全开关”。
+1. 计划审批由宿主按结构化范围和风险自动决定；常规工作台不再提供容易混淆的计划模式开关。
+2. OS 沙箱、动作审批、自动计划门禁、完成后只读复核分别表达，不共用一个含糊的“安全开关”。
 3. 项目/直接任务、provider 自检和同任务多轮优先于并发多 Agent、插件市场等平台扩张。
 4. “已答复”与“已证实”分离：自然答复不生成计划、Verifier 结论或 Proof Pack。
 5. “完全访问”在 TraceForge 中必须显示“工作区”限定；没有强制 OS 沙箱时，未知命令降级为人工确认，且该选择不成为下一轮默认值。
-6. 思考强度与 Agent/Plan、动作权限和 Verifier 正交；只记录请求档位，不展示或暗示隐藏推理内容。
+6. 思考强度与计划门禁、动作权限和 Verifier 正交；只记录请求档位，不展示或暗示隐藏推理内容。

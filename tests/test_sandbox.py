@@ -294,8 +294,8 @@ async def test_enforced_scoped_command_writes_project_but_not_sibling_even_when_
     beta = workspace.root / "beta"
     alpha.mkdir()
     beta.mkdir()
-    secret = "sibling project contents must stay private"
-    (beta / "secret.txt").write_text(secret)
+    sensitive_content = "sibling project contents must stay private"
+    (beta / "secret.txt").write_text(sensitive_content)
     (alpha / "sibling-link").symlink_to(beta, target_is_directory=True)
     run_id = "sandbox-project-scope"
     registry = _persisted_registry(
@@ -380,10 +380,10 @@ async def test_enforced_scoped_command_writes_project_but_not_sibling_even_when_
     assert not (beta / "escape.txt").exists()
     assert not sibling_read.ok
     assert sibling_read.metadata["sandbox"]["scope_enforced"] is True
-    assert secret not in sibling_read.output
+    assert sensitive_content not in sibling_read.output
     assert not symlink_read.ok
     assert symlink_read.metadata["sandbox"]["scope_enforced"] is True
-    assert secret not in symlink_read.output
+    assert sensitive_content not in symlink_read.output
 
 
 @pytest.mark.asyncio

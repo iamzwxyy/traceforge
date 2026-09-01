@@ -95,7 +95,7 @@ class Scenario:
     task: str
     mode: InteractionMode
     approval_mode: ApprovalMode
-    expected_gate: Literal["agent_continues", "approval_required"]
+    expected_gate: Literal["auto_approved", "approval_required"]
     required_files: tuple[str, ...]
     allowed_files: tuple[str, ...] | None
     test_args: tuple[str, ...]
@@ -107,7 +107,7 @@ class Scenario:
 SCENARIOS = (
     Scenario(
         id="single-file-fast-path",
-        title="Single-file repair in default Agent mode",
+        title="Single-file repair through the automatic plan gate",
         fixture=ROOT / "evaluation/fixtures/duration-parser",
         task=(
             "Fix the boolean-input bug described in README.md. Preserve normalize_seconds's "
@@ -116,7 +116,7 @@ SCENARIOS = (
         ),
         mode=InteractionMode.AGENT,
         approval_mode=ApprovalMode.AUTOMATIC,
-        expected_gate="agent_continues",
+        expected_gate="auto_approved",
         required_files=("duration_parser.py",),
         allowed_files=("duration_parser.py",),
         test_args=("-m", "pytest", "-q"),

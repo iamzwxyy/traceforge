@@ -40,7 +40,7 @@ flowchart TB
 - `AgentManager` is the product core: phases, approvals, retries, evidence freshness, repair
   cycles, cancellation, resume, and completion.
 - `assess_plan_gate` is a deterministic risk projection over the task and structured plan. The
-  selected interaction mode—not a model claim—decides whether implementation pauses for review.
+  host-owned gate—not a model claim—decides whether the standard workbench pauses for review.
 - `ToolRegistry` defines and executes the bounded local capability surface.
 - `WorkspaceInstructionLoader` safely captures the exact root `AGENTS.md` into a private,
   turn-indexed snapshot before a new turn exists. The model sees it as a separate user-role
@@ -63,8 +63,8 @@ stateDiagram-v2
     planning --> answered: conversation or read-only answer
     planning --> awaiting_clarification
     awaiting_clarification --> planning
-    planning --> awaiting_plan_approval: Plan mode
-    planning --> executing: Agent mode
+    planning --> awaiting_plan_approval: automatic gate requires review
+    planning --> executing: automatic gate continues
     awaiting_plan_approval --> planning: revise
     awaiting_plan_approval --> executing: approve
     executing --> awaiting_action_approval: selected profile requires human
@@ -200,7 +200,8 @@ The host applies an effect ceiling independently of model behavior: conversation
 workspace reads or `submit_plan`; every read route can inspect but cannot submit a plan; executable
 routes use the normal plan and action gates. An `undetermined` workspace task may inspect, clarify,
 and propose a plan, but the host forces that plan to an explicit approval gate with at least medium
-risk, even in Agent mode. The fallback is grammatical rather than one exact prompt: it covers
+risk, even when the default backend interaction value is `agent`. The fallback is grammatical
+rather than one exact prompt: it covers
 causative imperatives, obligation modals, desired-result frames, and Chinese 把 constructions, while
 epistemic questions, explanations, learning, and advice remain conversation. Terminal actions
 cannot be mixed with reads or with each other in one model response.
@@ -284,15 +285,17 @@ Malformed structured clarification or plan calls are returned as failed tool res
 field-level schema errors that omit invalid input values. They remain auditable and can be corrected
 within the same bounded planning phase instead of terminating the run.
 
-After validation, application code grades risk and records the reasons, but interaction mode owns
-the pause semantics. Agent mode persists `agent_continues` and moves directly to implementation;
-Plan mode persists `approval_required` and always waits, even for a one-file low-risk task. The
-structured fields are materialized as one canonical Markdown document containing goal, approach,
-steps, expected files, validation, and risks; `GET /api/runs/{id}/plan.md` downloads that exact
-contract. A restart preserves the recorded decision. Any later file mutation outside
+After validation, application code grades risk and records the reasons. The standard workbench uses
+the automatic gate: explicit low-risk single-file work persists `auto_approved`, while complex,
+high-impact, clarified, sensitive, or uncertain work persists `approval_required` and waits. The
+backend retains an explicit `plan` interaction value for the fixed demo, evaluator, and API
+compatibility; it is not exposed as a normal composer toggle and only forces the same review state.
+The structured fields are materialized as one canonical Markdown document containing goal,
+approach, steps, expected files, validation, and risks; `GET /api/runs/{id}/plan.md` downloads that
+exact contract. A restart preserves the recorded decision. Any later file mutation outside
 `impacted_files` remains a base-policy `ask`; Manual and Automatic pause, while workspace Full
-access handles that soft decision automatically without disabling the Workspace guard. Skipping a
-plan-review click never changes these action semantics.
+access handles that soft decision automatically without disabling the Workspace guard. Automatic
+plan continuation never changes these action semantics.
 
 ### Durable human decisions
 
@@ -418,7 +421,7 @@ relabeling one run's state or acting on another run.
 
 ## Reasoning effort and provider-private replay
 
-`ReasoningEffort` is a per-turn input, separate from Agent/Plan interaction mode and action
+`ReasoningEffort` is a per-turn input, separate from the plan-review gate and action
 permission. The API validates it before starting a worker, stores it on both the run mirror and the
 immutable active-turn snapshot, and the manager reads the turn as the authority for every planner,
 builder, retry, repair, and verifier request.
@@ -481,8 +484,9 @@ The snapshot freezes automatic discovery and injection only. Root or nested `AGE
 ordinary readable/editable workspace files; reading later disk content does not replace the marked
 current-turn guidance snapshot.
 
-A run is also a durable conversation. `ConversationTurn` records the request, selected Agent/Plan
-mode, selected action-permission mode, selected reasoning effort, request resolution, project
+A run is also a durable conversation. `ConversationTurn` records the request, retained backend
+interaction value and resulting plan gate, selected action-permission mode, selected reasoning
+effort, request resolution, project
 target, resolved clarification answers, outcome, completion summary, native-edit files, and
 timestamps. A terminal answered, successful, failed, or cancelled run can transition back to
 `created` for a follow-up. The next planner receives the last six completed turn requests,

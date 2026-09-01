@@ -97,14 +97,14 @@ checks—not model obedience—enforce the no-expansion security boundary.
 
 ## Plan and mutation policy
 
-Plan mode is an interaction choice, not a permission level. In the default Agent mode, the model
-still submits a structured plan before mutation, but the application records its risk assessment
-and proceeds without a plan-approval click. In Plan mode, every valid executable plan pauses for
-human review, even when it names one routine file. Conversational and explicitly read-only requests
-can instead end in the distinct `answered` state in either mode; that state cannot claim completion
-evidence or expose a Proof Pack. The canonical Markdown document and policy reasons remain visible
-for executable work in both modes. Selecting Agent mode cannot turn a denied command into an
-allowed command or expand the workspace boundary.
+Every executable request submits a structured plan before mutation. A host-owned automatic gate
+continues explicit low-risk single-file work and pauses complex, high-impact, clarified, sensitive,
+or uncertain work for human review. Conversational and explicitly read-only requests can instead
+end in the distinct `answered` state; that state cannot claim completion evidence or expose a Proof
+Pack. The canonical Markdown document and policy reasons remain visible in either gate outcome.
+The backend's explicit `plan` compatibility value, used by the fixed demo and evaluator, can force
+the same review state but is not a permission level and cannot turn a denied command into an allowed
+command or expand the workspace boundary.
 
 After planning, each `create_file` and every file in an `apply_patch` is compared with the declared
 scope. The base policy marks an unexpected path as `ask` before any bytes are written; the selected
@@ -532,7 +532,7 @@ ID; a lineage conflict refreshes the parent and task list so the existing succes
   not persisted until the scrub checkpoint succeeds; an external long-lived SQLite reader can
   therefore move the task to a visible cleanup-pending interruption or defer startup instead of
   letting TraceForge claim cleanup prematurely.
-- The risk assessment is deliberately conservative but still syntactic; Plan mode approval and
+- The risk assessment is deliberately conservative but still syntactic; plan approval and
   planned file scope do not establish semantic safety.
 - Proof Pack hashes are not signatures or remote attestations.
 - Provider behavior and availability are external dependencies; retries do not guarantee service.

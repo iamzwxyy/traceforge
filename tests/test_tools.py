@@ -952,13 +952,13 @@ async def test_unscoped_search_rejects_explicit_environment_paths_and_aliases(
         settings,
         RunRecord(id="env-search-boundary", task="Inspect", workspace=str(workspace.root)),
     )
-    secret = "PASSWORD=plain-environment-secret\n"
-    (workspace.root / ".env").write_text(secret)
-    (workspace.root / ".ENV").write_text(secret)
-    (workspace.root / ".env.prod").write_text(secret)
+    sensitive_content = "PASSWORD=plain-environment-secret\n"
+    (workspace.root / ".env").write_text(sensitive_content)
+    (workspace.root / ".ENV").write_text(sensitive_content)
+    (workspace.root / ".env.prod").write_text(sensitive_content)
     protected_directory = workspace.root / "nested" / ".EnV.prod"
     protected_directory.mkdir(parents=True)
-    (protected_directory / "settings.txt").write_text(secret)
+    (protected_directory / "settings.txt").write_text(sensitive_content)
     (workspace.root / "environment-alias").symlink_to(workspace.root / ".env")
     (workspace.root / ".env.example").write_text("EXAMPLE_VALUE=placeholder\n")
 
@@ -1097,8 +1097,8 @@ async def test_unscoped_reads_run_off_loop_and_reject_rename_to_external_symlink
     raced = workspace.root / "race.txt"
     raced.write_text("original workspace content\n")
     outside = workspace.root.parent / "outside-secret.txt"
-    secret = "external secret from rename race"
-    outside.write_text(secret)
+    sensitive_content = "external secret from rename race"
+    outside.write_text(sensitive_content)
     registry = _persisted_registry(
         storage,
         workspace,
@@ -1132,7 +1132,7 @@ async def test_unscoped_reads_run_off_loop_and_reject_rename_to_external_symlink
 
     assert swapped is True
     assert not result.ok
-    assert secret not in f"{result.output}\n{result.error}"
+    assert sensitive_content not in f"{result.output}\n{result.error}"
     assert worker_threads and worker_threads[0] != event_loop_thread
 
 
@@ -1526,8 +1526,8 @@ async def test_project_scope_rejects_parent_and_symlink_escapes_without_leaking_
     beta = workspace.root / "beta"
     alpha.mkdir()
     beta.mkdir()
-    secret = "beta private payload must stay hidden"
-    (beta / "secret.txt").write_text(secret)
+    sensitive_content = "beta private payload must stay hidden"
+    (beta / "secret.txt").write_text(sensitive_content)
     (alpha / "link").symlink_to(beta, target_is_directory=True)
     registry = _persisted_registry(
         storage,
@@ -1565,7 +1565,7 @@ async def test_project_scope_rejects_parent_and_symlink_escapes_without_leaking_
     for result in (traversal, linked_list, linked_search):
         assert not result.ok
         assert "selected project scope" in (result.error or "")
-        assert secret not in f"{result.output}\n{result.error}"
+        assert sensitive_content not in f"{result.output}\n{result.error}"
 
 
 @pytest.mark.asyncio
@@ -1837,13 +1837,13 @@ async def test_scoped_recursive_search_and_reads_never_follow_file_symlinks(
     alpha.mkdir()
     beta.mkdir()
     (alpha / "safe.txt").write_text("safe alpha payload\n")
-    secret = "sibling secret reachable only through a file symlink"
-    (beta / "secret.txt").write_text(secret)
+    sensitive_content = "sibling secret reachable only through a file symlink"
+    (beta / "secret.txt").write_text(sensitive_content)
     (alpha / "secret-link.txt").symlink_to(beta / "secret.txt")
     for ignored_name in ("node_modules", "build", "vendor"):
         ignored = alpha / ignored_name
         ignored.mkdir()
-        (ignored / "dependency.txt").write_text(secret)
+        (ignored / "dependency.txt").write_text(sensitive_content)
     registry = _persisted_registry(
         storage,
         workspace,
@@ -1872,7 +1872,7 @@ async def test_scoped_recursive_search_and_reads_never_follow_file_symlinks(
     assert all(name not in listed.output for name in ("node_modules", "build", "vendor"))
     assert not read.ok and "selected project scope" in (read.error or "")
     assert searched.ok and searched.output == "No matches"
-    assert secret not in "\n".join(
+    assert sensitive_content not in "\n".join(
         f"{result.output}\n{result.error}" for result in (listed, read, searched)
     )
 
@@ -2400,8 +2400,8 @@ async def test_scoped_search_rejects_file_changed_to_symlink_between_stat_and_op
     beta.mkdir()
     raced = alpha / "race.txt"
     raced.write_text("ordinary alpha content\n")
-    secret = "sibling payload from a raced symlink"
-    (beta / "secret.txt").write_text(secret)
+    sensitive_content = "sibling payload from a raced symlink"
+    (beta / "secret.txt").write_text(sensitive_content)
     registry = _persisted_registry(
         storage,
         workspace,
@@ -2429,7 +2429,7 @@ async def test_scoped_search_rejects_file_changed_to_symlink_between_stat_and_op
     assert swapped is True
     assert not searched.ok
     assert "replaced after selection" in (searched.error or "")
-    assert secret not in f"{searched.output}\n{searched.error}"
+    assert sensitive_content not in f"{searched.output}\n{searched.error}"
 
 
 @pytest.mark.asyncio
@@ -2443,8 +2443,8 @@ async def test_bound_project_scope_fails_closed_if_scope_is_replaced_by_symlink(
     alpha.mkdir()
     beta.mkdir()
     (alpha / "README.md").write_text("original alpha\n")
-    secret = "replacement beta payload must stay hidden"
-    (beta / "README.md").write_text(secret)
+    sensitive_content = "replacement beta payload must stay hidden"
+    (beta / "README.md").write_text(sensitive_content)
     registry = _persisted_registry(
         storage,
         workspace,
@@ -2476,7 +2476,7 @@ async def test_bound_project_scope_fails_closed_if_scope_is_replaced_by_symlink(
 
     for result in results:
         assert not result.ok
-        assert secret not in f"{result.output}\n{result.error}"
+        assert sensitive_content not in f"{result.output}\n{result.error}"
 
 
 @pytest.mark.asyncio

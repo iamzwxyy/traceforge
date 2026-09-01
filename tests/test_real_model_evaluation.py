@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from traceforge.models import ProviderConfig
+from traceforge.models import InteractionMode, ProviderConfig
 from traceforge.sandbox import CommandSandbox
 from traceforge.storage import Storage
 
@@ -129,10 +129,23 @@ def test_real_model_evaluator_lists_pinned_scenarios() -> None:
     )
 
     assert result.stdout.splitlines() == [
-        "single-file-fast-path\tSingle-file repair in default Agent mode",
+        "single-file-fast-path\tSingle-file repair through the automatic plan gate",
         "multi-file-review-path\tMulti-file repair behind plan review",
         "greenfield-todo-cli\tGreenfield zero-dependency project from an empty workspace",
     ]
+
+
+def test_real_model_scenarios_match_the_current_plan_gate_contract() -> None:
+    single = SCENARIO_BY_ID["single-file-fast-path"]
+    multi = SCENARIO_BY_ID["multi-file-review-path"]
+    greenfield = SCENARIO_BY_ID["greenfield-todo-cli"]
+
+    assert single.mode is InteractionMode.AGENT
+    assert single.expected_gate == "auto_approved"
+    assert multi.mode is InteractionMode.PLAN
+    assert multi.expected_gate == "approval_required"
+    assert greenfield.mode is InteractionMode.AGENT
+    assert greenfield.expected_gate == "approval_required"
 
 
 def test_repair_scenarios_pin_complete_isolated_environments() -> None:

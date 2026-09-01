@@ -46,12 +46,12 @@ Its differentiator is a defensible engineering loop with useful human control.
   whether an action may run. Scoped reads remain bounded by entry, line, file, tree, scan-byte,
   regex-time, and persisted-output limits. Only a manifest-backed whole-project overview
   additionally requires a root listing and one root README or manifest read before it can finish.
-- **Agent by default, Plan when requested.** Executable tasks inspect, plan internally, implement,
-  and verify without a plan-approval ceremony. Plan mode is an explicit composer toggle that
-  pauses on a complete downloadable Markdown plan whenever implementation is actually needed.
+- **Automatic plan-review gate.** Every executable task produces a structured Markdown plan. The
+  host continues explicit low-risk single-file work automatically and pauses complex, high-impact,
+  clarified, or uncertain work for review; the standard workbench has no separate plan-mode toggle.
 - **Three explicit action-permission profiles.** Manual asks before every edit or command;
   Automatic (the default) applies deterministic local rules; Full access is deliberately scoped
-  to the workspace and enforced OS sandbox. All three remain independent from Agent/Plan mode,
+  to the workspace and enforced OS sandbox. All three remain independent from the plan-review gate,
   while hard destructive commands, real-path boundaries, and credential scrubbing stay invariant.
 - **Plan as a completion contract.** Planned files, builder progress, check status, exact commands,
   and evidence stay visible. A write outside the declared file scope pauses for action approval.
@@ -182,7 +182,7 @@ rule-message insertion, so a key formed only across that compact JSON boundary c
 the provider loop or turn the paused task into a failure.
 
 Switching between tasks keeps each direct-task, project, and follow-up draft separate in page memory,
-including plan mode, approval mode, and reasoning effort. Draft text is never written to browser
+including approval mode and reasoning effort. Draft text is never written to browser
 storage or the backend and disappears on reload. Successful submissions clear only their own draft;
 failed submissions remain editable. A late create or follow-up response cannot steal navigation,
 surface an error on a different task, or submit twice. Selected-run events remain isolated to one
@@ -245,7 +245,8 @@ TraceForge creates a unique task directory beneath the visible default root. Cli
 reusable project root in the application, then use the plus button beside that folder for
 project-scoped tasks. Direct runs stay at the top level. After a
 turn finishes, use the bottom composer to continue in the same task; each follow-up can choose its
-own Agent/Plan and action-permission modes. In either mode, conversational or read-only requests can answer directly;
+own action-permission mode and reasoning effort, while the plan gate is assessed again.
+Conversational or read-only requests can answer directly;
 the UI labels that terminal state separately from evidence-backed completion.
 After rollback, the same composer creates and selects a linked successor task instead. The old run
 remains immutable audit history, and the successor snapshots the current workspace; exact request
@@ -281,8 +282,8 @@ flowchart LR
     A[Task] --> B[Inspect and clarify]
     B -->|conversation or read-only| J[Direct answer, no completion claim]
     B --> C[Complete Markdown plan]
-    C -->|Agent mode| D[Builder and native tools]
-    C -->|Plan mode| H[Human plan review]
+    C -->|low-risk automatic path| D[Builder and native tools]
+    C -->|review required| H[Human plan review]
     H --> D
     D --> E[Acceptance checks]
     E --> F[Read-only completion review]
