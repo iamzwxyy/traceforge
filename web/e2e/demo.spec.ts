@@ -71,9 +71,44 @@ test("demo proves a tenant-isolation fix without runtime errors", async ({ page 
   await expect(page.locator(".plan-document")).toContainText("实施计划");
   await expect(page.getByRole("link", { name: "下载 Markdown" }))
     .toHaveAttribute("href", /plan\.md$/);
+  const runsResponse = await page.request.get("/api/runs");
+  const runs = await runsResponse.json() as Array<{ id: string }>;
+  const runId = runs.at(0)?.id;
+  expect(runId).toBeTruthy();
   await page.getByRole("button", { name: "批准并执行" }).click();
 
-  await expect(page.getByText("本轮已完成", { exact: true })).toBeVisible({ timeout: 45_000 });
+  try {
+    await expect(page.getByText("本轮已完成", { exact: true })).toBeVisible({ timeout: 45_000 });
+  } catch (error) {
+    const [runResponse, eventsResponse] = await Promise.all([
+      page.request.get(`/api/runs/${runId}`),
+      page.request.get(`/api/runs/${runId}/events?after_seq=0`),
+    ]);
+    const run = await runResponse.json() as {
+      state?: string;
+      error?: string | null;
+      step_count?: number;
+      repair_cycles?: number;
+      plan?: { acceptance_checks?: unknown[] } | null;
+    };
+    const events = await eventsResponse.json() as Array<{
+      seq?: number;
+      type?: string;
+      payload?: unknown;
+    }>;
+    const diagnostic = {
+      state: run.state,
+      error: run.error,
+      step_count: run.step_count,
+      repair_cycles: run.repair_cycles,
+      acceptance_checks: run.plan?.acceptance_checks,
+      last_events: events.slice(-12),
+    };
+    throw new Error(
+      `Demo did not reach the terminal UI. Backend diagnostic: ${JSON.stringify(diagnostic)}. `
+      + `Original assertion: ${String(error)}`,
+    );
+  }
   await expect(page.locator(".assistant-turn")).toHaveCount(1);
   await expect(page.locator(".assistant-turn"))
     .toContainText("已按 (tenant_id, profile_id) 隔离缓存项");
