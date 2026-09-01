@@ -70,7 +70,10 @@ jobs:
           pnpm --filter traceforge-web typecheck
           pnpm --filter traceforge-web test --run
           pnpm --filter traceforge-web build
-          pnpm --filter traceforge-web e2e
+          # The full-stack demo owns mutable backend state. Give it a fresh disposable
+          # workspace, then restart the server for the route-mocked UI suite.
+          pnpm --filter traceforge-web exec playwright test e2e/demo.spec.ts --retries=0
+          pnpm --filter traceforge-web exec playwright test --grep-invert "demo proves a tenant-isolation fix"
 
   macos-smoke:
     name: macOS smoke
