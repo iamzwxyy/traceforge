@@ -1,4 +1,22 @@
-PLANNER_SYSTEM_PROMPT = """\
+_PLANNER_OFFLINE_NETWORK_GUIDANCE = """\
+An enforced command sandbox has no external network access. For a new or empty workspace, do not
+recommend a framework or package stack that requires an unproven download. Prefer a zero-dependency
+or already present toolchain as the recommended clarification option. If the user explicitly selects
+a dependency-heavy stack, submit a plan only when the workspace already makes it runnable offline;
+otherwise clarify whether a faithful zero-dependency fallback is acceptable instead of assuming an
+install will succeed."""
+
+
+_PLANNER_ONLINE_NETWORK_GUIDANCE = """\
+An enforced command sandbox in this deployment allows authorized outbound network access while still
+protecting the workspace boundary, credentials, and host files. You may recommend a framework or
+package stack that downloads dependencies, and you should prefer the stack the user requests. Still
+favor an already present or project-native toolchain when it fully satisfies the request, and treat
+dependency installation as a real plan step that can take time or fail rather than a guaranteed
+success."""
+
+
+_PLANNER_SYSTEM_PROMPT_TEMPLATE = """\
 You are TraceForge's intent router and planning component. The host first resolves any trusted
 workspace/project target and supplies a structured request-resolution record. Respect that record:
 project selection answers *where* the request applies, never whether execution is authorized.
@@ -50,12 +68,7 @@ not use shell strings.
 Prefer existing project test, lint, and type-check commands. Do not invent ad-hoc python -c checks
 when the project test suite already covers the behavior. A normal inspect, edit, and verify plan
 is still a small plan; avoid inflating low-risk work with generic risks.
-An enforced command sandbox has no external network access. For a new or empty workspace, do not
-recommend a framework or package stack that requires an unproven download. Prefer a zero-dependency
-or already present toolchain as the recommended clarification option. If the user explicitly selects
-a dependency-heavy stack, submit a plan only when the workspace already makes it runnable offline;
-otherwise clarify whether a faithful zero-dependency fallback is acceptable instead of assuming an
-install will succeed.
+{network_guidance}
 List every file the builder is expected to create, update, or delete in impacted_files. An empty
 list means the mutation scope is unknown and will require review. Keep the plan concrete enough
 to implement but do not make code changes during planning. Include a substantive approach that
@@ -70,7 +83,27 @@ Do not expose hidden reasoning.
 """
 
 
-BUILDER_SYSTEM_PROMPT = """\
+_BUILDER_OFFLINE_NETWORK_GUIDANCE = """\
+Project commands run with ambient credentials and TraceForge's private virtual environment removed.
+Use the project's existing environment, or create a workspace-local one with its normal package
+manager. Never install dependencies into or inspect TraceForge's own Python environment. An enforced
+command sandbox has no external network access, so do not assume a package install can download. If
+an install fails for that reason, do not repeat it unchanged: use an already cached or
+zero-dependency approach that still meets the plan, or report the concrete blocker when no faithful
+fallback exists."""
+
+
+_BUILDER_ONLINE_NETWORK_GUIDANCE = """\
+Project commands run with ambient credentials and TraceForge's private virtual environment removed.
+Use the project's existing environment, or create a workspace-local one with its normal package
+manager. Never install dependencies into or inspect TraceForge's own Python environment. An enforced
+command sandbox in this deployment allows authorized outbound network access, so a package install
+may download. If an install fails, inspect the concrete error and retry with a corrected command
+rather than repeating it unchanged; fall back to an already cached or zero-dependency approach only
+when installation genuinely cannot succeed."""
+
+
+_BUILDER_SYSTEM_PROMPT_TEMPLATE = """\
 You are TraceForge's Builder. Implement the recorded plan inside the selected workspace.
 Use the provided native tools; never claim to have read, changed, or tested something unless a
 tool result proves it. Reuse the supplied planning inspection evidence before reading the same
@@ -99,17 +132,41 @@ use an already available viable stack or create the declared project environment
 normal workspace-local package workflow; do not spend the task budget repeatedly probing the
 TraceForge host runtime.
 
-Project commands run with ambient credentials and TraceForge's private virtual environment removed.
-Use the project's existing environment, or create a workspace-local one with its normal package
-manager. Never install dependencies into or inspect TraceForge's own Python environment. An enforced
-command sandbox has no external network access, so do not assume a package install can download. If
-an install fails for that reason, do not repeat it unchanged: use an already cached or
-zero-dependency approach that still meets the plan, or report the concrete blocker when no faithful
-fallback exists.
+{network_guidance}
 
 Use Simplified Chinese for all user-facing progress and the final summary. Preserve code,
 commands, identifiers, paths, API names, and quoted user text exactly when needed.
 """
+
+
+def planner_system_prompt(*, allow_network: bool = False) -> str:
+    """Return the planner contract with network guidance matching the deployment."""
+
+    guidance = (
+        _PLANNER_ONLINE_NETWORK_GUIDANCE
+        if allow_network
+        else _PLANNER_OFFLINE_NETWORK_GUIDANCE
+    )
+    return _PLANNER_SYSTEM_PROMPT_TEMPLATE.format(network_guidance=guidance)
+
+
+def builder_system_prompt(*, allow_network: bool = False) -> str:
+    """Return the builder contract with network guidance matching the deployment."""
+
+    guidance = (
+        _BUILDER_ONLINE_NETWORK_GUIDANCE
+        if allow_network
+        else _BUILDER_OFFLINE_NETWORK_GUIDANCE
+    )
+    return _BUILDER_SYSTEM_PROMPT_TEMPLATE.format(network_guidance=guidance)
+
+
+# The offline variants remain the module-level defaults so callers and tests that do not
+# thread a deployment flag keep the historical network-free contract.
+PLANNER_SYSTEM_PROMPT = planner_system_prompt(allow_network=False)
+
+
+BUILDER_SYSTEM_PROMPT = builder_system_prompt(allow_network=False)
 
 
 VERIFIER_SYSTEM_PROMPT = """\

@@ -15,6 +15,7 @@ class Settings:
     base_url: str | None
     model: str
     credential_file: Path | None = None
+    allow_network: bool = True
     context_limit: int = 64_000
     model_request_timeout: int = 180
     model_retry_attempts: int = 3
@@ -58,6 +59,7 @@ class Settings:
             api_key=api_key,
             base_url=os.getenv("OPENAI_BASE_URL") or None,
             model=os.getenv("OPENAI_MODEL", "gpt-5.6-sol"),
+            allow_network=_bool_env("TRACEFORGE_ALLOW_NETWORK", True),
             context_limit=context_limit,
             model_request_timeout=model_request_timeout,
         )
@@ -84,3 +86,15 @@ def _positive_int(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"", "0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")

@@ -266,6 +266,7 @@ Environment variables remain available as a non-persisted fallback:
 | `OPENAI_BASE_URL` | no | OpenAI-compatible endpoint |
 | `TRACEFORGE_CONTEXT_LIMIT` | no | Conservative token-window fallback for unrecognized routes; defaults to 64,000 |
 | `TRACEFORGE_MODEL_TIMEOUT` | no | Per-attempt model timeout in seconds; defaults to 180 |
+| `TRACEFORGE_ALLOW_NETWORK` | no | Authorize outbound network for sandboxed commands; defaults to on. Set to `0`/`false` to contain the network axis; the workspace, credential, and host-file boundaries are always enforced |
 | `TRACEFORGE_WORKSPACE_ROOT` | no | Advanced override for the direct-task root |
 
 Before the first real run, use **测试并保存**. The probe exercises the unsaved draft in memory and

@@ -43,6 +43,8 @@ from traceforge.prompts import (
     BUILDER_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
+    builder_system_prompt,
+    planner_system_prompt,
 )
 from traceforge.proof import build_proof_pack, proof_pack_markdown
 from traceforge.provider import (
@@ -2735,6 +2737,27 @@ def test_greenfield_prompts_do_not_recommend_unavailable_network_dependencies() 
     assert "zero-dependency" in PLANNER_SYSTEM_PROMPT
     assert "do not assume a package install can download" in BUILDER_SYSTEM_PROMPT
     assert "do not repeat it unchanged" in BUILDER_SYSTEM_PROMPT
+
+
+def test_offline_prompt_helpers_match_module_defaults() -> None:
+    assert planner_system_prompt(allow_network=False) == PLANNER_SYSTEM_PROMPT
+    assert builder_system_prompt(allow_network=False) == BUILDER_SYSTEM_PROMPT
+
+
+def test_network_authorized_prompts_permit_dependency_downloads() -> None:
+    planner_online = planner_system_prompt(allow_network=True)
+    builder_online = builder_system_prompt(allow_network=True)
+    assert planner_online != PLANNER_SYSTEM_PROMPT
+    assert builder_online != BUILDER_SYSTEM_PROMPT
+    # The online contract must not repeat the offline "no external network" assumption or
+    # push the zero-dependency fallback as the default recommendation.
+    assert "no external network access" not in planner_online
+    assert "allows authorized outbound network access" in planner_online
+    assert "no external network access" not in builder_online
+    assert "allows authorized outbound network access" in builder_online
+    # Both variants remain Simplified-Chinese user-facing contracts.
+    assert "Simplified Chinese" in planner_online
+    assert "Simplified Chinese" in builder_online
 
 
 @pytest.mark.asyncio

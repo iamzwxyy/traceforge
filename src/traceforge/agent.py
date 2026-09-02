@@ -60,9 +60,9 @@ from traceforge.project_scope import (
     lookup_project_candidate_by_name,
 )
 from traceforge.prompts import (
-    BUILDER_SYSTEM_PROMPT,
-    PLANNER_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
+    builder_system_prompt,
+    planner_system_prompt,
 )
 from traceforge.proof import (
     ProofNotReadyError,
@@ -456,6 +456,14 @@ class AgentManager:
         )
         self.tools = ToolRegistry(self.workspace, settings)
         self.context = ContextManager(settings.context_limit)
+        # Resolve the network-aware model contracts once per manager so the planner and
+        # builder describe the same network posture the OS sandbox actually enforces.
+        self.planner_system_prompt = planner_system_prompt(
+            allow_network=settings.allow_network
+        )
+        self.builder_system_prompt = builder_system_prompt(
+            allow_network=settings.allow_network
+        )
         self.broker = broker or EventBroker(storage)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._controls: dict[str, _Control] = {}
@@ -1936,10 +1944,10 @@ class AgentManager:
     async def _planning_phase(self, run: RunRecord) -> None:
         request = self._current_request(run)
         if not run.messages or not str(run.messages[0].get("content", "")).startswith(
-            PLANNER_SYSTEM_PROMPT
+            self.planner_system_prompt
         ):
             run.messages = [
-                {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+                {"role": "system", "content": self.planner_system_prompt},
                 {
                     "role": "user",
                     "content": self._conversation_context(run, request),
@@ -2542,7 +2550,7 @@ class AgentManager:
                 "again):\n" + evidence
             )
         target = self._active_turn(run).project_target
-        system_prompt = BUILDER_SYSTEM_PROMPT
+        system_prompt = self.builder_system_prompt
         if target is not None:
             system_prompt += "\n\n" + self._project_target_instruction(run, target)
         messages: list[dict[str, Any]] = [
@@ -4361,7 +4369,7 @@ class AgentManager:
         if run.messages and run.messages[0].get("role") == "system":
             message_variants.append(run.messages)
         planning_messages = [
-            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+            {"role": "system", "content": self.planner_system_prompt},
             {
                 "role": "user",
                 "content": self._conversation_context(run, self._current_request(run)),
@@ -4409,7 +4417,7 @@ class AgentManager:
         assert guidance is not None
         self.context.prepare(
             [
-                {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+                {"role": "system", "content": self.planner_system_prompt},
                 {"role": "user", "content": guidance},
                 {"role": "user", "content": f"Current request:\n{request}"},
             ],

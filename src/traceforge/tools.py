@@ -142,7 +142,9 @@ class ToolRegistry:
         self.settings = settings
         self.workspace.storage.register_credential_guard(settings.api_key)
         self.sandbox = CommandSandbox(
-            workspace.root, credential_file=settings.credential_file
+            workspace.root,
+            credential_file=settings.credential_file,
+            allow_network=settings.allow_network,
         )
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._instruction_grants: dict[str, str] = {}

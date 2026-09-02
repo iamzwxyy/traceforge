@@ -721,7 +721,7 @@ def test_doctor_reports_readiness_without_exposing_credentials(tmp_path, monkeyp
     )
     monkeypatch.setattr(
         "traceforge.sandbox.sandbox_status",
-        lambda _workspace: SimpleNamespace(
+        lambda _workspace, **_kwargs: SimpleNamespace(
             enforced=True,
             backend="seatbelt",
             detail="Seatbelt is enforced.",
@@ -773,7 +773,7 @@ def test_successful_doctor_model_probe_persists_connection_verification(
     )
     monkeypatch.setattr(
         "traceforge.sandbox.sandbox_status",
-        lambda _workspace: SimpleNamespace(
+        lambda _workspace, **_kwargs: SimpleNamespace(
             enforced=True,
             backend="seatbelt",
             detail="Seatbelt is enforced.",
@@ -823,7 +823,7 @@ def test_doctor_fails_for_blocked_port_and_required_sandbox(tmp_path, monkeypatc
     )
     monkeypatch.setattr(
         "traceforge.sandbox.sandbox_status",
-        lambda _workspace: SimpleNamespace(
+        lambda _workspace, **_kwargs: SimpleNamespace(
             enforced=False,
             backend="policy_only",
             detail="No OS sandbox backend passed its probe.",
@@ -861,7 +861,7 @@ def test_doctor_reports_an_unreadable_state_database(tmp_path, monkeypatch) -> N
     )
     monkeypatch.setattr(
         "traceforge.sandbox.sandbox_status",
-        lambda _workspace: SimpleNamespace(
+        lambda _workspace, **_kwargs: SimpleNamespace(
             enforced=True,
             backend="seatbelt",
             detail="Seatbelt is enforced.",

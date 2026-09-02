@@ -281,8 +281,8 @@ then probes and selects one backend:
 
 | Platform | Enforced backend | Main boundary |
 | --- | --- | --- |
-| macOS | built-in Seatbelt (`sandbox-exec`) | writes limited to the command root and temp; a selected project also hides sibling file contents; external network denied; loopback retained |
-| Linux | working non-setuid Bubblewrap | read-only host root, writable command root/temp, read-only `.git`, separate user/PID/network namespaces; a selected project masks its containing workspace before remounting only that project |
+| macOS | built-in Seatbelt (`sandbox-exec`) | writes limited to the command root and temp; a selected project also hides sibling file contents; external network allowed by default, denied when contained (loopback retained) |
+| Linux | working non-setuid Bubblewrap | read-only host root, writable command root/temp, read-only `.git`, separate user/PID namespaces plus a network namespace only when network is contained; a selected project masks its containing workspace before remounting only that project |
 | Unsupported or failed probe | none (`policy_only`) | application path/argv policy and approval only for workspace-root commands; selected-project commands fail closed |
 
 Both enforced profiles block configured credential files, common credential locations, and real
@@ -290,6 +290,14 @@ Both enforced profiles block configured credential files, common credential loca
 under the user's home except the selected workspace and runtime paths. Bubblewrap keeps the host
 root readable for tool compatibility but masks the enumerated sensitive paths. These are accurate,
 different claims; the UI does not collapse them into a generic “secure” label.
+
+Outbound network is a separate axis from these file, credential, and host boundaries. By default it
+is authorized deployment-wide so dependency installation and other network work succeed without the
+whole-sandbox `bypass` path. An operator can set `TRACEFORGE_ALLOW_NETWORK=0` to contain it, which
+makes Seatbelt deny external connections and Bubblewrap add a network namespace; only the network
+rules change while every write, credential, and host-file boundary stays enforced either way. The
+effective mode is recorded on each command result (`network=allowed` when authorized) and named in
+the readiness detail, so it remains an auditable configured fact rather than an inferred one.
 
 When a project below the workspace root is selected, its command boundary cannot be bypassed by an
 approval: an unavailable backend rejects the command, Seatbelt denies reads from the rest of the
@@ -518,6 +526,10 @@ ID; a lineage conflict refreshes the parent and task list so the existing succes
   fails visibly to `policy_only` when its startup probe cannot construct the namespace.
 - The macOS profile permits loopback so project tests can bind local servers; another trusted local
   process could still be reachable.
+- Outbound network is authorized deployment-wide by default and can be contained with
+  `TRACEFORGE_ALLOW_NETWORK=0`. That relaxes only the network axis; the file, credential, and host
+  boundaries stay enforced, but a hostile command can then exfiltrate readable data or download
+  untrusted code. Contain it for unfamiliar repositories.
 - Read-only classification is syntactic; aliases/wrappers are treated as unknown, not trusted.
 - A benign repository may contain arbitrary secrets in ordinary source files. TraceForge blocks the
   currently configured provider key and recognizable `sk-...` values at its durable/public

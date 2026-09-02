@@ -392,7 +392,7 @@ def doctor(
     _doctor_line("PASS" if port_ready else "FAIL", "Listen address", port_detail)
     failures += not port_ready
 
-    sandbox = sandbox_status(settings.workspace)
+    sandbox = sandbox_status(settings.workspace, allow_network=settings.allow_network)
     if sandbox.enforced:
         _doctor_line("PASS", "Command sandbox", f"{sandbox.backend} enforced")
     else:

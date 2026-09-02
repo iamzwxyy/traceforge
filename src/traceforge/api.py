@@ -448,7 +448,9 @@ def create_app(
             "connection_verified": runtime.connection_verified(),
             "suggested_task": settings.suggested_task,
             "mode": "demo" if settings.demo_mode else "standard",
-            "sandbox": sandbox_status(settings.workspace).as_dict(),
+            "sandbox": sandbox_status(
+                settings.workspace, allow_network=settings.allow_network
+            ).as_dict(),
             "limits": {
                 "context": model_context.context_window,
                 "context_source": model_context.source,

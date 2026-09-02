@@ -33,7 +33,8 @@ paths. It:
 
 - permits writes only below the selected workspace and per-command temporary directory;
 - protects the workspace root from unlink and makes `.git` read-only;
-- denies external IPv4/IPv6 outbound connections while retaining loopback for local test servers;
+- allows external IPv4/IPv6 outbound connections by default, and denies them (retaining loopback for
+  local test servers) when network is contained (see "Network authorization");
 - blocks configured credentials, common key stores, and `.env*` contents;
 - denies other file-content reads under the user's home except workspace and required runtime
   roots, while retaining directory metadata needed to traverse a virtual-environment interpreter.
@@ -42,13 +43,36 @@ paths. It:
 
 TraceForge accepts only a working, non-setuid `bwrap` outside the workspace. Its probe must create
 user and network namespaces with a read-only root. Each invocation then uses a new session plus
-user, PID, IPC, UTS, and network namespaces; rebinds only the workspace and command temp writable;
-rebinds `.git` read-only; and masks known credential paths. If user namespaces are disabled or any
-probe step fails, execution remains available but the state is visibly `policy_only`.
+user, PID, IPC, UTS, and (only when network is contained) network namespaces; rebinds only
+the workspace and command temp writable; rebinds `.git` read-only; and masks known credential paths.
+If user namespaces are disabled or any probe step fails, execution remains available but the state
+is visibly `policy_only`.
 
 The Linux host root stays readable for broad build-tool compatibility. This is intentionally a
-weaker read-isolation claim than the macOS home-content rule, while the write, process, and network
-boundaries remain OS-enforced.
+weaker read-isolation claim than the macOS home-content rule, while the write and process boundaries
+remain OS-enforced. The network boundary is OS-enforced only while network containment is left on.
+
+## Network authorization
+
+Network containment is a separate axis from the file, credential, process, and host boundaries. It
+is on by default: an enforced backend allows external outbound connections. An operator can contain
+it by setting `TRACEFORGE_ALLOW_NETWORK=0` before launch, which makes Seatbelt deny external
+outbound connections (retaining loopback) and Bubblewrap remove the command's network namespace.
+The two behaviors are independent of every file boundary:
+
+- With network authorized (default), Seatbelt omits the two `network-outbound` denials and
+  Bubblewrap omits only `--unshare-net`; every write, unlink, credential, home-content, namespace,
+  and mount rule is unchanged.
+- With network contained, those two network rules are reinstated and nothing else changes.
+- Each enforced command result reports `network=allowed` or the contained mode, and the readiness
+  detail names the posture, so the fact stays auditable rather than inferred from an approval.
+
+This is intentionally global and coarse rather than a per-command decision: the file sandbox always
+protects the workspace boundary, credentials, and host files, so installing dependencies never
+requires the whole-sandbox `bypass` path. The default-on network widens the residual
+data-exfiltration and untrusted-download surface for every command in the deployment; set
+`TRACEFORGE_ALLOW_NETWORK=0` for unfamiliar repositories and prefer a disposable VM for intentionally
+hostile code.
 
 ## Environment containment
 
@@ -88,7 +112,10 @@ portable tests. The browser E2E also checks the global state and Proof Pack sand
 This profile protects the normal local-agent workflow; it is not a kernel exploit boundary or a
 remote attestation. macOS loopback remains reachable. Linux readable host files outside enumerated
 sensitive paths may still disclose data to a malicious build. A user-approved bypass intentionally
-runs with the TraceForge user's authority. Use a disposable VM for intentionally hostile code.
+runs with the TraceForge user's authority. Because network is authorized by default, every command
+can reach the network with the file boundaries still enforced, which widens data-exfiltration and
+untrusted-download risk; set `TRACEFORGE_ALLOW_NETWORK=0` to contain it. Use a disposable VM for
+intentionally hostile code.
 
 Design references: [OpenAI Codex sandboxing](https://developers.openai.com/codex/sandboxing) and
 [Bubblewrap](https://github.com/containers/bubblewrap).

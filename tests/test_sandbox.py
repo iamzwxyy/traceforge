@@ -491,3 +491,117 @@ async def test_explicit_sandbox_bypass_is_visible_and_one_shot(
     assert outside.read_text() == "approved"
     assert result.metadata["sandbox"]["status"] == "bypassed"
     outside.unlink()
+
+
+def test_seatbelt_network_authorization_drops_only_network_denials(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".env").write_text("SECRET=masked\n")
+    command_temp = tmp_path / "command-temp"
+    command_temp.mkdir()
+    sandbox = CommandSandbox(workspace, allow_network=True)
+    sandbox.status = SandboxStatus("seatbelt", True, "test backend")
+    sandbox._program = "/usr/bin/sandbox-exec"
+
+    launch = sandbox.prepare(
+        "/usr/bin/python3",
+        ["python3", "-V"],
+        cwd=workspace,
+        command_temp=command_temp,
+        environment={"PATH": "/usr/bin:/bin"},
+        bypass=False,
+    )
+
+    profile = launch.arguments[1]
+    # Only the network axis is relaxed; every file and credential boundary is unchanged.
+    assert "deny network-outbound" not in profile
+    assert "deny file-write*" in profile
+    assert "deny file-read-data" in profile
+    assert launch.metadata["network"] == "allowed"
+    assert launch.metadata["status"] == "enforced"
+
+
+def test_bubblewrap_network_authorization_keeps_other_namespaces(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".env").write_text("SECRET=masked\n")
+    command_temp = tmp_path / "command-temp"
+    command_temp.mkdir()
+    sandbox = CommandSandbox(workspace, allow_network=True)
+    sandbox.status = SandboxStatus("bubblewrap", True, "test backend")
+    sandbox._program = "/usr/bin/bwrap"
+
+    launch = sandbox.prepare(
+        "/usr/bin/python3",
+        ["python3", "-V"],
+        cwd=workspace,
+        command_temp=command_temp,
+        environment={"PATH": "/usr/bin:/bin"},
+        bypass=False,
+    )
+
+    arguments = launch.arguments
+    # Only the network namespace is shared; every other namespace and mask is unchanged.
+    assert "--unshare-net" not in arguments
+    assert {"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts"} <= set(
+        arguments
+    )
+    assert str(workspace / ".env") in arguments
+    assert launch.metadata["network"] == "allowed"
+
+
+@pytest.mark.asyncio
+async def test_network_authorized_sandbox_still_blocks_escape_and_secret(
+    settings: Settings, storage: Storage, workspace: Workspace
+) -> None:
+    secret = workspace.root / ".env"
+    secret.write_text("TRACEFORGE_SANDBOX_SECRET=never-readable\n")
+    configured = replace(settings, credential_file=secret, allow_network=True)
+    registry = _persisted_registry(
+        storage,
+        workspace,
+        configured,
+        RunRecord(id="net-run", task="Probe", workspace=str(workspace.root)),
+    )
+    if not registry.sandbox_status.enforced:
+        pytest.skip(registry.sandbox_status.detail)
+    outside = workspace.root.parent / "network-escape.txt"
+    outside.unlink(missing_ok=True)
+
+    escape_result = await registry.execute(
+        "net-run",
+        ToolCall(
+            id="escape",
+            name="run_command",
+            arguments={
+                "argv": [
+                    "python3",
+                    "-c",
+                    f"from pathlib import Path; Path({str(outside)!r}).write_text('escaped')",
+                ]
+            },
+        ),
+    )
+    secret_result = await registry.execute(
+        "net-run",
+        ToolCall(
+            id="secret",
+            name="run_command",
+            arguments={
+                "argv": [
+                    "python3",
+                    "-c",
+                    "from pathlib import Path; print(Path('.env').read_text())",
+                ]
+            },
+        ),
+    )
+
+    # The file/credential boundaries stay enforced even though network is authorized.
+    assert not escape_result.ok
+    assert escape_result.metadata["sandbox"]["network"] == "allowed"
+    assert not outside.exists()
+    assert not secret_result.ok
+    assert "never-readable" not in secret_result.output

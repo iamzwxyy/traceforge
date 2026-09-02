@@ -34,10 +34,19 @@ class SandboxLaunch:
 class CommandSandbox:
     """Build a fail-closed OS wrapper for commands that did not request an escape."""
 
-    def __init__(self, workspace: Path, *, credential_file: Path | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        credential_file: Path | None = None,
+        allow_network: bool = False,
+    ) -> None:
         self.workspace = workspace.resolve(strict=True)
         self.credential_file = credential_file.resolve() if credential_file else None
-        self.status, self._program = _detect_backend(self.workspace)
+        self.allow_network = allow_network
+        self.status, self._program = _detect_backend(
+            self.workspace, allow_network=allow_network
+        )
 
     def prepare(
         self,
@@ -107,16 +116,21 @@ class CommandSandbox:
                 "status": "enforced",
                 "backend": self.status.backend,
                 "enforced": True,
-                "network": (
-                    "loopback_only"
-                    if self.status.backend == "seatbelt"
-                    else "isolated_namespace"
-                ),
+                "network": self._network_mode(),
                 "command_root": str(command_root),
                 "scope_enforced": scoped,
                 "bypass_requested": bypass,
                 "detail": self.status.detail,
             },
+        )
+
+    def _network_mode(self) -> str:
+        if self.allow_network:
+            return "allowed"
+        return (
+            "loopback_only"
+            if self.status.backend == "seatbelt"
+            else "isolated_namespace"
         )
 
     def _validated_execution_root(self, requested: Path | None) -> Path:
@@ -221,10 +235,12 @@ class CommandSandbox:
                 f'(subpath (param "{key}")))'
             )
 
-        profile = "\n".join(
-            [
-                "(version 1)",
-                "(allow default)",
+        network_rules: list[str] = []
+        if not self.allow_network:
+            # Network containment is independent from the file, credential, and host
+            # boundaries below. When the operator explicitly allows network, only these
+            # outbound denials are dropped; every other rule still applies.
+            network_rules = [
                 (
                     "(deny network-outbound (require-all (socket-domain AF_INET) "
                     '(require-not (remote ip "localhost:*"))))'
@@ -233,6 +249,12 @@ class CommandSandbox:
                     "(deny network-outbound (require-all (socket-domain AF_INET6) "
                     '(require-not (remote ip "localhost:*"))))'
                 ),
+            ]
+        profile = "\n".join(
+            [
+                "(version 1)",
+                "(allow default)",
+                *network_rules,
                 # Keep directory metadata visible so executables nested under the
                 # user's home can be traversed, while denying file contents.
                 "(deny file-read-data (require-all (subpath (param \"HOME_ROOT\")) ",
@@ -276,15 +298,23 @@ class CommandSandbox:
             "--unshare-pid",
             "--unshare-ipc",
             "--unshare-uts",
-            "--unshare-net",
-            "--ro-bind",
-            "/",
-            "/",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
         ]
+        if not self.allow_network:
+            # A separate network namespace is the only network containment here. When the
+            # operator explicitly allows network, keep every other namespace and file
+            # boundary but let the command share the host network stack.
+            arguments.append("--unshare-net")
+        arguments.extend(
+            [
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+            ]
+        )
         if execution_root != self.workspace:
             # The initial read-only root still exposes the host workspace. Mask it before
             # mounting the selected project back at its original absolute path so sibling
@@ -339,22 +369,31 @@ class CommandSandbox:
         return sorted(protected)
 
 
-def sandbox_status(workspace: Path) -> SandboxStatus:
-    return _detect_backend(workspace.resolve(strict=True))[0]
+def sandbox_status(workspace: Path, *, allow_network: bool = False) -> SandboxStatus:
+    return _detect_backend(
+        workspace.resolve(strict=True), allow_network=allow_network
+    )[0]
 
 
-def _detect_backend(workspace: Path) -> tuple[SandboxStatus, str | None]:
+def _detect_backend(
+    workspace: Path, *, allow_network: bool = False
+) -> tuple[SandboxStatus, str | None]:
     system = platform.system()
     if system == "Darwin":
         executable = Path("/usr/bin/sandbox-exec")
         if executable.is_file() and _seatbelt_probe(str(executable)):
+            network_detail = (
+                "with authorized outbound network"
+                if allow_network
+                else "with loopback-only network"
+            )
             return (
                 SandboxStatus(
                     backend="seatbelt",
                     enforced=True,
                     detail=(
                         "Seatbelt limits writes to the workspace and isolated command temp, "
-                        "with loopback-only network."
+                        f"{network_detail}."
                     ),
                 ),
                 str(executable),
@@ -383,13 +422,18 @@ def _detect_backend(workspace: Path) -> tuple[SandboxStatus, str | None]:
                     None,
                 )
             elif _bubblewrap_probe(str(executable)):
+                network_detail = (
+                    "shared host network"
+                    if allow_network
+                    else "isolated network"
+                )
                 return (
                     SandboxStatus(
                         backend="bubblewrap",
                         enforced=True,
                         detail=(
                             "Bubblewrap limits writes to the workspace and isolated command "
-                            "temp, with isolated processes and network."
+                            f"temp, with isolated processes and {network_detail}."
                         ),
                     ),
                     str(executable),

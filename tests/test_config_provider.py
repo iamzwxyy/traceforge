@@ -30,6 +30,7 @@ def test_settings_from_env_and_validation(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TRACEFORGE_CONTEXT_LIMIT", "1234")
     monkeypatch.setenv("TRACEFORGE_MODEL_TIMEOUT", "90")
 
+    monkeypatch.delenv("TRACEFORGE_ALLOW_NETWORK", raising=False)
     settings = Settings.from_env(workspace)
 
     assert settings.workspace == workspace.resolve()
@@ -37,6 +38,7 @@ def test_settings_from_env_and_validation(tmp_path, monkeypatch) -> None:
     assert settings.context_limit == 1234
     assert settings.model_request_timeout == 90
     assert settings.masked_base_url == "https://model.example/v1"
+    assert settings.allow_network is True
 
     monkeypatch.delenv("OPENAI_API_KEY")
     with pytest.raises(ValueError, match="OPENAI_API_KEY"):
@@ -52,6 +54,30 @@ def test_settings_from_env_and_validation(tmp_path, monkeypatch) -> None:
         Settings.from_env(workspace, require_api_key=False)
     with pytest.raises(ValueError, match="not a directory"):
         Settings.from_env(workspace / "missing", require_api_key=False)
+
+
+def test_settings_allow_network_env_parsing(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(config_module, "user_data_path", lambda *args, **kwargs: data_dir)
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+
+    # Default is on; set TRACEFORGE_ALLOW_NETWORK=0 to contain unfamiliar repositories.
+    monkeypatch.delenv("TRACEFORGE_ALLOW_NETWORK", raising=False)
+    assert Settings.from_env(workspace).allow_network is True
+
+    for raw in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("TRACEFORGE_ALLOW_NETWORK", raw)
+        assert Settings.from_env(workspace).allow_network is True
+
+    for raw in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("TRACEFORGE_ALLOW_NETWORK", raw)
+        assert Settings.from_env(workspace).allow_network is False
+
+    monkeypatch.setenv("TRACEFORGE_ALLOW_NETWORK", "maybe")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        Settings.from_env(workspace)
 
 
 def test_settings_creates_and_reuses_a_default_workspace_root(
