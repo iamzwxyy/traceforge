@@ -88,13 +88,14 @@ _WORKSPACE_READ_INTENT = re.compile(
 _CONCRETE_WORKSPACE_SUBJECT = re.compile(
     r"项目|工程|仓库|代码库|依赖(?!注入|倒置)|"
     r"(?:源)?代码(?!\s*(?:示例|例子|样例|片段))|源码|文件|实现|逻辑|流程|调用链|"
-    r"定义|引用|测试|配置|README|清单|入口|构建|编译|部署|服务|应用|模块|"
+    r"定义|引用|测试|配置|README|清单|入口|构建|编译|部署|服务|应用|程序(?!员)|脚本|模块|"
     r"函数|接口|端点|页面|功能|缺陷|漏洞|错误|问题|数据库表|数据表|模式|迁移|"
     r"\b(?:projects?|repositor(?:y|ies)|repos?|codebases?|dependencies|"
     r"source\s+code|code(?!\s+(?:examples?|samples?|snippets?))|files?|"
     r"implementations?|logic|flows?|call\s+chains?|definitions?|references?|"
     r"tests?|configurations?|configs?|readmes?|manifests?|entry\s+points?|"
-    r"builds?|compilation|deployments?|services?|apps?|applications?|modules?|"
+    r"builds?|compilation|deployments?|services?|apps?|applications?|"
+    r"programs?|scripts?|modules?|"
     r"functions?|APIs?|endpoints?|pages?|features?|bugs?|errors?|issues?|"
     r"database\s+tables?|"
     r"schemas?|migrations?)\b",
@@ -434,14 +435,14 @@ _POTENTIAL_WORKSPACE_TASK_FRAME = re.compile(
 )
 _CHINESE_SOFTWARE_SUBJECT = (
     r"(?:登录|认证|授权|接口|端点|输入|输出|请求|响应|模式|支持|"
-    r"功能|缺陷|问题|错误|异常|页面|服务|应用|代码|文件|测试|"
+    r"功能|缺陷|问题|错误|异常|页面|服务|应用|程序|脚本|代码|文件|测试|"
     r"构建|依赖|数据库|配置|空值|边界)"
 )
 _ENGLISH_SOFTWARE_SUBJECT = (
     r"(?:login|auth(?:entication|orization)?|apis?|endpoints?|uuids?|inputs?|"
     r"outputs?|requests?|responses?|modes?|support|features?|bugs?|issues?|errors?|"
-    r"pages?|services?|apps?|applications?|code|files?|tests?|builds?|dependencies|"
-    r"databases?|configs?|configuration|null|empty|edge\s+cases?)"
+    r"pages?|services?|apps?|applications?|programs?|scripts?|code|files?|tests?|"
+    r"builds?|dependencies|databases?|configs?|configuration|null|empty|edge\s+cases?)"
 )
 _POTENTIAL_SOFTWARE_OBJECT = re.compile(
     rf"{_CHINESE_SOFTWARE_SUBJECT}|\b{_ENGLISH_SOFTWARE_SUBJECT}\b",

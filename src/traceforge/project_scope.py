@@ -185,7 +185,7 @@ _PROJECT_SIGNALS = re.compile(
 _CHINESE_STRONG_MUTATION_ACTION = r"(?:修改|修复|创建|新建|实现|添加|删除|迁移|重构|重命名)"
 _CHINESE_CONTEXTUAL_MUTATION_ACTION = (
     r"(?:编辑|改一下|改下|改|优化|开发|完善|写入|写|保存(?:到)?|落盘|"
-    r"生成|移动|复制|提交)"
+    r"生成|做|移动|复制|提交)"
 )
 _CHINESE_MUTATION_ACTION = (
     rf"(?:{_CHINESE_STRONG_MUTATION_ACTION}|{_CHINESE_CONTEXTUAL_MUTATION_ACTION})"

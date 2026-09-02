@@ -712,6 +712,47 @@ def test_non_workspace_content_outputs_do_not_open_a_project_picker(prompt: str)
 
 
 @pytest.mark.parametrize(
+    "prompt",
+    [
+        "帮我做个todolist程序",
+        "帮我做一个todo程序",
+        "做个待办清单程序",
+        "帮我写个todolist程序",
+        "帮我生成一个todo程序",
+        "帮我写个待办脚本",
+        "write me a todo program",
+        "create a todo program",
+        "build a todo script",
+    ],
+)
+def test_software_creation_requests_are_workspace_dependent(prompt: str) -> None:
+    """A request to build a program is workspace work, never a chat-only turn.
+
+    Regression: the mutation lexicon lacked ``做`` and the software-subject
+    lexicon lacked ``程序``/``脚本``/``program``/``script``, so creation phrasing
+    such as "帮我做个todolist程序" fell through to a ``conversation`` result and
+    the agent refused to touch a fully accessible workspace.
+    """
+
+    resolution = resolve_request(prompt, [])
+
+    assert resolution.work_kind in {"execute", "undetermined"}
+    assert resolution.workspace_dependent is True
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["Make me laugh", "does that make sense", "make sure it works"],
+)
+def test_english_make_idioms_are_not_forced_into_execution(prompt: str) -> None:
+    """English ``make`` stays polysemous: idioms are not treated as file mutations."""
+
+    resolution = resolve_request(prompt, [])
+
+    assert resolution.work_kind != "execute"
+
+
+@pytest.mark.parametrize(
     ("prompt", "expected_path"),
     [
         ("在alpha中搜索代码", "alpha"),
